@@ -16,6 +16,8 @@ from .db import connect, connect_readonly, utc_now
 
 TERMINAL_STATUSES = frozenset({"done", "canceled"})
 ACTIVE_STATUSES = frozenset({"ready", "running", "review", "blocked"})
+CLAIM_WAIT_WARNING_SECONDS = 60
+CLAIM_WAIT_CRITICAL_SECONDS = 300
 
 
 class TeamError(RuntimeError):
@@ -807,11 +809,115 @@ class TeamService:
                 task["claim_wait_seconds"] = wait_seconds
                 task["claim_wait_state"] = (
                     "critical"
-                    if wait_seconds >= 300
+                    if wait_seconds >= CLAIM_WAIT_CRITICAL_SECONDS
                     else "warning"
-                    if wait_seconds >= 60
+                    if wait_seconds >= CLAIM_WAIT_WARNING_SECONDS
                     else "normal"
                 )
+            goal_states: dict[str, dict[str, Any]] = {}
+            attention_count = 0
+            for task in tasks:
+                goal_id = task.get("goal_id")
+                if not goal_id:
+                    if (
+                        task["status"] in {"blocked", "review"}
+                        or task["claim_wait_state"] == "critical"
+                    ):
+                        attention_count += 1
+                    continue
+                state = goal_states.setdefault(
+                    goal_id,
+                    {
+                        "attention_task_count": 0,
+                        "has_blocked": False,
+                        "has_review": False,
+                        "has_critical_wait": False,
+                        "has_warning_wait": False,
+                        "has_ready": False,
+                        "has_running": False,
+                    },
+                )
+                task_status = task["status"]
+                task_attention = (
+                    task_status in {"blocked", "review"}
+                    or task["claim_wait_state"] == "critical"
+                )
+                if task_attention:
+                    state["attention_task_count"] += 1
+                    attention_count += 1
+                state["has_blocked"] = state["has_blocked"] or task_status == "blocked"
+                state["has_review"] = state["has_review"] or task_status == "review"
+                state["has_critical_wait"] = (
+                    state["has_critical_wait"]
+                    or task["claim_wait_state"] == "critical"
+                )
+                state["has_warning_wait"] = (
+                    state["has_warning_wait"]
+                    or task["claim_wait_state"] == "warning"
+                )
+                state["has_ready"] = state["has_ready"] or task_status == "ready"
+                state["has_running"] = state["has_running"] or task_status == "running"
+            active_goal_ids = {
+                job["goal_id"]
+                for job in cluster_jobs
+                if job.get("goal_id")
+                and job.get("status") in {"starting", "running"}
+            }
+            for goal in cluster_goals:
+                state = goal_states.get(goal["goal_id"], {})
+                goal_status = goal["status"]
+                has_active_job = goal["goal_id"] in active_goal_ids
+                has_blocked = bool(state.get("has_blocked"))
+                has_review = bool(state.get("has_review"))
+                has_critical_wait = bool(state.get("has_critical_wait"))
+                has_warning_wait = bool(state.get("has_warning_wait"))
+                has_ready = bool(state.get("has_ready"))
+                has_running = bool(state.get("has_running"))
+                goal["attention_task_count"] = int(
+                    state.get("attention_task_count", 0)
+                )
+                if (
+                    goal_status == "failed"
+                    or has_blocked
+                    or has_critical_wait
+                ):
+                    goal["health"] = "critical"
+                elif (
+                    goal_status == "paused"
+                    or has_review
+                    or has_warning_wait
+                ):
+                    goal["health"] = "warning"
+                elif has_active_job or has_running:
+                    goal["health"] = "active"
+                elif goal_status == "planning":
+                    goal["health"] = "planning"
+                else:
+                    goal["health"] = "healthy"
+                if goal_status == "failed":
+                    goal["next_action"] = "inspect_failed_goal"
+                elif goal_status == "paused":
+                    goal["next_action"] = "resume_or_cancel_goal"
+                elif has_blocked:
+                    goal["next_action"] = "resolve_blocked_tasks"
+                elif has_critical_wait:
+                    goal["next_action"] = "assign_ready_tasks"
+                elif has_review:
+                    goal["next_action"] = "review_completed_tasks"
+                elif has_active_job:
+                    goal["next_action"] = "monitor_active_jobs"
+                elif has_running:
+                    goal["next_action"] = "monitor_running_tasks"
+                elif has_ready:
+                    goal["next_action"] = "schedule_ready_tasks"
+                elif goal_status == "planning":
+                    goal["next_action"] = "wait_for_lead"
+                elif goal_status == "completed":
+                    goal["next_action"] = "none"
+                else:
+                    goal["next_action"] = "monitor_goal"
+                if goal_status in {"paused", "failed"}:
+                    attention_count += 1
             messages = [dict(row) for row in reversed(message_rows)]
             if project_id:
                 event_rows = connection.execute(
@@ -857,6 +963,35 @@ class TeamService:
             counts: dict[str, int] = {}
             for task in tasks:
                 counts[task["status"]] = counts.get(task["status"], 0) + 1
+            cluster_summary = {
+                "goals_total": len(cluster_goals),
+                "goals_active": sum(
+                    goal["status"] == "active" for goal in cluster_goals
+                ),
+                "goals_paused": sum(
+                    goal["status"] == "paused" for goal in cluster_goals
+                ),
+                "goals_failed": sum(
+                    goal["status"] == "failed" for goal in cluster_goals
+                ),
+                "ready_tasks": counts.get("ready", 0),
+                "running_tasks": counts.get("running", 0),
+                "review_tasks": counts.get("review", 0),
+                "blocked_tasks": counts.get("blocked", 0),
+                "active_jobs": sum(
+                    job.get("status") in {"starting", "running"}
+                    for job in cluster_jobs
+                ),
+                "attention_count": attention_count,
+                "oldest_claim_wait_seconds": max(
+                    (
+                        task["claim_wait_seconds"]
+                        for task in tasks
+                        if task["status"] == "ready"
+                    ),
+                    default=0,
+                ),
+            }
             return {
                 "projects": projects,
                 "selected_project_id": project_id,
@@ -866,6 +1001,7 @@ class TeamService:
                 "events": events,
                 "cluster_goals": cluster_goals,
                 "cluster_jobs": cluster_jobs,
+                "cluster_summary": cluster_summary,
                 "include_archived": include_archived,
                 "generated_at": utc_now(),
             }
