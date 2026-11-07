@@ -671,9 +671,13 @@ exec。runtime 初始化完成后，单个 `thread/start` 或 `turn/start` RPC �
 重启健康的共享进程，只允许当前 job 做一次 fresh-thread 或 exec fallback，
 其它活动 turn 保持不变。只有 transport、健康检查或进程级故障才触发 restart；
 restart 前后都会显式把其它活动 job 收敛为 `lost`，避免旧进程的 turn 在恢复后
-残留。已选 thread 的 `thread/resume` 失败时，旧 Agent 会标记为 `needs_reset`，
-同一 job 只再创建一次 fresh thread。`goal.lead_thread_id` 仅是兼容字段，不能
-绕过 AgentPool 对项目、workstream、模型、provider、状态和 reset 的检查。
+残留。`thread/start`、`turn/start` 和 `thread/resume` 调用前后还会比较 runtime
+generation；若 `_ensure_started()` 已内部替换进程，即使调用随后抛错且新进程
+恢复 healthy，也会在本次派发返回前隔离其它旧 generation job，并让当前 job
+在新进程上按既有 fresh/resume 一次性边界继续。已选 thread 的
+`thread/resume` 失败时，旧 Agent 会标记为 `needs_reset`，同一 job 只再创建
+一次 fresh thread。`goal.lead_thread_id` 仅是兼容字段，不能绕过 AgentPool 对
+项目、workstream、模型、provider、状态和 reset 的检查。
 
 每个活动 App Server job/turn state 都持久化创建时的 `runtime_generation`。
 reconcile 会与当前 runtime health 的 generation 比较；一旦进程被替换，旧

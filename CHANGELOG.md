@@ -74,6 +74,9 @@
   溢出会将 goal 标记 failed，Worker 会 blocked，并记录重试耗尽原因。
 - App Server `thread/start` 或 `turn/start` 重启重试仍失败时，同一 job 自动清理
   thread/Agent 关联并回退 exec，不再让 dispatcher 直接 block。
+- App Server RPC 内部自动重启后抛错时，通过调用前后 generation 快照立即隔离
+  其它旧 generation job，并让当前 job 按既有 fresh/resume 边界在新进程继续，
+  不再等待下一次 reconcile 或误回退 exec。
 - 缓存 benchmark 要求显式 `task_success`；成功样本缺少有效 last 用量时固定 FAIL，
   cache-hit rate 改为按 last 单轮 cached/input 计算。
 - fake App Server fixture 强制 UTF-8 Python 环境，跨平台测试不再受控制台代码页影响。
