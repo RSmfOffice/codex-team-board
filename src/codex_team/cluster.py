@@ -167,6 +167,10 @@ class ClusterError(TeamError):
     pass
 
 
+class _AppServerJobStartError(ClusterError):
+    """An App Server job could not start after its one runtime restart."""
+
+
 class ClusterManager:
     def __init__(
         self,
@@ -1383,22 +1387,80 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                 },
             )
         if selected_runtime == "app_server":
-            return self._start_app_server_job(
-                goal,
-                job_id=job_id,
-                task_id=task_id,
-                kind=kind,
-                role=role,
-                cwd=cwd,
-                log_path=log_path,
-                output_path=output_path,
-                attempt=attempt,
-                developer_instructions=developer_instructions,
-                turn_input=turn_input,
-                continuity_mode=continuity_mode,
-                sandbox_mode=sandbox_mode,
-            )
+            try:
+                return self._start_app_server_job(
+                    goal,
+                    job_id=job_id,
+                    task_id=task_id,
+                    kind=kind,
+                    role=role,
+                    cwd=cwd,
+                    log_path=log_path,
+                    output_path=output_path,
+                    attempt=attempt,
+                    developer_instructions=developer_instructions,
+                    turn_input=turn_input,
+                    continuity_mode=continuity_mode,
+                    sandbox_mode=sandbox_mode,
+                )
+            except _AppServerJobStartError as exc:
+                self._fallback_job_start_to_exec(
+                    goal,
+                    job_id=job_id,
+                    task_id=task_id,
+                    kind=kind,
+                    role=role,
+                    log_path=log_path,
+                    runtime_error=str(exc),
+                )
+                return self._start_exec_job(
+                    goal,
+                    job_id=job_id,
+                    task_id=task_id,
+                    kind=kind,
+                    role=role,
+                    cwd=cwd,
+                    log_path=log_path,
+                    output_path=output_path,
+                    attempt=attempt,
+                    developer_instructions=developer_instructions,
+                    turn_input=turn_input,
+                    resume_thread_id=None,
+                    sandbox_mode=sandbox_mode,
+                )
+        return self._start_exec_job(
+            goal,
+            job_id=job_id,
+            task_id=task_id,
+            kind=kind,
+            role=role,
+            cwd=cwd,
+            log_path=log_path,
+            output_path=output_path,
+            attempt=attempt,
+            developer_instructions=developer_instructions,
+            turn_input=turn_input,
+            resume_thread_id=resume_thread_id,
+            sandbox_mode=sandbox_mode,
+        )
 
+    def _start_exec_job(
+        self,
+        goal: dict[str, Any],
+        *,
+        job_id: str,
+        task_id: str | None,
+        kind: str,
+        role: str,
+        cwd: Path,
+        log_path: Path,
+        output_path: Path,
+        attempt: int,
+        developer_instructions: str,
+        turn_input: str,
+        resume_thread_id: str | None,
+        sandbox_mode: str,
+    ) -> dict[str, Any]:
         prompt = f"{developer_instructions.rstrip()}\n\n{turn_input.lstrip()}"
         command = self._build_command(
             cwd,
@@ -1496,9 +1558,72 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
             "kind": kind,
             "role": role,
             "pid": process.pid,
+            "runtime": "exec",
             "attempt": attempt,
             "log_path": str(log_path),
         }
+
+    def _fallback_job_start_to_exec(
+        self,
+        goal: dict[str, Any],
+        *,
+        job_id: str,
+        task_id: str | None,
+        kind: str,
+        role: str,
+        log_path: Path,
+        runtime_error: str,
+    ) -> None:
+        with self.team.connection() as connection:
+            job = connection.execute(
+                "SELECT * FROM cluster_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            previous_thread_id = job["thread_id"] if job is not None else None
+            previous_agent_id = job["agent_id"] if job is not None else None
+            connection.execute(
+                """
+                UPDATE cluster_jobs
+                SET runtime = 'exec', status = 'starting', pid = NULL,
+                    thread_id = NULL, agent_id = NULL, turn_id = NULL, error = ?
+                WHERE job_id = ?
+                """,
+                (runtime_error, job_id),
+            )
+            if kind == "lead":
+                connection.execute(
+                    """
+                    UPDATE cluster_goals
+                    SET lead_thread_id = NULL,
+                        lead_generation = lead_generation + 1,
+                        last_error = ?, updated_at = ?
+                    WHERE goal_id = ?
+                    """,
+                    (runtime_error, utc_now(), goal["goal_id"]),
+                )
+            payload = {
+                "job_id": job_id,
+                "task_id": task_id,
+                "kind": kind,
+                "role": role,
+                "configured_runtime": "app_server",
+                "fallback_runtime": "exec",
+                "previous_thread_id": previous_thread_id,
+                "previous_agent_id": previous_agent_id,
+                "error": runtime_error,
+                "scope": "same_job",
+            }
+            self._event(
+                connection,
+                goal["goal_id"],
+                "agent_runtime_fallback",
+                "teamd",
+                payload,
+            )
+        self._append_app_event(
+            log_path,
+            {"event": "agent_runtime_fallback", **payload},
+        )
 
     def _select_job_runtime(
         self,
@@ -1547,6 +1672,89 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                 )
                 return self._runtime_fallback_reason
 
+    def _start_fresh_app_thread(
+        self,
+        runtime: Any,
+        cwd: Path,
+        *,
+        developer_instructions: str,
+    ) -> str:
+        def start() -> str:
+            return runtime.start_thread(
+                cwd,
+                developer_instructions=developer_instructions,
+                model=self.model or None,
+                model_provider=self.model_provider or None,
+                service_name="codex-team-cluster",
+            )
+
+        try:
+            return start()
+        except Exception as first_error:
+            try:
+                runtime.restart()
+            except Exception as restart_error:
+                raise _AppServerJobStartError(
+                    f"thread/start failed: {first_error}; "
+                    f"restart failed: {restart_error}"
+                ) from restart_error
+            try:
+                return start()
+            except Exception as second_error:
+                raise _AppServerJobStartError(
+                    f"thread/start failed: {first_error}; "
+                    f"retry after restart failed: {second_error}"
+                ) from second_error
+
+    def _start_app_turn_with_restart(
+        self,
+        runtime: Any,
+        thread_id: str,
+        turn_input: str,
+        *,
+        cwd: Path,
+        sandbox_mode: str,
+    ) -> dict[str, Any]:
+        def start() -> dict[str, Any]:
+            return runtime.start_turn(
+                thread_id,
+                turn_input,
+                cwd=cwd,
+                sandbox_mode=sandbox_mode,
+                model=self.model or None,
+            )
+
+        try:
+            return start()
+        except Exception as first_error:
+            try:
+                runtime.restart()
+            except Exception as restart_error:
+                raise _AppServerJobStartError(
+                    f"turn/start failed: {first_error}; "
+                    f"restart failed: {restart_error}"
+                ) from restart_error
+            try:
+                restored_thread_id = runtime.resume_thread(thread_id)
+            except Exception as resume_error:
+                raise _AppServerJobStartError(
+                    f"turn/start failed: {first_error}; "
+                    f"thread reload after restart failed: {resume_error}"
+                ) from resume_error
+            try:
+                return runtime.start_turn(
+                    restored_thread_id,
+                    turn_input,
+                    cwd=cwd,
+                    sandbox_mode=sandbox_mode,
+                    model=self.model or None,
+                )
+            except Exception as second_error:
+                raise _AppServerJobStartError(
+                    f"turn/start failed: {first_error}; "
+                    f"retry after restart failed: {second_error}"
+                ) from second_error
+
     def _start_app_server_job(
         self,
         goal: dict[str, Any],
@@ -1576,35 +1784,55 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
         task_kind = "read" if kind == "lead" else str(
             self.team.get_task(task_id)["kind"]
         )
-        agent = self.agent_pool.select_agent(
-            str(goal["project_id"]),
-            role,
-            workstream_key,
-            continuity_mode,
-            task_kind,
-            self.model,
-            self.model_provider,
-        )
-        thread_id: str
+        agent: dict[str, Any] | None = None
+        thread_id = ""
         try:
+            agent = self.agent_pool.select_agent(
+                str(goal["project_id"]),
+                role,
+                workstream_key,
+                continuity_mode,
+                task_kind,
+                self.model,
+                self.model_provider,
+            )
             if agent is not None:
-                thread_id = runtime.resume_thread(str(agent["thread_id"]))
-            else:
-                legacy_thread_id = (
-                    str(goal.get("lead_thread_id") or "")
-                    if kind == "lead"
-                    else ""
-                )
-                if legacy_thread_id:
-                    thread_id = runtime.resume_thread(legacy_thread_id)
-                else:
-                    thread_id = runtime.start_thread(
-                        cwd,
-                        developer_instructions=developer_instructions,
-                        model=self.model or None,
-                        model_provider=self.model_provider or None,
-                        service_name="codex-team-cluster",
+                try:
+                    thread_id = runtime.resume_thread(str(agent["thread_id"]))
+                except Exception as exc:
+                    reason = f"thread resume failed: {exc}"
+                    try:
+                        self.agent_pool.mark_failed(
+                            str(agent["agent_id"]),
+                            reason,
+                            needs_reset=True,
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        runtime.unsubscribe_thread(str(agent["thread_id"]))
+                    except Exception:
+                        pass
+                    self._append_app_event(
+                        log_path,
+                        {
+                            "event": "agent_thread_resume_failed",
+                            "job_id": job_id,
+                            "agent_id": agent["agent_id"],
+                            "thread_id": agent["thread_id"],
+                            "error": str(exc),
+                            "action": "fresh_thread",
+                        },
                     )
+                    agent = None
+            if agent is None:
+                # goal.lead_thread_id is migration-only display/exec state. It
+                # must not bypass AgentPool identity, status, or reset checks.
+                thread_id = self._start_fresh_app_thread(
+                    runtime,
+                    cwd,
+                    developer_instructions=developer_instructions,
+                )
                 agent = self.agent_pool.register_thread(
                     str(goal["project_id"]),
                     role,
@@ -1653,43 +1881,35 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                     "runtime": "app_server",
                 },
             )
-            turn = runtime.start_turn(
+            turn = self._start_app_turn_with_restart(
+                runtime,
                 thread_id,
                 turn_input,
                 cwd=cwd,
                 sandbox_mode=sandbox_mode,
-                model=self.model or None,
             )
         except Exception as exc:
             with self._app_state_lock:
-                self.app_thread_jobs.pop(thread_id if "thread_id" in locals() else "", None)
+                self.app_thread_jobs.pop(thread_id, None)
                 self.app_turns.pop(job_id, None)
             if agent is not None:
                 try:
                     self.agent_pool.mark_failed(
                         str(agent["agent_id"]),
                         f"App Server turn start failed: {exc}",
+                        needs_reset=True,
                     )
                 except Exception:
                     pass
-            with self.team.connection() as connection:
-                connection.execute(
-                    """
-                    UPDATE cluster_jobs
-                    SET status = 'failed', finished_at = ?, error = ?
-                    WHERE job_id = ?
-                    """,
-                    (utc_now(), str(exc), job_id),
-                )
-                self._event(
-                    connection,
-                    goal["goal_id"],
-                    "job_start_failed",
-                    "teamd",
-                    {"job_id": job_id, "runtime": "app_server", "error": str(exc)},
-                )
-            raise ClusterError(
-                f"could not start {kind} App Server turn: {exc}"
+            if thread_id:
+                try:
+                    runtime.unsubscribe_thread(thread_id)
+                except Exception:
+                    pass
+            if isinstance(exc, _AppServerJobStartError):
+                raise
+            raise _AppServerJobStartError(
+                f"App Server job start failed: {exc}"
             ) from exc
         turn_id = turn["turn_id"]
         with self._app_state_lock:
@@ -2154,6 +2374,11 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
         job: dict[str, Any],
         state: Mapping[str, Any],
     ) -> None:
+        retry_scope = (
+            f"lead:{job['goal_id']}"
+            if job["kind"] == "lead"
+            else f"worker:{job.get('task_id') or job['job_id']}"
+        )
         with self.team.connection(write=False) as connection:
             rows = connection.execute(
                 """
@@ -2169,9 +2394,20 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                 data = json.loads(row["data_json"])
             except (TypeError, ValueError):
                 continue
-            if data.get("task_id") == job.get("task_id"):
+            event_scope = str(data.get("retry_scope") or "")
+            if not event_scope:
+                if data.get("kind") == "lead" or (
+                    "kind" not in data and data.get("task_id") is None
+                ):
+                    event_scope = f"lead:{job['goal_id']}"
+                elif data.get("task_id"):
+                    event_scope = f"worker:{data['task_id']}"
+            if event_scope == retry_scope:
                 reset_count += 1
         retry_allowed = reset_count < 1
+        exhausted_reason = (
+            "contextWindowExceeded persisted after one automatic fresh-thread retry"
+        )
         agent_id = str(job.get("agent_id") or "")
         if agent_id:
             try:
@@ -2197,27 +2433,70 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                 {
                     "job_id": job["job_id"],
                     "task_id": job.get("task_id"),
+                    "kind": job["kind"],
+                    "retry_scope": retry_scope,
+                    "retry_number": reset_count + 1,
                     "thread_id": job.get("thread_id"),
                     "turn_id": job.get("turn_id"),
                     "retry_allowed": retry_allowed,
                     "error": self._app_turn_error(state),
                 },
             )
-        self._finish_job(
-            job,
-            1,
-            forced_error="contextWindowExceeded",
-            agent_already_failed=True,
-            context_overflow=True,
-        )
-        if not retry_allowed and job.get("task_id"):
+            if not retry_allowed:
+                if job["kind"] == "lead":
+                    connection.execute(
+                        """
+                        UPDATE cluster_goals
+                        SET status = 'failed', last_error = ?,
+                            completed_at = COALESCE(completed_at, ?),
+                            updated_at = ?
+                        WHERE goal_id = ?
+                        """,
+                        (
+                            exhausted_reason,
+                            utc_now(),
+                            utc_now(),
+                            job["goal_id"],
+                        ),
+                    )
+                self._event(
+                    connection,
+                    job["goal_id"],
+                    "agent_context_retry_exhausted",
+                    "teamd",
+                    {
+                        "job_id": job["job_id"],
+                        "task_id": job.get("task_id"),
+                        "kind": job["kind"],
+                        "retry_scope": retry_scope,
+                        "thread_id": job.get("thread_id"),
+                        "reason": exhausted_reason,
+                    },
+                )
+        if not retry_allowed and job["kind"] == "worker" and job.get("task_id"):
             task = self.team.get_task(str(job["task_id"]))
-            if task["status"] not in {"review", "done", "blocked", "canceled"}:
+            if task["status"] not in {
+                "review",
+                "done",
+                "blocked",
+                "canceled",
+            }:
                 self.team.block_task(
                     str(job["task_id"]),
                     actor="teamd",
-                    reason="contextWindowExceeded persisted after automatic retry",
+                    reason=exhausted_reason,
                 )
+        self._finish_job(
+            job,
+            1,
+            forced_error=(
+                "contextWindowExceeded"
+                if retry_allowed
+                else exhausted_reason
+            ),
+            agent_already_failed=True,
+            context_overflow=True,
+        )
 
     def _interrupt_app_turn(self, job: Mapping[str, Any], reason: str) -> None:
         thread_id = str(job.get("thread_id") or "")
