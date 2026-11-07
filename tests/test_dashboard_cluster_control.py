@@ -310,6 +310,96 @@ class DashboardClusterControlTests(unittest.TestCase):
                     self.assertIn("error", body)
             start_daemon.assert_not_called()
 
+    def test_reset_agent_rejects_busy_and_records_idle_request(self) -> None:
+        now = "2026-11-07T11:30:00Z"
+        with self.team.connection() as connection:
+            for agent_id, status in (
+                ("A-BUSY", "busy"),
+                ("A-IDLE", "idle"),
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO cluster_agents(
+                        agent_id, project_id, role, workstream_key,
+                        display_name, thread_id, status, created_at, updated_at
+                    ) VALUES (?, ?, 'team_worker', 'reset-test', ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        agent_id,
+                        self.project["project_id"],
+                        f"Agent {agent_id}",
+                        f"thread-{agent_id.lower()}",
+                        status,
+                        now,
+                        now,
+                    ),
+                )
+
+        with (
+            patch(
+                "codex_team.dashboard.ensure_daemon",
+                side_effect=AssertionError("reset must not start a daemon"),
+            ) as start_daemon,
+            patch(
+                "codex_team.dashboard.daemon_status",
+                side_effect=AssertionError("reset must not inspect a daemon"),
+            ) as read_daemon,
+        ):
+            status, busy = self.post(
+                "/api/agents/reset",
+                {"agent_id": "A-BUSY", "reason": "must be rejected"},
+            )
+            status_ok, reset = self.post(
+                "/api/agents/reset",
+                {"agent_id": "A-IDLE", "reason": "manual diagnostics reset"},
+            )
+
+        self.assertEqual(status, 409)
+        self.assertIn("busy", busy["error"])
+        self.assertEqual(status_ok, 200)
+        self.assertEqual(reset["agent"]["agent_id"], "A-IDLE")
+        self.assertEqual(reset["agent"]["status"], "idle")
+        self.assertIsNotNone(reset["agent"]["reset_requested_at"])
+        self.assertEqual(
+            reset["agent"]["reset_reason"],
+            "manual diagnostics reset",
+        )
+        start_daemon.assert_not_called()
+        read_daemon.assert_not_called()
+
+        with self.team.connection(write=False) as connection:
+            agents = {
+                row["agent_id"]: dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT * FROM cluster_agents
+                    WHERE agent_id IN ('A-BUSY', 'A-IDLE')
+                    """
+                )
+            }
+            events = connection.execute(
+                """
+                SELECT agent_id, event_type, actor, data_json
+                FROM cluster_agent_events
+                ORDER BY event_id
+                """
+            ).fetchall()
+        self.assertIsNone(agents["A-BUSY"]["reset_requested_at"])
+        self.assertEqual(agents["A-BUSY"]["reset_reason"], "")
+        self.assertIsNotNone(agents["A-IDLE"]["reset_requested_at"])
+        self.assertEqual(
+            agents["A-IDLE"]["reset_reason"],
+            "manual diagnostics reset",
+        )
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["agent_id"], "A-IDLE")
+        self.assertEqual(events[0]["event_type"], "reset_requested")
+        self.assertEqual(events[0]["actor"], "human")
+        self.assertEqual(
+            json.loads(events[0]["data_json"])["reason"],
+            "manual diagnostics reset",
+        )
+
     def test_malformed_json_returns_json_error(self) -> None:
         request = urllib.request.Request(
             self.base_url + "/api/clusters",

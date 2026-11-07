@@ -84,6 +84,28 @@ class TeamService:
         )
 
     @staticmethod
+    def _cache_hit_rate(
+        input_tokens: object,
+        cached_input_tokens: object,
+        uncached_input_tokens: object,
+    ) -> float:
+        """Return the cached input share as a ratio in the closed [0, 1] range."""
+
+        def number(value: object) -> int:
+            try:
+                return max(0, int(value or 0))
+            except (TypeError, ValueError):
+                return 0
+
+        input_count = number(input_tokens)
+        cached_count = number(cached_input_tokens)
+        uncached_count = number(uncached_input_tokens)
+        denominator = input_count or cached_count + uncached_count
+        if denominator <= 0:
+            return 0.0
+        return max(0.0, min(1.0, cached_count / denominator))
+
+    @staticmethod
     def _root(path: str | Path) -> Path:
         candidate = Path(path).expanduser().resolve()
         result = subprocess.run(
@@ -132,6 +154,75 @@ class TeamService:
         if row is None:
             raise TeamError(f"project not found: {project_id}")
         return dict(row)
+
+    def reset_agent(
+        self,
+        agent_id: str,
+        *,
+        actor: str = "human",
+        reason: str = "manual reset requested through dashboard",
+    ) -> dict[str, Any]:
+        if not isinstance(agent_id, str):
+            raise TeamError("agent_id must be a string")
+        normalized_id = agent_id.strip()
+        if not normalized_id:
+            raise TeamError("agent_id is required")
+        if not isinstance(actor, str):
+            raise TeamError("actor must be a string")
+        normalized_actor = actor.strip()
+        if not normalized_actor:
+            raise TeamError("actor is required")
+        if not isinstance(reason, str):
+            raise TeamError("reset reason must be a string")
+        normalized_reason = reason.strip()
+        if not normalized_reason:
+            normalized_reason = "manual reset requested through dashboard"
+        if len(normalized_reason) > 2000:
+            raise TeamError("reset reason must not exceed 2000 characters")
+        now = utc_now()
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            agent = connection.execute(
+                "SELECT * FROM cluster_agents WHERE agent_id = ?",
+                (normalized_id,),
+            ).fetchone()
+            if agent is None:
+                raise TeamError(f"agent not found: {normalized_id}")
+            if agent["status"] == "busy":
+                raise TeamError(f"agent is busy; reset is unavailable: {normalized_id}")
+            connection.execute(
+                """
+                UPDATE cluster_agents
+                SET reset_requested_at = ?, reset_reason = ?, updated_at = ?
+                WHERE agent_id = ?
+                """,
+                (now, normalized_reason, now, normalized_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO cluster_agent_events(
+                    agent_id, event_type, actor, data_json, created_at
+                ) VALUES (?, 'reset_requested', ?, ?, ?)
+                """,
+                (
+                    normalized_id,
+                    normalized_actor,
+                    json.dumps(
+                        {
+                            "reason": normalized_reason,
+                            "requested_at": now,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    now,
+                ),
+            )
+            updated = connection.execute(
+                "SELECT * FROM cluster_agents WHERE agent_id = ?",
+                (normalized_id,),
+            ).fetchone()
+        return dict(updated)
 
     def list_projects(self, *, include_archived: bool = False) -> list[dict[str, Any]]:
         with self.connection(write=False) as connection:
@@ -393,6 +484,7 @@ class TeamService:
         priority: int = 2,
         depends_on: list[str] | None = None,
         goal_id: str | None = None,
+        continuity_mode: str = "auto",
     ) -> dict[str, Any]:
         if kind not in {"read", "write", "review", "ops"}:
             raise TeamError("kind must be read, write, review, or ops")
@@ -402,6 +494,11 @@ class TeamService:
             raise TeamError("owner_role must not be empty")
         if priority not in {0, 1, 2, 3}:
             raise TeamError("priority must be between 0 and 3")
+        if not isinstance(continuity_mode, str):
+            raise TeamError("continuity_mode must be auto, reuse, or fresh")
+        continuity_mode = continuity_mode.strip().lower()
+        if continuity_mode not in {"auto", "reuse", "fresh"}:
+            raise TeamError("continuity_mode must be auto, reuse, or fresh")
         project = self.register_project(repo)
         self._ensure_project_active(project)
         dependencies = list(dict.fromkeys(depends_on or []))
@@ -427,8 +524,8 @@ class TeamService:
                 """
                 INSERT INTO tasks(
                     task_id, project_id, goal_id, title, description, acceptance, kind,
-                    status, priority, owner_role, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?)
+                    status, priority, owner_role, continuity_mode, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -440,6 +537,7 @@ class TeamService:
                     kind,
                     priority,
                     owner_role.strip(),
+                    continuity_mode,
                     now,
                     now,
                 ),
@@ -462,6 +560,7 @@ class TeamService:
                     "owner_role": owner_role,
                     "depends_on": dependencies,
                     "goal_id": goal_id,
+                    "continuity_mode": continuity_mode,
                 },
             )
         return self.get_task(task_id)
@@ -707,6 +806,77 @@ class TeamService:
                 ).fetchall()
             cluster_goals = [dict(row) for row in goal_rows]
             cluster_jobs = [dict(row) for row in job_rows]
+            for job in cluster_jobs:
+                job["cache_hit_rate"] = self._cache_hit_rate(
+                    job.get("input_tokens"),
+                    job.get("cached_input_tokens"),
+                    job.get("uncached_input_tokens"),
+                )
+            agent_where = ["1 = 1"]
+            agent_parameters: list[Any] = []
+            if project_id:
+                agent_where.append("a.project_id = ?")
+                agent_parameters.append(project_id)
+            if not include_archived:
+                agent_where.append("a.archived_at IS NULL")
+                agent_where.append("p.archived_at IS NULL")
+            agent_rows = connection.execute(
+                f"""
+                SELECT a.*, g.objective AS current_goal_objective,
+                       t.title AS current_task_title,
+                       j.kind AS current_job_kind,
+                       j.status AS current_job_status
+                FROM cluster_agents a
+                JOIN projects p ON p.project_id = a.project_id
+                LEFT JOIN cluster_goals g ON g.goal_id = a.current_goal_id
+                LEFT JOIN tasks t ON t.task_id = a.current_task_id
+                LEFT JOIN cluster_jobs j ON j.job_id = a.current_job_id
+                WHERE {" AND ".join(agent_where)}
+                ORDER BY
+                    CASE a.status
+                        WHEN 'busy' THEN 0
+                        WHEN 'starting' THEN 1
+                        WHEN 'loaded' THEN 2
+                        WHEN 'idle' THEN 3
+                        ELSE 4
+                    END,
+                    a.last_used_at DESC,
+                    a.agent_id
+                LIMIT 200
+                """,
+                agent_parameters,
+            ).fetchall()
+            cluster_agents = []
+            for row in agent_rows:
+                agent = dict(row)
+                agent["cache_hit_rate"] = self._cache_hit_rate(
+                    agent.get("total_input_tokens"),
+                    agent.get("total_cached_input_tokens"),
+                    agent.get("total_uncached_input_tokens"),
+                )
+                cluster_agents.append(agent)
+            cluster_agent_events: list[dict[str, Any]] = []
+            agent_ids = [agent["agent_id"] for agent in cluster_agents]
+            if agent_ids:
+                placeholders = ",".join("?" for _ in agent_ids)
+                agent_event_rows = connection.execute(
+                    f"""
+                    SELECT *
+                    FROM cluster_agent_events
+                    WHERE agent_id IN ({placeholders})
+                    ORDER BY event_id DESC
+                    LIMIT 200
+                    """,
+                    agent_ids,
+                ).fetchall()
+                for row in reversed(agent_event_rows):
+                    item = dict(row)
+                    try:
+                        item["data"] = json.loads(item.pop("data_json"))
+                    except (TypeError, ValueError):
+                        item["data"] = {}
+                        item.pop("data_json", None)
+                    cluster_agent_events.append(item)
             schedulable_goal_count = int(
                 connection.execute(
                     """
@@ -843,6 +1013,12 @@ class TeamService:
                 """
             ).fetchall()
             active_jobs = [dict(row) for row in active_job_rows]
+            for job in active_jobs:
+                job["cache_hit_rate"] = self._cache_hit_rate(
+                    job.get("input_tokens"),
+                    job.get("cached_input_tokens"),
+                    job.get("uncached_input_tokens"),
+                )
             active_jobs_by_task = {
                 job["task_id"]: {
                     "job_id": job["job_id"],
@@ -852,6 +1028,16 @@ class TeamService:
                     "pid": job.get("pid"),
                     "attempt": job.get("attempt"),
                     "started_at": job.get("started_at"),
+                    "thread_id": job.get("thread_id"),
+                    "turn_id": job.get("turn_id"),
+                    "runtime": job.get("runtime"),
+                    "input_tokens": job.get("input_tokens", 0),
+                    "cached_input_tokens": job.get("cached_input_tokens", 0),
+                    "uncached_input_tokens": job.get("uncached_input_tokens", 0),
+                    "output_tokens": job.get("output_tokens", 0),
+                    "context_tokens": job.get("context_tokens", 0),
+                    "model_context_window": job.get("model_context_window"),
+                    "cache_hit_rate": job["cache_hit_rate"],
                 }
                 for job in active_jobs
                 if job.get("task_id")
@@ -1261,6 +1447,8 @@ class TeamService:
                 "events": events,
                 "cluster_goals": cluster_goals,
                 "cluster_jobs": cluster_jobs,
+                "cluster_agents": cluster_agents,
+                "cluster_agent_events": cluster_agent_events,
                 "cluster_summary": cluster_summary,
                 "include_archived": include_archived,
                 "generated_at": utc_now(),

@@ -84,6 +84,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/clusters/archive":
             self._archive_cluster_goal()
             return
+        if parsed.path == "/api/agents/reset":
+            self._reset_agent()
+            return
         if parsed.path not in {"/api/projects/archive", "/api/tasks/archive"}:
             self._send_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
             return
@@ -110,6 +113,35 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     archived,
                 )
                 self._send_json({"task": task})
+        except TeamError as exc:
+            self._send_json(
+                {"error": str(exc)},
+                status=HTTPStatus.CONFLICT,
+            )
+        except (OSError, ValueError) as exc:
+            self._send_json(
+                {"error": str(exc)},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+
+    def _reset_agent(self) -> None:
+        try:
+            payload = self._read_json()
+            agent_id = self._required_text(payload, "agent_id")
+            reason = payload.get(
+                "reason",
+                "manual reset requested through dashboard",
+            )
+            if not isinstance(reason, str):
+                raise ValueError("reason must be a string")
+            if len(reason.strip()) > 2000:
+                raise ValueError("reason must not exceed 2000 characters")
+            agent = self.team_service.reset_agent(
+                agent_id,
+                actor="human",
+                reason=reason,
+            )
+            self._send_json({"agent": agent})
         except TeamError as exc:
             self._send_json(
                 {"error": str(exc)},
