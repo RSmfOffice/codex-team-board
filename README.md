@@ -14,7 +14,7 @@
 - append-only 任务事件与团队消息
 - Codex MCP stdio 服务
 - 无外部依赖的本地 Web Kanban
-- 可在 Web 看板创建、暂停、恢复和取消自动集群目标
+- 可在 Web 看板创建、暂停、恢复、取消和归档自动集群目标
 - 集群健康摘要、下一步动作和需要关注的异常提示
 - 跨项目多集群的全局 Jobs 容量、每 goal Worker 容量和公平排队
 - 默认 2 小时 Worker、45 分钟 Lead 的长任务超时与心跳诊断
@@ -315,7 +315,7 @@ Blocked、Done 泳道，以及依赖、租约、分支、worktree、审计结果
 
 - Active/Planning：暂停或取消。
 - Paused：恢复或取消；恢复会把目标改为 Active 并确保 `teamd` 已启动。
-- Completed/Failed：不显示操作按钮。
+- Completed/Failed：归档已完成或失败的目标；归档后可恢复。
 
 取消在 Web API 中通过目标状态 `failed` 落板，具体原因保存在 `last_error`，不会
 删除目标、任务、事件或 Git worktree。
@@ -441,6 +441,27 @@ Invoke-RestMethod `
 `{"goal": {...}, "daemon": {...}}`；参数错误返回 400，状态或项目冲突返回 409，
 错误响应包含 `error`。
 
+只有 `completed` 或 `failed` 的集群目标可以归档。归档和恢复使用独立端点：
+
+```powershell
+$archive = @{
+  goal_id = $goalId
+  archived = $true
+} | ConvertTo-Json
+
+Invoke-RestMethod `
+  -Uri "$base/api/clusters/archive" `
+  -Method Post `
+  -ContentType "application/json" `
+  -Body $archive
+```
+
+将 `archived` 设为 `false` 可恢复目标。归档目标默认不进入 `/api/board`；使用
+`?include_archived=1` 或 WebUI 的“显示已归档”筛选后可以查看和恢复。
+CLI 对应命令为 `cluster archive <goal-id>` 和 `cluster restore <goal-id>`；
+MCP 的 `team_cluster_control.action` 除 `pause`、`resume`、`cancel` 外，也接受
+`archive` 和 `restore`。
+
 ### 轮询效率
 
 页面首次加载会读取一次 `/api/projects`，之后常规轮询只请求 `/api/board`。
@@ -454,23 +475,26 @@ Invoke-RestMethod `
 - 只有 board 内容签名变化时才重绘；正常轮询中的 claim 年龄和
   `generated_at` 更新不会单独触发表格重绘。
 
-### 项目与任务归档
+### 项目、任务与集群目标归档
 
 归档按钮会根据当前上下文切换目标：
 
 - 没有打开任务详情时：归档或恢复当前项目。
 - 打开任务详情时：归档或恢复当前任务。
+- 集群目标使用目标卡片上的“归档目标”或“恢复目标”按钮。
 - 先关闭任务详情，按钮才会切回项目归档。
 
-项目和任务都采用软归档：
+项目、任务和集群目标都采用软归档：
 
-- 默认的“所有活动项目”视图会隐藏归档项目、归档任务及其消息。
+- 默认的“所有活动项目”视图会隐藏归档项目、归档任务、归档集群目标及其消息。
 - 勾选“显示已归档”后可以重新查看，按钮会切换为“恢复当前项目”或
-  “恢复当前任务”。
+  “恢复当前任务”；归档的集群目标则显示“恢复目标”。
 - 归档不会删除数据库记录、任务事件、worktree、分支或合并提交。
 - 有未结束的集群目标、Running 任务或活动 Agent 进程时禁止归档。
 - 已归档任务不能 claim；已归档项目不能创建任务、cluster goal 或 worktree，
   恢复后解除限制。
+- 只有 `completed`/`failed` 集群目标可以在没有活动 job 时归档；归档目标不能
+  直接改变状态，恢复后才能继续生命周期操作。
 
 ## MCP 工具
 
@@ -494,6 +518,10 @@ Invoke-RestMethod `
 - `team_review_task`
 - `team_add_message`
 - `team_list_messages`
+- `team_cluster_start`
+- `team_cluster_ensure`
+- `team_cluster_status`
+- `team_cluster_control`
 
 ## 状态规则
 
@@ -528,7 +556,19 @@ ready/review/blocked ──取消──→ canceled
 
 ## 自动 Agent 集群
 
-启动一个持续目标：
+非平凡开发任务优先使用幂等的 `cluster ensure`，确保每个项目只有一个未完成
+目标：
+
+```powershell
+.\scripts\team.ps1 cluster ensure `
+  --repo "D:\path\to\repo" `
+  --objective "实现并验证目标，自动拆分、执行、测试和验收" `
+  --autonomy auto
+```
+
+该命令会复用现有的 `planning`、`active` 或 `paused` 目标。返回值通过
+`created`、`reused` 和 `requires_resume` 区分结果；遇到 paused 目标只返回提示，
+不会自动恢复。需要明确创建新目标时使用 `cluster start`：
 
 ```powershell
 .\scripts\team.ps1 cluster start `
@@ -536,6 +576,9 @@ ready/review/blocked ──取消──→ canceled
   --objective "实现并验证目标，自动拆分、执行、测试和验收" `
   --autonomy auto
 ```
+
+`cluster start` 只用于显式新建目标；同一项目已有 `planning`/`active` 目标时会
+返回 `project already has active goal`。
 
 ### 多集群容量与公平调度
 

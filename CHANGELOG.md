@@ -9,6 +9,10 @@
 - 新增跨项目多集群调度：全局 Jobs 容量默认 4，每 goal Worker 容量默认 3。
 - 新增按最久未启动 goal 优先的公平轮转；全局容量满时记录
   `fairness_deferred`，并对同一 goal 的重复事件做 60 秒去重。
+- 新增 `team_cluster_ensure` 与 `cluster ensure`：复用项目现有的
+  `planning`/`active`/`paused` 目标，paused 目标只提示恢复、不自动恢复。
+- 新增集群目标软归档与恢复；只允许归档已结束且无活动 job 的
+  `completed`/`failed` 目标，并支持在 WebUI 中筛选查看。
 - 新增 `CODEX_TEAM_CLUSTER_MAX_JOBS`、`CODEX_TEAM_CLUSTER_MAX_WORKERS`、
   `CODEX_TEAM_WORKER_TIMEOUT_SECONDS` 和
   `CODEX_TEAM_LEAD_TIMEOUT_SECONDS` 调度/超时配置，以及可选的
@@ -28,6 +32,8 @@
 - 全局 Jobs 容量同时约束 Lead 和 Worker；每 goal Worker 容量只约束 Worker。
 - 同一项目仍只允许一个 `planning`/`active` goal；多集群并行需要为不同项目创建
   目标。
+- 日常非平凡开发应先调用 `team_cluster_ensure`；`team_cluster_start` 保留为
+  明确创建新目标的入口，避免重复创建集群。
 - 新增 `dependency_wait` 队列原因和 WebUI“等待依赖完成”标签，避免把仍受依赖
   限制的 ready 任务误报为可调度。
 - `read` 任务 Worker 与 Review Worker 改用 `read-only` 沙箱；`write` Worker
