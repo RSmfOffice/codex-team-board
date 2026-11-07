@@ -14,8 +14,11 @@
 - append-only 任务事件与团队消息
 - Codex MCP stdio 服务
 - 无外部依赖的本地 Web Kanban
-- 可在 Web 看板创建、暂停、恢复和取消自动集群目标
+- 可在 Web 看板创建、暂停、恢复、取消和归档自动集群目标
 - 集群健康摘要、下一步动作和需要关注的异常提示
+- 跨项目多集群的全局 Jobs 容量、每 goal Worker 容量和公平排队
+- 默认 2 小时 Worker、45 分钟 Lead 的长任务超时与心跳诊断
+- WebUI 全局槽位、排队、等待时长和 heartbeat 健康指标
 
 ## 两个仓库如何联动
 
@@ -131,7 +134,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 
 如果仍需联动上下文插件，追加
 `-ContextMeterRoot "D:\path\to\codex-context-meter"`。安装完成后重新打开 Codex，
-并确认健康接口返回 `"version": "0.3.1"`：
+并确认健康接口返回 `"version": "0.4.0"`：
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8765/api/health
@@ -312,7 +315,7 @@ Blocked、Done 泳道，以及依赖、租约、分支、worktree、审计结果
 
 - Active/Planning：暂停或取消。
 - Paused：恢复或取消；恢复会把目标改为 Active 并确保 `teamd` 已启动。
-- Completed/Failed：不显示操作按钮。
+- Completed/Failed：归档已完成或失败的目标；归档后可恢复。
 
 取消在 Web API 中通过目标状态 `failed` 落板，具体原因保存在 `last_error`，不会
 删除目标、任务、事件或 Git worktree。
@@ -331,12 +334,41 @@ running_tasks
 review_tasks
 blocked_tasks
 active_jobs
+global_jobs
+global_capacity
+queued_goals
+heartbeat_overdue
+oldest_heartbeat_age_seconds
+fairness_wait_count
 attention_count
 oldest_claim_wait_seconds
 ```
 
 每个 `cluster_goals` 项还包含 `health`、`next_action` 和
-`attention_task_count`。`health` 按以下优先级计算：
+`attention_task_count`，以及 `active_job_count`、`heartbeat_age_seconds`、
+`heartbeat_state`、`queue_reason` 和 `estimated_wait_seconds`。WebUI 顶部显示
+`JOBS`（活动全局 job/容量）、`QUEUED`（排队目标及公平等待数）和
+`HB OVERDUE`（超过 warning 阈值的 job 数及最老心跳年龄）；集群卡显示每个
+目标的队列原因、`当前等待`时长、活动 Lead/Worker 和心跳状态。
+
+`queue_reason` 是供 UI 和自动化消费的稳定枚举：
+
+| 值 | WebUI 标签/含义 |
+| --- | --- |
+| `global_capacity` | 全局容量已满 |
+| `goal_capacity` | 目标容量已满 |
+| `review_pending` | 等待 Review |
+| `blocked` | 等待处理阻塞 |
+| `ready` | 等待调度 |
+| `dependency_wait` | 等待依赖完成；存在 ready 任务，但它们仍有未完成依赖 |
+| `running` | 活动 job 或任务正在运行 |
+| `waiting_for_lead` | 等待 Lead 规划 |
+| `none` | 无排队 |
+
+`estimated_wait_seconds` 是当前队列关注任务已等待的时长，不代表调度器承诺的
+剩余等待时间。因此 WebUI 使用“当前等待”，而不是“预计等待”。
+
+`health` 按以下优先级计算：
 
 | 值 | 条件 |
 | --- | --- |
@@ -409,6 +441,27 @@ Invoke-RestMethod `
 `{"goal": {...}, "daemon": {...}}`；参数错误返回 400，状态或项目冲突返回 409，
 错误响应包含 `error`。
 
+只有 `completed` 或 `failed` 的集群目标可以归档。归档和恢复使用独立端点：
+
+```powershell
+$archive = @{
+  goal_id = $goalId
+  archived = $true
+} | ConvertTo-Json
+
+Invoke-RestMethod `
+  -Uri "$base/api/clusters/archive" `
+  -Method Post `
+  -ContentType "application/json" `
+  -Body $archive
+```
+
+将 `archived` 设为 `false` 可恢复目标。归档目标默认不进入 `/api/board`；使用
+`?include_archived=1` 或 WebUI 的“显示已归档”筛选后可以查看和恢复。
+CLI 对应命令为 `cluster archive <goal-id>` 和 `cluster restore <goal-id>`；
+MCP 的 `team_cluster_control.action` 除 `pause`、`resume`、`cancel` 外，也接受
+`archive` 和 `restore`。
+
 ### 轮询效率
 
 页面首次加载会读取一次 `/api/projects`，之后常规轮询只请求 `/api/board`。
@@ -422,23 +475,26 @@ Invoke-RestMethod `
 - 只有 board 内容签名变化时才重绘；正常轮询中的 claim 年龄和
   `generated_at` 更新不会单独触发表格重绘。
 
-### 项目与任务归档
+### 项目、任务与集群目标归档
 
 归档按钮会根据当前上下文切换目标：
 
 - 没有打开任务详情时：归档或恢复当前项目。
 - 打开任务详情时：归档或恢复当前任务。
+- 集群目标使用目标卡片上的“归档目标”或“恢复目标”按钮。
 - 先关闭任务详情，按钮才会切回项目归档。
 
-项目和任务都采用软归档：
+项目、任务和集群目标都采用软归档：
 
-- 默认的“所有活动项目”视图会隐藏归档项目、归档任务及其消息。
+- 默认的“所有活动项目”视图会隐藏归档项目、归档任务、归档集群目标及其消息。
 - 勾选“显示已归档”后可以重新查看，按钮会切换为“恢复当前项目”或
-  “恢复当前任务”。
+  “恢复当前任务”；归档的集群目标则显示“恢复目标”。
 - 归档不会删除数据库记录、任务事件、worktree、分支或合并提交。
 - 有未结束的集群目标、Running 任务或活动 Agent 进程时禁止归档。
 - 已归档任务不能 claim；已归档项目不能创建任务、cluster goal 或 worktree，
   恢复后解除限制。
+- 只有 `completed`/`failed` 集群目标可以在没有活动 job 时归档；归档目标不能
+  直接改变状态，恢复后才能继续生命周期操作。
 
 ## MCP 工具
 
@@ -462,6 +518,10 @@ Invoke-RestMethod `
 - `team_review_task`
 - `team_add_message`
 - `team_list_messages`
+- `team_cluster_start`
+- `team_cluster_ensure`
+- `team_cluster_status`
+- `team_cluster_control`
 
 ## 状态规则
 
@@ -496,7 +556,19 @@ ready/review/blocked ──取消──→ canceled
 
 ## 自动 Agent 集群
 
-启动一个持续目标：
+非平凡开发任务优先使用幂等的 `cluster ensure`，确保每个项目只有一个未完成
+目标：
+
+```powershell
+.\scripts\team.ps1 cluster ensure `
+  --repo "D:\path\to\repo" `
+  --objective "实现并验证目标，自动拆分、执行、测试和验收" `
+  --autonomy auto
+```
+
+该命令会复用现有的 `planning`、`active` 或 `paused` 目标。返回值通过
+`created`、`reused` 和 `requires_resume` 区分结果；遇到 paused 目标只返回提示，
+不会自动恢复。需要明确创建新目标时使用 `cluster start`：
 
 ```powershell
 .\scripts\team.ps1 cluster start `
@@ -504,6 +576,103 @@ ready/review/blocked ──取消──→ canceled
   --objective "实现并验证目标，自动拆分、执行、测试和验收" `
   --autonomy auto
 ```
+
+`cluster start` 只用于显式新建目标；同一项目已有 `planning`/`active` 目标时会
+返回 `project already has active goal`。
+
+### 多集群容量与公平调度
+
+`teamd` 可以同时调度不同 Git 项目中的目标，但以下容量和隔离规则仍然生效：
+
+- 全局 Jobs 容量默认是 `4`。它统计所有项目中状态为 `starting` 或 `running`
+  的 Lead 和 Worker，因此 Lead 也占用全局槽位。
+- 每个 goal 的 Worker 容量默认是 `3`。Lead 不占每 goal 的 Worker 配额，但仍占
+  一个全局 Jobs 槽位；全局容量始终是更外层的上限。
+- 同一项目仍只允许一个 `planning` 或 `active` goal。需要并行多个集群时，应为
+  不同项目分别创建目标。
+- 调度器优先选择最久未启动任务的 goal，再比较该 goal 当前活动 job 数和 goal ID；
+  goal 内则按任务 priority、创建时间选择 Worker。这是持续填充全局槽位的公平
+  轮转，不保证每个 goal 获得固定槽位数。
+- 全局容量已满且某个 goal 仍有可派发 Worker 时，会记录
+  `fairness_deferred` 事件，数据包含 `reason: "global capacity full"`、
+  `ready_tasks` 和 `capacity`。相同 goal、相同原因的事件最多每 60 秒记录一次；
+  该事件只是排队审计信号，不会改变任务状态。
+
+不同项目的目标可以独立创建。例如：
+
+```powershell
+.\scripts\team.ps1 cluster start `
+  --repo "D:\work\project-a" `
+  --objective "完成 project-a 的实现与验证" `
+  --autonomy auto
+
+.\scripts\team.ps1 cluster start `
+  --repo "D:\work\project-b" `
+  --objective "完成 project-b 的实现与验证" `
+  --autonomy supervised
+```
+
+如果第二个目标指向第一目标所在的项目，会返回
+`project already has active goal`。
+
+### 调度配置
+
+以下环境变量由 `teamd` 和相关管理命令读取。四个调度/超时变量控制实际行为，
+两个 heartbeat 变量是可选诊断阈值：
+
+| 环境变量 | 默认值 | 输入范围 | 实际调度值/作用 |
+| --- | ---: | ---: | --- |
+| `CODEX_TEAM_CLUSTER_MAX_JOBS` | `4` | `1..86400` | 调度器再硬限制为最多 `16`；统计所有项目 Lead+Worker 的活动 job |
+| `CODEX_TEAM_CLUSTER_MAX_WORKERS` | `3` | `1..86400` | 调度器再硬限制为最多 `8`；限制每个 goal 的活动 Worker |
+| `CODEX_TEAM_WORKER_TIMEOUT_SECONDS` | `7200`（2 小时） | `1..86400` | Worker job 从启动到强制超时的时间 |
+| `CODEX_TEAM_LEAD_TIMEOUT_SECONDS` | `2700`（45 分钟） | `1..86400` | Lead job 从启动到强制超时的时间 |
+| `CODEX_TEAM_HEARTBEAT_WARNING_SECONDS` | `300`（5 分钟） | `1..86400` | Worker 心跳超过该时长后进入 warning |
+| `CODEX_TEAM_HEARTBEAT_CRITICAL_SECONDS` | `900`（15 分钟） | `1..86400` | Worker 心跳超过该时长后进入 critical；有效值不会低于 warning |
+
+空值或非整数使用默认值，超出范围的值会被限制到合法边界。配置在 `teamd`、
+管理命令和看板进程启动时读取；修改后先停止旧 daemon，再在同一个 PowerShell
+会话中设置变量并重新启动 daemon：
+
+```powershell
+.\scripts\team.ps1 cluster stop-daemon
+
+$env:CODEX_TEAM_CLUSTER_MAX_JOBS = "6"
+$env:CODEX_TEAM_CLUSTER_MAX_WORKERS = "2"
+$env:CODEX_TEAM_WORKER_TIMEOUT_SECONDS = "7200"
+$env:CODEX_TEAM_LEAD_TIMEOUT_SECONDS = "2700"
+$env:CODEX_TEAM_HEARTBEAT_WARNING_SECONDS = "300"
+$env:CODEX_TEAM_HEARTBEAT_CRITICAL_SECONDS = "900"
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File .\scripts\ensure-cluster-daemon.ps1
+.\scripts\team.ps1 cluster daemon-status
+```
+
+容量变量虽然接受 `1..86400` 的整数输入，但有效调度上限固定为全局 Jobs `16`、
+每 goal Workers `8`。例如输入 `999` 时，`teamd` 实际分别按 `16` 和 `8`
+调度。看板进程直接读取该进程环境中的整数配置；为避免显示值与实际调度不一致，
+应把变量设置在有效上限以内，并让 `teamd` 与看板使用相同环境。
+
+若 critical 阈值小于或等于 warning，调度器和看板都会把有效 critical 提升到
+warning，因此 critical 始终不早于 warning。两项心跳变量均可省略。
+
+WebUI 的 `global_capacity` 来自看板进程自身的环境。修改容量后还应停止并重新
+启动旧看板，使显示值、队列判断与 `teamd` 的实际调度保持一致。
+
+如果全局上限小于多个 goal 的 Worker 配额之和，全局上限优先。提高每 goal
+配额不会突破全局 Jobs 容量。
+
+### 长任务与心跳
+
+- Worker 最近一次 `claimed`、`heartbeat` 或 `progress` 事件超过 5 分钟后，记录
+  `worker_heartbeat_warning`。
+- 超过 15 分钟后记录 `worker_heartbeat_critical`。心跳告警只写入审计事件和
+  WebUI 健康指标，不会直接终止进程。
+- Worker 默认运行超过 2 小时会由 `teamd` 终止进程树并标记为失败；任务按
+  `max_worker_attempts` 恢复或最终 blocked。Lead 默认运行超过 45 分钟时执行
+  相同的超时处理，并按 Lead 重试上限处理。
+- 因此，心跳负责提示“可能失去进展”，超时负责实际回收失控 job。长任务应定期
+  调用 `team_heartbeat` 或写入 progress，同时确保其总运行时间留在配置范围内。
 
 常驻 `teamd` 会：
 
@@ -520,7 +689,9 @@ Codex 的 `workspace-write` 沙箱会把 `.git/` 递归设为只读，即使工�
 
 - `write` Worker 和 `auto` 模式 Lead 使用 `danger-full-access`，以便执行
   `git commit`、合并和验收。
-- 只读调研与普通 Review Worker 继续使用 `workspace-write`。
+- `read` 任务 Worker 与 Review Worker 使用 `read-only`。
+- `supervised` 模式 Lead 使用 `workspace-write`，不会获得自动合并和终审所需
+  的完整写权限。
 - 这只应运行在可信的本地项目和由 `teamd` 分配的隔离 worktree 中。
 - 项目初始化是幂等的；未显式传入 `--max-threads` 时保留已有配置，不会因为
   Lead 再次确认项目而把干净 checkout 改脏。
@@ -563,5 +734,5 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -File .\scripts\build-release.ps1
 ```
 
-输出位于 `dist\codex-team-board-v0.3.1.zip`，同时生成 SHA256 文件。GitHub
+输出位于 `dist\codex-team-board-v0.4.0.zip`，同时生成 SHA256 文件。GitHub
 Release 应附带 ZIP 与 `.sha256` 两个资产。
