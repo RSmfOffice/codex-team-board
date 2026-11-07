@@ -168,6 +168,24 @@ class _AppServerJobStartError(ClusterError):
     """An App Server job could not start after its one runtime restart."""
 
 
+class _AppServerGenerationDeltaError(ClusterError):
+    """An App Server RPC observed an internally replaced runtime process."""
+
+    def __init__(
+        self,
+        operation: str,
+        previous_generation: int,
+        current_generation: int,
+    ) -> None:
+        self.operation = operation
+        self.previous_generation = previous_generation
+        self.current_generation = current_generation
+        super().__init__(
+            f"{operation} observed App Server runtime generation change "
+            f"from {previous_generation} to {current_generation}"
+        )
+
+
 class ClusterManager:
     def __init__(
         self,
@@ -1791,6 +1809,72 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                 (generation, job_id),
             )
 
+    def _call_app_server_rpc(
+        self,
+        runtime: Any,
+        *,
+        job_id: str,
+        operation: str,
+        request: Any,
+    ) -> Any:
+        before = self._current_runtime_generation(runtime)
+        try:
+            result = request()
+        except Exception as exc:
+            after = self._current_runtime_generation(runtime)
+            if (
+                before is not None
+                and after is not None
+                and after != before
+            ):
+                self._isolate_app_server_generation_delta(
+                    runtime,
+                    job_id=job_id,
+                    operation=operation,
+                    previous_generation=before,
+                    current_generation=after,
+                )
+                raise _AppServerGenerationDeltaError(
+                    operation,
+                    before,
+                    after,
+                ) from exc
+            raise
+        after = self._current_runtime_generation(runtime)
+        if before is not None and after is not None and after != before:
+            self._isolate_app_server_generation_delta(
+                runtime,
+                job_id=job_id,
+                operation=operation,
+                previous_generation=before,
+                current_generation=after,
+            )
+        return result
+
+    def _isolate_app_server_generation_delta(
+        self,
+        runtime: Any,
+        *,
+        job_id: str,
+        operation: str,
+        previous_generation: int,
+        current_generation: int,
+    ) -> None:
+        generation = self._current_runtime_generation(runtime)
+        self._record_app_turn_generation(
+            job_id,
+            generation if generation is not None else current_generation,
+        )
+        self._lose_other_app_server_jobs(
+            current_job_id=job_id,
+            reason=(
+                f"App Server runtime generation changed from "
+                f"{previous_generation} to "
+                f"{generation if generation is not None else current_generation}"
+                f" during {operation}"
+            ),
+        )
+
     @staticmethod
     def _redact_error(message: str) -> str:
         return _redact_sensitive_log(str(message))
@@ -1916,8 +2000,33 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                 service_name="codex-team-cluster",
             )
 
+        def guarded_start() -> str:
+            return self._call_app_server_rpc(
+                runtime,
+                job_id=job_id,
+                operation="thread/start",
+                request=start,
+            )
+
         try:
-            return start()
+            return guarded_start()
+        except _AppServerGenerationDeltaError as first_error:
+            first_failure = self._app_server_failure(
+                f"thread/start failed: "
+                f"{self._redact_error(str(first_error))}",
+                runtime,
+            )
+            try:
+                return guarded_start()
+            except Exception as second_error:
+                raise _AppServerJobStartError(
+                    self._app_server_failure(
+                        f"{first_failure}; fresh-thread retry after runtime "
+                        f"generation change failed: "
+                        f"{self._redact_error(str(second_error))}",
+                        runtime,
+                    )
+                ) from second_error
         except Exception as first_error:
             first_failure = self._app_server_failure(
                 f"thread/start failed: "
@@ -1942,7 +2051,7 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                     f"{self._redact_error(str(restart_error))}"
                 ) from restart_error
             try:
-                return start()
+                return guarded_start()
             except Exception as second_error:
                 raise _AppServerJobStartError(
                     self._app_server_failure(
@@ -1951,6 +2060,54 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                         runtime,
                     )
                 ) from second_error
+
+    def _resume_thread_and_retry_app_turn(
+        self,
+        runtime: Any,
+        thread_id: str,
+        turn_input: str,
+        *,
+        cwd: Path,
+        sandbox_mode: str,
+        job_id: str,
+        first_failure: str,
+    ) -> dict[str, Any]:
+        try:
+            restored_thread_id = self._call_app_server_rpc(
+                runtime,
+                job_id=job_id,
+                operation="thread/resume",
+                request=lambda: runtime.resume_thread(thread_id),
+            )
+        except Exception as resume_error:
+            raise _AppServerJobStartError(
+                self._app_server_failure(
+                    f"{first_failure}; thread reload after replacement failed: "
+                    f"{self._redact_error(str(resume_error))}",
+                    runtime,
+                )
+            ) from resume_error
+        try:
+            return self._call_app_server_rpc(
+                runtime,
+                job_id=job_id,
+                operation="turn/start retry",
+                request=lambda: runtime.start_turn(
+                    restored_thread_id,
+                    turn_input,
+                    cwd=cwd,
+                    sandbox_mode=sandbox_mode,
+                    model=self.model or None,
+                ),
+            )
+        except Exception as second_error:
+            raise _AppServerJobStartError(
+                self._app_server_failure(
+                    f"{first_failure}; retry after replacement failed: "
+                    f"{self._redact_error(str(second_error))}",
+                    runtime,
+                )
+            ) from second_error
 
     def _start_app_turn_with_restart(
         self,
@@ -1971,8 +2128,31 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                 model=self.model or None,
             )
 
+        def guarded_start() -> dict[str, Any]:
+            return self._call_app_server_rpc(
+                runtime,
+                job_id=job_id,
+                operation="turn/start",
+                request=start,
+            )
+
         try:
-            return start()
+            return guarded_start()
+        except _AppServerGenerationDeltaError as first_error:
+            first_failure = self._app_server_failure(
+                f"turn/start failed: "
+                f"{self._redact_error(str(first_error))}",
+                runtime,
+            )
+            return self._resume_thread_and_retry_app_turn(
+                runtime,
+                thread_id,
+                turn_input,
+                cwd=cwd,
+                sandbox_mode=sandbox_mode,
+                job_id=job_id,
+                first_failure=first_failure,
+            )
         except Exception as first_error:
             first_failure = self._app_server_failure(
                 f"turn/start failed: "
@@ -1996,32 +2176,15 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                     f"restart failed: "
                     f"{self._redact_error(str(restart_error))}"
                 ) from restart_error
-            try:
-                restored_thread_id = runtime.resume_thread(thread_id)
-            except Exception as resume_error:
-                raise _AppServerJobStartError(
-                    self._app_server_failure(
-                        f"{first_failure}; thread reload after restart failed: "
-                        f"{self._redact_error(str(resume_error))}",
-                        runtime,
-                    )
-                ) from resume_error
-            try:
-                return runtime.start_turn(
-                    restored_thread_id,
-                    turn_input,
-                    cwd=cwd,
-                    sandbox_mode=sandbox_mode,
-                    model=self.model or None,
-                )
-            except Exception as second_error:
-                raise _AppServerJobStartError(
-                    self._app_server_failure(
-                        f"{first_failure}; retry after restart failed: "
-                        f"{self._redact_error(str(second_error))}",
-                        runtime,
-                    )
-                ) from second_error
+            return self._resume_thread_and_retry_app_turn(
+                runtime,
+                thread_id,
+                turn_input,
+                cwd=cwd,
+                sandbox_mode=sandbox_mode,
+                job_id=job_id,
+                first_failure=first_failure,
+            )
 
     def _start_app_server_job(
         self,
@@ -2066,14 +2229,26 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
             )
             if agent is not None:
                 try:
-                    thread_id = runtime.resume_thread(str(agent["thread_id"]))
+                    thread_id = self._call_app_server_rpc(
+                        runtime,
+                        job_id=job_id,
+                        operation="thread/resume",
+                        request=lambda: runtime.resume_thread(
+                            str(agent["thread_id"])
+                        ),
+                    )
                 except Exception as exc:
                     reason = self._app_server_failure(
                         f"thread resume failed: "
                         f"{self._redact_error(str(exc))}",
                         runtime,
                     )
-                    if not self._health_is_healthy(
+                    if isinstance(exc, _AppServerGenerationDeltaError):
+                        reason += (
+                            "; runtime generation changed, so the replacement "
+                            "process will use a fresh thread"
+                        )
+                    elif not self._health_is_healthy(
                         self._runtime_health(runtime)
                     ):
                         try:

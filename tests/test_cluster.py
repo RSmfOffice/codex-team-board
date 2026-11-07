@@ -96,6 +96,9 @@ class StubAppServerRuntime:
         fail_start_thread: int = 0,
         fail_turn: int = 0,
         disconnect_turn_attempt: int | None = None,
+        restart_start_thread_attempt: int | None = None,
+        restart_resume_attempt: int | None = None,
+        restart_turn_attempt: int | None = None,
         stderr_lines: tuple[str, ...] = (),
     ) -> None:
         self.fail_start = fail_start
@@ -104,6 +107,9 @@ class StubAppServerRuntime:
         self.fail_start_thread = fail_start_thread
         self.fail_turn = fail_turn
         self.disconnect_turn_attempt = disconnect_turn_attempt
+        self.restart_start_thread_attempt = restart_start_thread_attempt
+        self.restart_resume_attempt = restart_resume_attempt
+        self.restart_turn_attempt = restart_turn_attempt
         self.stderr_lines = stderr_lines
         self.start_calls = 0
         self.restart_calls = 0
@@ -121,34 +127,51 @@ class StubAppServerRuntime:
         self._turn_sequence = 0
         self._healthy = False
         self._generation = 0
-        self._lock = threading.Lock()
+        self._loaded_threads: set[str] = set()
+        self._lock = threading.RLock()
 
     def start(self) -> dict:
-        self.start_calls += 1
-        if self.start_calls <= self.fail_start:
-            raise RuntimeError("startup failed")
-        if not self._healthy:
-            self._generation += 1
-        self._healthy = True
-        return self.health()
+        with self._lock:
+            self.start_calls += 1
+            if self.start_calls <= self.fail_start:
+                raise RuntimeError("startup failed")
+            if not self._healthy:
+                self._generation += 1
+                self._loaded_threads.clear()
+            self._healthy = True
+            return self.health()
 
     def restart(self) -> dict:
-        self.restart_calls += 1
-        if self.restart_calls <= self.fail_restart:
-            raise RuntimeError("restart failed")
-        self._generation += 1
-        self._healthy = True
-        return self.health()
+        with self._lock:
+            self.restart_calls += 1
+            if self.restart_calls <= self.fail_restart:
+                raise RuntimeError("restart failed")
+            self._generation += 1
+            self._healthy = True
+            self._loaded_threads.clear()
+            return self.health()
 
     def stop(self) -> None:
-        self.stop_calls += 1
+        with self._lock:
+            self.stop_calls += 1
+            self._loaded_threads.clear()
 
     def health(self) -> dict:
-        return {
-            "healthy": self._healthy,
-            "running": self._healthy,
-            "generation": self._generation,
-        }
+        with self._lock:
+            return {
+                "healthy": self._healthy,
+                "running": self._healthy,
+                "generation": self._generation,
+            }
+
+    def list_loaded_threads(self) -> list[str]:
+        with self._lock:
+            return sorted(self._loaded_threads)
+
+    @property
+    def generation(self) -> int:
+        with self._lock:
+            return self._generation
 
     def start_thread(
         self,
@@ -162,17 +185,37 @@ class StubAppServerRuntime:
             self.start_thread_attempts += 1
             if self.start_thread_attempts <= self.fail_start_thread:
                 raise RuntimeError("thread/start failed")
+            if (
+                self.start_thread_attempts
+                == self.restart_start_thread_attempt
+            ):
+                self._generation += 1
+                self._healthy = True
+                self._loaded_threads.clear()
+                raise RuntimeError(
+                    "thread/start failed after an automatic runtime restart"
+                )
             self._thread_sequence += 1
             thread_id = f"stub-thread-{self._thread_sequence}"
             self.start_threads.append((str(cwd), developer_instructions))
+            self._loaded_threads.add(thread_id)
             return thread_id
 
     def resume_thread(self, thread_id: str, exclude_turns: bool = True) -> str:
-        self.resume_attempts += 1
-        if self.resume_attempts <= self.fail_resume:
-            raise RuntimeError("modelProviderMismatch during thread/resume")
-        self.resume_threads.append(thread_id)
-        return thread_id
+        with self._lock:
+            self.resume_attempts += 1
+            if self.resume_attempts <= self.fail_resume:
+                raise RuntimeError("modelProviderMismatch during thread/resume")
+            if self.resume_attempts == self.restart_resume_attempt:
+                self._generation += 1
+                self._healthy = True
+                self._loaded_threads.clear()
+                raise RuntimeError(
+                    "thread/resume failed after an automatic runtime restart"
+                )
+            self.resume_threads.append(thread_id)
+            self._loaded_threads.add(thread_id)
+            return thread_id
 
     def start_turn(
         self,
@@ -190,6 +233,13 @@ class StubAppServerRuntime:
             if self.turn_attempts == self.disconnect_turn_attempt:
                 self._healthy = False
                 raise RuntimeError("turn/start disconnected")
+            if self.turn_attempts == self.restart_turn_attempt:
+                self._generation += 1
+                self._healthy = True
+                self._loaded_threads.clear()
+                raise RuntimeError(
+                    "turn/start failed after an automatic runtime restart"
+                )
             self._turn_sequence += 1
             turn_id = f"stub-turn-{self._turn_sequence}"
             self.turns.append(
@@ -201,6 +251,7 @@ class StubAppServerRuntime:
                     "sandbox_mode": sandbox_mode,
                 }
             )
+            self._loaded_threads.add(thread_id)
             return {"turn_id": turn_id, "status": "inProgress"}
 
     def interrupt_turn(self, thread_id: str, turn_id: str) -> None:
@@ -1843,6 +1894,10 @@ class ClusterSchedulerTests(unittest.TestCase):
                 manager.app_turns[first["job_id"]]["runtime_generation"],
                 1,
             )
+            self.assertIn(
+                first["thread_id"],
+                runtime.list_loaded_threads(),
+            )
             self.assertNotIn(second["job_id"], manager.app_turns)
             self.assertIn(
                 "process remained healthy",
@@ -1938,6 +1993,273 @@ class ClusterSchedulerTests(unittest.TestCase):
                 worker_other["job_id"],
             )
             self.assertIn("unhealthy App Server", recovered[-1]["reason"])
+
+    def test_internal_restart_during_turn_start_isolates_old_jobs_before_return(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            repo = _repo(base, "turn-start-generation-delta")
+            runtime = StubAppServerRuntime()
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime=runtime,
+                runtime_mode="app_server",
+            )
+            goal, tasks = self._goal_with_ready_tasks(
+                manager,
+                team,
+                repo,
+                3,
+            )
+            old_worker = manager._dispatch_worker(
+                manager.get_goal(goal["goal_id"]),
+                team.get_task(tasks[0]["task_id"]),
+            )
+            team.claim_task(tasks[0]["task_id"], actor="generation-a")
+            old_explorer = manager._dispatch_worker(
+                manager.get_goal(goal["goal_id"]),
+                team.get_task(tasks[1]["task_id"]),
+            )
+            team.claim_task(tasks[1]["task_id"], actor="generation-b")
+            runtime.restart_turn_attempt = runtime.turn_attempts + 1
+
+            current = manager._dispatch_worker(
+                manager.get_goal(goal["goal_id"]),
+                team.get_task(tasks[2]["task_id"]),
+            )
+
+            result = manager.get_goal(goal["goal_id"])
+            jobs = {job["job_id"]: job for job in result["jobs"]}
+            self.assertEqual(current["runtime"], "app_server")
+            self.assertEqual(runtime.restart_calls, 0)
+            self.assertEqual(runtime.generation, 2)
+            self.assertEqual(jobs[old_worker["job_id"]]["status"], "lost")
+            self.assertEqual(jobs[old_explorer["job_id"]]["status"], "lost")
+            self.assertEqual(jobs[current["job_id"]]["status"], "running")
+            self.assertEqual(
+                jobs[old_worker["job_id"]]["runtime_generation"],
+                1,
+            )
+            self.assertEqual(
+                jobs[old_explorer["job_id"]]["runtime_generation"],
+                1,
+            )
+            self.assertEqual(
+                jobs[current["job_id"]]["runtime_generation"],
+                2,
+            )
+            self.assertEqual(
+                manager.app_turns[current["job_id"]]["runtime_generation"],
+                2,
+            )
+            self.assertEqual(
+                {
+                    job["job_id"]
+                    for job in result["jobs"]
+                    if job["status"] == "lost"
+                },
+                {old_worker["job_id"], old_explorer["job_id"]},
+            )
+            self.assertEqual(
+                team.get_task(tasks[0]["task_id"])["status"],
+                "ready",
+            )
+            self.assertEqual(
+                team.get_task(tasks[1]["task_id"])["status"],
+                "ready",
+            )
+            recovered = {
+                event["data"]["job_id"]
+                for event in result["events"]
+                if event["event_type"] == "worker_recovered"
+            }
+            self.assertTrue(
+                {old_worker["job_id"], old_explorer["job_id"]} <= recovered
+            )
+            lost_events = [
+                event["data"]
+                for event in result["events"]
+                if event["event_type"] == "app_server_turn_lost"
+            ]
+            self.assertEqual(len(lost_events), 2)
+            self.assertTrue(
+                all(
+                    event["runtime_generation"] == 1
+                    and event["current_runtime_generation"] == 2
+                    for event in lost_events
+                )
+            )
+            fallback_events = [
+                event
+                for event in result["events"]
+                if event["event_type"] == "agent_runtime_fallback"
+                and event["data"].get("job_id") == current["job_id"]
+            ]
+            self.assertEqual(fallback_events, [])
+
+    def test_internal_restart_during_fresh_thread_start_retries_once_on_new_generation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            repo = _repo(base, "thread-start-generation-delta")
+            runtime = StubAppServerRuntime()
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime=runtime,
+                runtime_mode="app_server",
+            )
+            goal, tasks = self._goal_with_ready_tasks(
+                manager,
+                team,
+                repo,
+                3,
+            )
+            old_worker = manager._dispatch_worker(
+                manager.get_goal(goal["goal_id"]),
+                team.get_task(tasks[0]["task_id"]),
+            )
+            team.claim_task(tasks[0]["task_id"], actor="thread-generation-a")
+            old_explorer = manager._dispatch_worker(
+                manager.get_goal(goal["goal_id"]),
+                team.get_task(tasks[1]["task_id"]),
+            )
+            team.claim_task(tasks[1]["task_id"], actor="thread-generation-b")
+            runtime.restart_start_thread_attempt = (
+                runtime.start_thread_attempts + 1
+            )
+
+            current = manager._dispatch_worker(
+                manager.get_goal(goal["goal_id"]),
+                team.get_task(tasks[2]["task_id"]),
+            )
+
+            result = manager.get_goal(goal["goal_id"])
+            jobs = {job["job_id"]: job for job in result["jobs"]}
+            self.assertEqual(current["runtime"], "app_server")
+            self.assertEqual(runtime.restart_calls, 0)
+            self.assertEqual(runtime.generation, 2)
+            self.assertEqual(runtime.start_thread_attempts, 4)
+            self.assertEqual(jobs[old_worker["job_id"]]["status"], "lost")
+            self.assertEqual(jobs[old_explorer["job_id"]]["status"], "lost")
+            self.assertEqual(jobs[current["job_id"]]["status"], "running")
+            self.assertEqual(
+                jobs[current["job_id"]]["runtime_generation"],
+                2,
+            )
+            lost_events = [
+                event["data"]
+                for event in result["events"]
+                if event["event_type"] == "app_server_turn_lost"
+            ]
+            self.assertEqual(len(lost_events), 2)
+            self.assertTrue(
+                all(
+                    event["runtime_generation"] == 1
+                    and event["current_runtime_generation"] == 2
+                    for event in lost_events
+                )
+            )
+
+    def test_internal_restart_during_thread_resume_isolates_jobs_and_starts_fresh_once(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            repo = _repo(base, "resume-generation-delta")
+            runtime = StubAppServerRuntime()
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime=runtime,
+                runtime_mode="app_server",
+            )
+            project = team.init_project(repo)
+            goal, tasks = self._goal_with_ready_tasks(
+                manager,
+                team,
+                repo,
+                2,
+            )
+            old_worker = manager._dispatch_worker(
+                manager.get_goal(goal["goal_id"]),
+                team.get_task(tasks[0]["task_id"]),
+            )
+            team.claim_task(tasks[0]["task_id"], actor="resume-generation-a")
+            old_explorer = manager._dispatch_worker(
+                manager.get_goal(goal["goal_id"]),
+                team.get_task(tasks[1]["task_id"]),
+            )
+            team.claim_task(tasks[1]["task_id"], actor="resume-generation-b")
+            pool = AgentPool(settings)
+            old_agent = pool.register_thread(
+                project["project_id"],
+                "lead",
+                str(goal["workstream_key"]),
+                "stale-generation-thread",
+                manager.model,
+                manager.model_provider,
+                "stale generation lead",
+            )
+            with team.connection() as connection:
+                connection.execute(
+                    """
+                    UPDATE cluster_goals
+                    SET lead_thread_id = ?, updated_at = ?
+                    WHERE goal_id = ?
+                    """,
+                    (old_agent["thread_id"], utc_now(), goal["goal_id"]),
+                )
+            runtime.restart_resume_attempt = runtime.resume_attempts + 1
+
+            current = manager._dispatch_lead(
+                manager.get_goal(goal["goal_id"]),
+                team.list_tasks(repo, goal_id=goal["goal_id"]),
+            )
+
+            result = manager.get_goal(goal["goal_id"])
+            jobs = {job["job_id"]: job for job in result["jobs"]}
+            self.assertEqual(current["runtime"], "app_server")
+            self.assertEqual(runtime.restart_calls, 0)
+            self.assertEqual(runtime.generation, 2)
+            self.assertEqual(runtime.resume_attempts, 1)
+            self.assertEqual(len(runtime.start_threads), 3)
+            self.assertEqual(jobs[old_worker["job_id"]]["status"], "lost")
+            self.assertEqual(jobs[old_explorer["job_id"]]["status"], "lost")
+            self.assertEqual(jobs[current["job_id"]]["status"], "running")
+            self.assertNotEqual(current["thread_id"], old_agent["thread_id"])
+            self.assertEqual(
+                jobs[current["job_id"]]["runtime_generation"],
+                2,
+            )
+            failed = next(
+                agent
+                for agent in pool.list_agents(project["project_id"])
+                if agent["agent_id"] == old_agent["agent_id"]
+            )
+            self.assertEqual(failed["status"], "failed")
+            lost_events = [
+                event["data"]
+                for event in result["events"]
+                if event["event_type"] == "app_server_turn_lost"
+            ]
+            self.assertEqual(len(lost_events), 2)
+            self.assertTrue(
+                all(
+                    event["runtime_generation"] == 1
+                    and event["current_runtime_generation"] == 2
+                    for event in lost_events
+                )
+            )
 
     def test_generation_switch_reconciles_old_jobs_before_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
