@@ -80,8 +80,8 @@ class ClusterManager:
             if max_jobs is None
             else int(max_jobs)
         )
-        self.max_workers = max(1, configured_workers)
-        self.max_jobs = max(1, configured_jobs)
+        self.max_workers = max(1, min(configured_workers, 8))
+        self.max_jobs = max(1, min(configured_jobs, 16))
         self.worker_timeout_seconds = env_int(
             "CODEX_TEAM_WORKER_TIMEOUT_SECONDS",
             DEFAULT_WORKER_TIMEOUT_SECONDS,
@@ -90,8 +90,17 @@ class ClusterManager:
             "CODEX_TEAM_LEAD_TIMEOUT_SECONDS",
             DEFAULT_LEAD_TIMEOUT_SECONDS,
         )
-        self.heartbeat_warning_seconds = DEFAULT_HEARTBEAT_WARNING_SECONDS
-        self.heartbeat_critical_seconds = DEFAULT_HEARTBEAT_CRITICAL_SECONDS
+        self.heartbeat_warning_seconds = env_int(
+            "CODEX_TEAM_HEARTBEAT_WARNING_SECONDS",
+            DEFAULT_HEARTBEAT_WARNING_SECONDS,
+        )
+        self.heartbeat_critical_seconds = max(
+            self.heartbeat_warning_seconds,
+            env_int(
+                "CODEX_TEAM_HEARTBEAT_CRITICAL_SECONDS",
+                DEFAULT_HEARTBEAT_CRITICAL_SECONDS,
+            ),
+        )
         self.lead_cooldown_seconds = max(0.0, float(lead_cooldown_seconds))
         self.processes: dict[str, subprocess.Popen[str]] = {}
         self.log_threads: dict[str, threading.Thread] = {}
@@ -334,7 +343,13 @@ class ClusterManager:
         root = Path(goal["root_path"])
         tasks = self.team.list_tasks(root, goal_id=goal_id, include_done=True)
         active_workers = self._active_worker_jobs(goal_id)
-        if tasks and all(item["status"] in TERMINAL_TASK_STATUSES for item in tasks):
+        active_lead = self._active_lead_job(goal_id)
+        if (
+            tasks
+            and all(item["status"] in TERMINAL_TASK_STATUSES for item in tasks)
+            and not active_workers
+            and not active_lead
+        ):
             self.set_goal_status(goal_id, "completed", reason="all tasks completed")
             return False
         if (
@@ -739,11 +754,15 @@ review focus, or call `team_block_task` with a precise blocker.
             role=role,
             cwd=cwd,
             prompt=prompt,
-            sandbox_mode=(
-                "danger-full-access"
-                if task["kind"] == "write"
-                else "workspace-write"
-            ),
+            sandbox_mode=self._worker_sandbox_mode(task),
+        )
+
+    @staticmethod
+    def _worker_sandbox_mode(task: dict[str, Any]) -> str:
+        return (
+            "danger-full-access"
+            if task.get("kind") == "write"
+            else "read-only"
         )
 
     def _dispatch_lead(

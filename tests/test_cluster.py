@@ -234,6 +234,18 @@ class ClusterSchedulerTests(unittest.TestCase):
             self.assertIn("danger-full-access", initial)
             self.assertIn('sandbox_mode="danger-full-access"', resumed)
             self.assertNotIn("workspace-write", initial)
+            self.assertEqual(
+                manager._worker_sandbox_mode({"kind": "read"}),
+                "read-only",
+            )
+            self.assertEqual(
+                manager._worker_sandbox_mode({"kind": "review"}),
+                "read-only",
+            )
+            self.assertEqual(
+                manager._worker_sandbox_mode({"kind": "write"}),
+                "danger-full-access",
+            )
 
     def test_lead_resume_worker_retry_and_goal_completion(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -551,6 +563,8 @@ class ClusterSchedulerTests(unittest.TestCase):
                 "CODEX_TEAM_CLUSTER_MAX_WORKERS": "2",
                 "CODEX_TEAM_WORKER_TIMEOUT_SECONDS": "4800",
                 "CODEX_TEAM_LEAD_TIMEOUT_SECONDS": "1800",
+                "CODEX_TEAM_HEARTBEAT_WARNING_SECONDS": "120",
+                "CODEX_TEAM_HEARTBEAT_CRITICAL_SECONDS": "60",
             }
             with patch.dict(os.environ, environment):
                 manager = ClusterManager(
@@ -562,14 +576,8 @@ class ClusterSchedulerTests(unittest.TestCase):
             self.assertEqual(manager.max_workers, 2)
             self.assertEqual(manager.worker_timeout_seconds, 4800)
             self.assertEqual(manager.lead_timeout_seconds, 1800)
-            self.assertEqual(
-                manager.heartbeat_warning_seconds,
-                DEFAULT_HEARTBEAT_WARNING_SECONDS,
-            )
-            self.assertEqual(
-                manager.heartbeat_critical_seconds,
-                DEFAULT_HEARTBEAT_CRITICAL_SECONDS,
-            )
+            self.assertEqual(manager.heartbeat_warning_seconds, 120)
+            self.assertEqual(manager.heartbeat_critical_seconds, 120)
             old_job = {
                 "kind": "worker",
                 "started_at": _iso_seconds_ago(4700),
@@ -594,6 +602,74 @@ class ClusterSchedulerTests(unittest.TestCase):
                 45 * 60,
             )
             self.assertEqual(DEFAULT_GLOBAL_JOB_CAPACITY, 4)
+            with patch.dict(
+                os.environ,
+                {
+                    "CODEX_TEAM_CLUSTER_MAX_JOBS": "999",
+                    "CODEX_TEAM_CLUSTER_MAX_WORKERS": "999",
+                },
+            ):
+                capped = ClusterManager(
+                    settings,
+                    team=TeamService(settings),
+                    agent_command=["codex"],
+                )
+            self.assertEqual(capped.max_jobs, 16)
+            self.assertEqual(capped.max_workers, 8)
+
+    def test_goal_does_not_complete_while_a_lead_job_is_active(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            manager = ClusterManager(
+                settings,
+                team=team,
+                agent_command=["codex"],
+            )
+            repo = _repo(base, "goal-completion")
+            goal, tasks = self._goal_with_ready_tasks(
+                manager,
+                team,
+                repo,
+                1,
+            )
+            manager.set_goal_status(goal["goal_id"], "active")
+            with team.connection() as connection:
+                connection.execute(
+                    "UPDATE tasks SET status = 'done' WHERE task_id = ?",
+                    (tasks[0]["task_id"],),
+                )
+            self._insert_job(
+                team,
+                goal["goal_id"],
+                job_id="J-ACTIVE-LEAD",
+                kind="lead",
+                status="running",
+                started_at=_iso_seconds_ago(5),
+                pid=os.getpid(),
+            )
+
+            self.assertTrue(manager._prepare_goal(manager.get_goal(goal["goal_id"])))
+            self.assertEqual(
+                manager.get_goal(goal["goal_id"])["status"],
+                "active",
+            )
+
+            with team.connection() as connection:
+                connection.execute(
+                    """
+                    UPDATE cluster_jobs
+                    SET status = 'completed', finished_at = ?
+                    WHERE job_id = 'J-ACTIVE-LEAD'
+                    """,
+                    (utc_now(),),
+                )
+            self.assertFalse(manager._prepare_goal(manager.get_goal(goal["goal_id"])))
+            self.assertEqual(
+                manager.get_goal(goal["goal_id"])["status"],
+                "completed",
+            )
 
     def test_worker_heartbeat_warning_and_critical_alert_without_kill(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

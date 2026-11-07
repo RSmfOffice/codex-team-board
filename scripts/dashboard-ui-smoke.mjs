@@ -332,8 +332,8 @@ assert.match(clusterHtmlBefore, /warning · 5 分钟/);
 assert.match(clusterHtmlBefore, /critical · 16 分钟/);
 assert.match(clusterHtmlBefore, /全局容量已满/);
 assert.match(clusterHtmlBefore, /目标容量已满/);
-assert.match(clusterHtmlBefore, /预计等待 2 分钟/);
-assert.match(clusterHtmlBefore, /预计等待 5 分钟/);
+assert.match(clusterHtmlBefore, /当前等待 2 分钟/);
+assert.match(clusterHtmlBefore, /当前等待 5 分钟/);
 assert.match(clusterHtmlBefore, /data-heartbeat-state="warning"/);
 assert.match(clusterHtmlBefore, /data-heartbeat-state="critical"/);
 assert.match(clusterHtmlBefore, /data-queue-reason="global_capacity"/);
@@ -476,6 +476,7 @@ assert.deepEqual(
       "ready",
       "global_capacity",
       "goal_capacity",
+      "dependency_wait",
       "waiting_for_lead",
       "none",
     ].map((state) => [
@@ -490,6 +491,7 @@ assert.deepEqual(
     ready: "等待调度",
     global_capacity: "全局容量已满",
     goal_capacity: "目标容量已满",
+    dependency_wait: "等待依赖完成",
     waiting_for_lead: "等待 Lead 规划",
     none: "无排队",
   },

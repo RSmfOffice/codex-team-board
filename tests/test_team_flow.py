@@ -945,6 +945,7 @@ class TeamFlowTests(unittest.TestCase):
             "review_pending",
             "blocked",
             "ready",
+            "dependency_wait",
             "global_capacity",
             "goal_capacity",
             "waiting_for_lead",
@@ -1050,6 +1051,96 @@ class TeamFlowTests(unittest.TestCase):
                     dashboard["cluster_summary"]["fairness_wait_count"],
                     0,
                 )
+
+    def test_dependency_wait_and_lead_heartbeat_are_not_false_alarms(self) -> None:
+        manager = ClusterManager(
+            self.settings,
+            team=self.team,
+            worktrees=self.worktrees,
+        )
+        goal = manager.create_goal(
+            self.repo,
+            objective="Dependency and lead diagnostics",
+            autonomy="auto",
+        )
+        manager.set_goal_status(goal["goal_id"], "active")
+        blocker = self.team.create_task(
+            self.repo,
+            title="Backlog blocker",
+            description="Keeps the dependent task blocked without an active job.",
+            acceptance="dependency remains pending",
+            kind="read",
+            owner_role="team_explorer",
+            goal_id=goal["goal_id"],
+        )
+        dependent = self.team.create_task(
+            self.repo,
+            title="Dependency waiter",
+            description="Must not be reported as ready for scheduling.",
+            acceptance="queue reason is dependency_wait",
+            kind="read",
+            owner_role="team_explorer",
+            goal_id=goal["goal_id"],
+            depends_on=[blocker["task_id"]],
+        )
+        now = datetime.now(UTC)
+        with self.team.connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET status = 'backlog' WHERE task_id = ?",
+                (blocker["task_id"],),
+            )
+            connection.execute(
+                """
+                UPDATE tasks SET created_at = ?, updated_at = ?
+                WHERE task_id = ?
+                """,
+                (
+                    (now - timedelta(seconds=600))
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                    (now - timedelta(seconds=600))
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                    dependent["task_id"],
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO cluster_jobs(
+                    job_id, goal_id, task_id, kind, role, status,
+                    log_path, output_path, started_at
+                ) VALUES (?, ?, NULL, 'lead', 'lead', 'running', ?, ?, ?)
+                """,
+                (
+                    "J-OLD-LEAD-NO-HEARTBEAT",
+                    goal["goal_id"],
+                    str(self.base / "old-lead.log"),
+                    str(self.base / "old-lead.out"),
+                    (now - timedelta(seconds=3600))
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                ),
+            )
+
+        dashboard = self.team.dashboard_snapshot()
+        saved = next(
+            item
+            for item in dashboard["cluster_goals"]
+            if item["goal_id"] == goal["goal_id"]
+        )
+        self.assertEqual(saved["queue_reason"], "dependency_wait")
+        self.assertGreaterEqual(saved["estimated_wait_seconds"], 590)
+        self.assertEqual(saved["heartbeat_state"], "normal")
+        self.assertEqual(saved["heartbeat_age_seconds"], 0)
+        self.assertEqual(dashboard["cluster_summary"]["heartbeat_overdue"], 0)
+        self.assertEqual(
+            dashboard["cluster_summary"]["oldest_heartbeat_age_seconds"],
+            0,
+        )
+        self.assertEqual(
+            dashboard["cluster_summary"]["fairness_wait_count"],
+            0,
+        )
 
     def test_mcp_handoff_flow(self) -> None:
         create_tool = next(

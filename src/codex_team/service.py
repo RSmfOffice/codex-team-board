@@ -896,15 +896,19 @@ class TeamService:
                     return "warning"
                 return "normal"
 
-            job_heartbeat_ages: dict[str, int] = {}
+            worker_heartbeat_ages: dict[str, int] = {}
             for job in active_jobs:
+                if job.get("kind") != "worker":
+                    continue
                 heartbeat_at = job.get("started_at")
-                if job.get("kind") == "worker" and job.get("task_id"):
+                if job.get("task_id"):
                     heartbeat_at = latest_task_activity.get(
                         str(job["task_id"]),
                         heartbeat_at,
                     )
-                job_heartbeat_ages[str(job["job_id"])] = age_seconds(heartbeat_at)
+                worker_heartbeat_ages[str(job["job_id"])] = age_seconds(
+                    heartbeat_at
+                )
             for task in tasks:
                 task["active_job"] = active_jobs_by_task.get(task["task_id"])
                 wait_seconds = 0
@@ -1034,8 +1038,9 @@ class TeamService:
                 goal["active_job_count"] = len(goal_jobs)
                 goal_heartbeat_age = max(
                     (
-                        job_heartbeat_ages[str(job["job_id"])]
+                        worker_heartbeat_ages[str(job["job_id"])]
                         for job in goal_jobs
+                        if str(job["job_id"]) in worker_heartbeat_ages
                     ),
                     default=0,
                 )
@@ -1078,8 +1083,10 @@ class TeamService:
                     queue_reason = "review_pending"
                 elif blocked_tasks:
                     queue_reason = "blocked"
-                elif ready_tasks:
+                elif dispatchable_ready:
                     queue_reason = "ready"
+                elif ready_tasks:
+                    queue_reason = "dependency_wait"
                 elif goal_jobs or any(
                     task["status"] == "running" for task in goal_tasks
                 ):
@@ -1101,6 +1108,9 @@ class TeamService:
                 elif queue_reason == "ready":
                     wait_tasks = ready_tasks
                     wait_field = "created_at"
+                elif queue_reason == "dependency_wait":
+                    wait_tasks = ready_tasks
+                    wait_field = "updated_at"
                 elif queue_reason == "waiting_for_lead":
                     wait_tasks = []
                     wait_field = "updated_at"
@@ -1191,10 +1201,10 @@ class TeamService:
                 ),
                 "heartbeat_overdue": sum(
                     age >= heartbeat_warning_seconds
-                    for age in job_heartbeat_ages.values()
+                    for age in worker_heartbeat_ages.values()
                 ),
                 "oldest_heartbeat_age_seconds": max(
-                    job_heartbeat_ages.values(),
+                    worker_heartbeat_ages.values(),
                     default=0,
                 ),
                 "fairness_wait_count": sum(
