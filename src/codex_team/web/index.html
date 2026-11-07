@@ -57,6 +57,17 @@
     </form>
     <div id="cluster-summary" class="cluster-summary" aria-live="polite"></div>
     <div id="cluster-overview" class="cluster-overview"></div>
+    <details id="agent-threads" class="agent-threads">
+      <summary>
+        <span>Agent Threads 诊断</span>
+        <span id="agent-thread-count">0</span>
+      </summary>
+      <p class="agent-threads-note">
+        仅展示线程状态、任务归属与 token 用量，不展示对话正文。
+      </p>
+      <span id="agent-reset-status" class="action-status" role="status"></span>
+      <div id="agent-thread-list" class="agent-thread-list"></div>
+    </details>
   </section>
   <section class="summary" id="summary"></section>
 

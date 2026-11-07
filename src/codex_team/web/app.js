@@ -30,6 +30,15 @@ const queueReasonLabels = Object.freeze({
   waiting_for_lead: "等待 Lead 规划",
   none: "无排队",
 });
+const agentStatusLabels = Object.freeze({
+  starting: "启动中",
+  busy: "忙碌",
+  loaded: "已载入",
+  idle: "空闲",
+  stored: "已存储",
+  superseded: "已替换",
+  failed: "失败",
+});
 
 let selectedProject = "";
 let selectedTaskId = "";
@@ -71,6 +80,62 @@ function ageText(seconds) {
 function nonNegativeNumber(value, fallback = 0) {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function tokenText(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0
+    ? Math.floor(parsed).toLocaleString("zh-CN")
+    : "—";
+}
+
+function cacheRate(value, cachedValue, uncachedValue) {
+  const explicit = Number(value);
+  if (Number.isFinite(explicit) && explicit >= 0) {
+    return Math.min(1, explicit);
+  }
+  const cached = Number(cachedValue);
+  const uncached = Number(uncachedValue);
+  const cachedCount = Number.isFinite(cached) && cached >= 0 ? cached : 0;
+  const uncachedCount = Number.isFinite(uncached) && uncached >= 0 ? uncached : 0;
+  const total = cachedCount + uncachedCount;
+  return total > 0 ? cachedCount / total : 0;
+}
+
+function cacheRateText(value, cachedValue, uncachedValue) {
+  return `${Math.round(
+    cacheRate(value, cachedValue, uncachedValue) * 100,
+  )}%`;
+}
+
+function jobRuntimeHtml(job) {
+  if (!job) return "";
+  const thread = job.thread_id ?? job.thread;
+  const turn = job.turn_id ?? job.turn;
+  const cached = job.cached_input_tokens ?? job.cached_tokens;
+  const uncached = job.uncached_input_tokens ?? job.uncached_tokens;
+  const hasCached = cached !== undefined && cached !== null;
+  const hasUncached = uncached !== undefined && uncached !== null;
+  const hasCacheRate = job.cache_hit_rate !== undefined
+    && job.cache_hit_rate !== null;
+  const badges = [];
+  if (thread !== undefined && thread !== null && thread !== "") {
+    badges.push(`<span>thread ${escapeHtml(thread)}</span>`);
+  }
+  if (turn !== undefined && turn !== null && turn !== "") {
+    badges.push(`<span>turn ${escapeHtml(turn)}</span>`);
+  }
+  if (hasCacheRate || hasCached || hasUncached) {
+    const parts = [
+      `cache ${cacheRateText(job.cache_hit_rate, cached, uncached)}`,
+    ];
+    if (hasCached) parts.push(`${tokenText(cached)} cached`);
+    if (hasUncached) parts.push(`${tokenText(uncached)} uncached`);
+    badges.push(`<span>${escapeHtml(parts.join(" · "))}</span>`);
+  }
+  return badges.length
+    ? `<div class="task-runtime">${badges.join("")}</div>`
+    : "";
 }
 
 function goalHeartbeatInfo(goal) {
@@ -280,6 +345,7 @@ function renderCard(task) {
         <span class="chip">${escapeHtml(task.project_name || "")}</span>
         ${blocker}${lease}${assigned}${claimWait}${archived}
       </div>
+      ${jobRuntimeHtml(task.active_job)}
     </article>`;
 }
 
@@ -547,6 +613,10 @@ function renderBoard(data, { force = false } = {}) {
     .join("");
 
   renderCluster(data.cluster_goals || [], data.cluster_jobs || [], data);
+  renderAgentThreads(
+    data.cluster_agents || [],
+    data.cluster_agent_events || [],
+  );
   renderMessages(data.messages || []);
   updateArchiveButton();
   const detail = document.getElementById("detail");
@@ -668,6 +738,105 @@ function renderCluster(goals, jobs, data) {
       </article>`;
   }).join("");
   container.innerHTML = `<div class="cluster-title">${goals.length} 个目标 · ${activeJobs.length} 个活动进程</div>${cards}`;
+}
+
+function renderAgentThreads(agents, events = []) {
+  const safeAgents = Array.isArray(agents) ? agents : [];
+  const safeEvents = Array.isArray(events) ? events : [];
+  document.getElementById("agent-thread-count").textContent = safeAgents.length;
+  const container = document.getElementById("agent-thread-list");
+  if (!safeAgents.length) {
+    container.innerHTML = '<div class="empty">本范围内暂无 Agent Thread</div>';
+    return;
+  }
+  const latestEventByAgent = new Map();
+  for (const event of safeEvents) {
+    const current = latestEventByAgent.get(event.agent_id);
+    const eventRank = Number(event.event_id);
+    const currentRank = Number(current?.event_id);
+    const eventTime = Date.parse(event.created_at);
+    const currentTime = Date.parse(current?.created_at);
+    const isNewer = Number.isFinite(eventRank) && Number.isFinite(currentRank)
+      ? eventRank >= currentRank
+      : Number.isFinite(eventTime) && Number.isFinite(currentTime)
+        ? eventTime >= currentTime
+        : !current;
+    if (isNewer) {
+      latestEventByAgent.set(event.agent_id, event);
+    }
+  }
+  container.innerHTML = safeAgents.map((agent) => {
+    const status = String(agent.status || "unknown").toLowerCase();
+    const statusLabel = agentStatusLabels[status] || status;
+    const workstream = agent.workstream_key ?? agent.workstream ?? "—";
+    const thread = agent.thread_id ?? agent.thread ?? "—";
+    const model = [agent.model, agent.model_provider]
+      .filter((value) => value !== undefined && value !== null && value !== "")
+      .join(" · ") || "模型未知";
+    const cached = agent.total_cached_input_tokens
+      ?? agent.last_cached_input_tokens
+      ?? 0;
+    const uncached = agent.total_uncached_input_tokens
+      ?? agent.last_uncached_input_tokens
+      ?? 0;
+    const contextTokens = agent.context_tokens ?? 0;
+    const windowTokens = agent.model_context_window;
+    const context = windowTokens !== undefined
+      && windowTokens !== null
+      && Number(windowTokens) > 0
+      ? `${tokenText(contextTokens)} / ${tokenText(windowTokens)}`
+      : tokenText(contextTokens);
+    const taskLabel = agent.current_task_id
+      ? `${agent.current_task_id}${agent.current_task_title ? ` · ${agent.current_task_title}` : ""}`
+      : "未绑定任务";
+    const goalLabel = agent.current_goal_id
+      ? `${agent.current_goal_id}${agent.current_goal_objective ? ` · ${agent.current_goal_objective}` : ""}`
+      : "未绑定目标";
+    const latestEvent = latestEventByAgent.get(agent.agent_id);
+    const resetState = agent.reset_requested_at
+      ? `重置已请求 ${timeText(agent.reset_requested_at)}${agent.reset_reason ? ` · ${agent.reset_reason}` : ""}`
+      : latestEvent
+        ? `最近事件 ${latestEvent.event_type}`
+        : "尚未请求重置";
+    const resetDisabled = status === "busy";
+    return `
+      <article class="agent-thread-card ${escapeHtml(status)}"
+               data-agent-id="${escapeHtml(agent.agent_id)}"
+               data-agent-status="${escapeHtml(status)}">
+        <div class="agent-thread-head">
+          <strong>${escapeHtml(agent.display_name || agent.agent_id)}</strong>
+          <span class="agent-status ${escapeHtml(status)}">${escapeHtml(statusLabel)}</span>
+        </div>
+        <div class="agent-thread-meta">
+          <span>role ${escapeHtml(agent.role || "—")}</span>
+          <span>workstream ${escapeHtml(workstream)}</span>
+          <span>thread ${escapeHtml(thread)}</span>
+          <span>${escapeHtml(model)}</span>
+          <span>turn ${escapeHtml(agent.turn_count ?? 0)}</span>
+          <span>last ${escapeHtml(timeText(agent.last_used_at))}</span>
+          <span>last cache/uncached ${escapeHtml(tokenText(agent.last_cached_input_tokens))} / ${escapeHtml(tokenText(agent.last_uncached_input_tokens))}</span>
+        </div>
+        <div class="agent-thread-task">
+          <div>任务：${escapeHtml(taskLabel)}</div>
+          <div>当前目标：${escapeHtml(goalLabel)}</div>
+        </div>
+        <div class="agent-thread-usage">
+          <div><span>context</span><strong>${escapeHtml(context)}</strong></div>
+          <div><span>cache</span><strong>${escapeHtml(cacheRateText(agent.cache_hit_rate, cached, uncached))} · ${escapeHtml(tokenText(cached))}</strong></div>
+          <div><span>uncached</span><strong>${escapeHtml(tokenText(uncached))}</strong></div>
+        </div>
+        <div class="agent-thread-actions">
+          <small>${escapeHtml(resetState)}</small>
+          <button class="agent-reset" type="button"
+                  data-control-action="reset-agent"
+                  data-agent-id="${escapeHtml(agent.agent_id)}"
+                  data-agent-status="${escapeHtml(status)}"
+                  ${resetDisabled ? "disabled" : ""}>
+            ${resetDisabled ? "忙碌中不可重置" : "请求重置"}
+          </button>
+        </div>
+      </article>`;
+  }).join("");
 }
 
 function renderMessages(messages) {
@@ -1014,6 +1183,45 @@ async function handleClusterControl(button) {
   }
 }
 
+async function handleAgentReset(button) {
+  const agentId = button.dataset.agentId;
+  const status = String(button.dataset.agentStatus || "").toLowerCase();
+  if (!agentId || status === "busy") return;
+  if (!window.confirm(`请求重置 Agent Thread ${agentId}？此操作只写入重置请求。`)) {
+    return;
+  }
+  button.disabled = true;
+  setActionStatus("agent-reset-status", `${agentId} · 正在写入重置请求…`, "pending");
+  try {
+    const result = await requestJson(
+      "/api/agents/reset",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          agent_id: agentId,
+          reason: "manual reset requested through dashboard",
+        }),
+      },
+      "reset agent",
+    );
+    setActionStatus(
+      "agent-reset-status",
+      `${result.agent?.agent_id || agentId} · 重置请求已写入`,
+      "success",
+    );
+    await requestImmediateRefresh();
+  } catch (error) {
+    setActionStatus(
+      "agent-reset-status",
+      `${agentId} · 重置失败：${error.message}`,
+      "error",
+    );
+  } finally {
+    button.disabled = false;
+  }
+}
+
 function initializeDashboard() {
   const board = document.getElementById("board");
   if (!board) return;
@@ -1024,6 +1232,10 @@ function initializeDashboard() {
   document.getElementById("cluster-overview").addEventListener("click", (event) => {
     const button = event.target.closest("[data-control-action]");
     if (button) void handleClusterControl(button);
+  });
+  document.getElementById("agent-threads").addEventListener("click", (event) => {
+    const button = event.target.closest('[data-control-action="reset-agent"]');
+    if (button) void handleAgentReset(button);
   });
   document.getElementById("cluster-create-form").addEventListener(
     "submit",
@@ -1069,6 +1281,7 @@ if (typeof window !== "undefined") {
     goalQueueReason,
     nextActionText,
     renderBoard,
+    renderAgentThreads,
     waitDurationText,
   });
 }

@@ -34,6 +34,10 @@ const requiredDomIds = [
   "cluster-summary",
   "cluster-overview",
   "cluster-action-status",
+  "agent-threads",
+  "agent-thread-count",
+  "agent-thread-list",
+  "agent-reset-status",
   "project-select",
   "show-archived",
   "archive-target",
@@ -51,6 +55,7 @@ expectText(app, "取消", "app.js");
 expectText(app, "JSON.stringify(payload)", "app.js");
 expectText(app, "/api/clusters/control", "app.js");
 expectText(app, "/api/clusters/archive", "app.js");
+expectText(app, "/api/agents/reset", "app.js");
 expectText(app, "/api/board", "app.js");
 expectText(app, "/api/projects", "app.js");
 expectText(app, "data.cluster_summary", "app.js");
@@ -74,6 +79,23 @@ expectText(css, ".cluster-card.heartbeat-critical", "style.css");
 expectText(css, ".cluster-card.archived", "style.css");
 expectText(css, ".cluster-diagnostic.heartbeat-warning", "style.css");
 expectText(css, ".cluster-diagnostic.heartbeat-critical", "style.css");
+expectText(css, ".agent-thread-card.busy", "style.css");
+expectText(css, ".task-runtime", "style.css");
+const agentThreadsMarkup = between(
+  html,
+  '<details id="agent-threads"',
+  "</details>",
+);
+assert.doesNotMatch(
+  agentThreadsMarkup,
+  /\sopen(?:\s|=|>)/,
+  "Agent Threads must be collapsed by default",
+);
+assert.doesNotMatch(
+  app,
+  /agent\.(?:messages|transcript|conversation)/,
+  "Agent diagnostics must not render conversation content",
+);
 for (const field of [
   "global_jobs",
   "global_capacity",
@@ -86,6 +108,10 @@ for (const field of [
   "heartbeat_age_seconds",
   "queue_reason",
   "estimated_wait_seconds",
+  "cluster_agents",
+  "cluster_agent_events",
+  "cache_hit_rate",
+  "uncached_input_tokens",
 ]) {
   expectText(app, field, "app.js");
 }
@@ -176,6 +202,9 @@ for (const id of [
   "summary",
   "cluster-summary",
   "cluster-overview",
+  "agent-thread-count",
+  "agent-thread-list",
+  "agent-reset-status",
   "message-count",
   "messages",
   "archive-target",
@@ -199,6 +228,19 @@ const firstBoard = {
     blocked_by: [],
     claim_wait_seconds: 62,
     claim_wait_state: "warning",
+    active_job: {
+      job_id: "J-TASK-1",
+      kind: "worker",
+      role: "team_worker",
+      status: "running",
+      thread_id: "thread-task-1",
+      turn_id: "turn-3",
+      cached_input_tokens: 1500,
+      uncached_input_tokens: 500,
+      context_tokens: 12000,
+      model_context_window: 128000,
+      cache_hit_rate: 0.75,
+    },
   }],
   counts: { ready: 1 },
   projects: [{
@@ -324,6 +366,72 @@ const firstBoard = {
       pid: 4322,
     },
   ],
+  cluster_agents: [
+    {
+      agent_id: "A-BUSY",
+      display_name: "Diagnostic Worker",
+      status: "busy",
+      role: "team_worker",
+      workstream_key: "webui-agent-diagnostics",
+      thread_id: "thread-agent-busy",
+      current_goal_id: "G-WARNING",
+      current_goal_objective: "验证两个并发目标的警告心跳与全局容量队列",
+      current_task_id: "T-1",
+      current_task_title: "实现真实消费者",
+      model: "test-model",
+      model_provider: "test-provider",
+      model_context_window: 128000,
+      context_tokens: 48000,
+      last_cached_input_tokens: 1200,
+      last_uncached_input_tokens: 400,
+      total_cached_input_tokens: 2400,
+      total_uncached_input_tokens: 800,
+      cache_hit_rate: 0.75,
+      turn_count: 6,
+      last_used_at: "2026-11-07T10:00:00Z",
+      reset_requested_at: null,
+    },
+    {
+      agent_id: "A-IDLE",
+      display_name: "Idle Reviewer",
+      status: "idle",
+      role: "team_reviewer",
+      workstream_key: "review-queue",
+      thread_id: "thread-agent-idle",
+      current_goal_id: null,
+      current_task_id: null,
+      model: "test-model",
+      model_provider: "test-provider",
+      model_context_window: 64000,
+      context_tokens: 0,
+      last_cached_input_tokens: 0,
+      last_uncached_input_tokens: 0,
+      total_cached_input_tokens: 0,
+      total_uncached_input_tokens: 0,
+      cache_hit_rate: 0,
+      turn_count: 2,
+      last_used_at: "2026-11-07T09:55:00Z",
+      reset_requested_at: null,
+    },
+  ],
+  cluster_agent_events: [
+    {
+      event_id: 1,
+      agent_id: "A-BUSY",
+      event_type: "tokens_updated",
+      actor: "app_server",
+      data: { turn_id: "turn-3" },
+      created_at: "2026-11-07T10:00:00Z",
+    },
+    {
+      event_id: 2,
+      agent_id: "A-IDLE",
+      event_type: "reset_requested",
+      actor: "human",
+      data: { reason: "manual reset" },
+      created_at: "2026-11-07T10:00:01Z",
+    },
+  ],
 };
 const secondBoard = JSON.parse(JSON.stringify(firstBoard));
 secondBoard.generated_at = "2026-11-07T10:00:02Z";
@@ -354,10 +462,20 @@ assert.notEqual(
   hooks.buildBoardSignature(heartbeatThresholdBoard),
   "heartbeat severity changes must trigger a redraw",
 );
+const agentTokenBoard = JSON.parse(JSON.stringify(secondBoard));
+agentTokenBoard.cluster_agents[0].context_tokens = 52000;
+agentTokenBoard.cluster_agents[0].cache_hit_rate = 0.8;
+assert.notEqual(
+  hooks.buildBoardSignature(firstBoard),
+  hooks.buildBoardSignature(agentTokenBoard),
+  "Agent token diagnostics must trigger a redraw",
+);
 
 assert.equal(hooks.renderBoard(firstBoard), true, "first board should render");
 const clusterHtmlBefore = fakeElements.get("cluster-overview").innerHTML;
 const summaryHtml = fakeElements.get("cluster-summary").innerHTML;
+const agentThreadHtml = fakeElements.get("agent-thread-list").innerHTML;
+const taskCardHtml = fakeElements.get("cards-ready").innerHTML;
 assert.match(summaryHtml, /data-metric="jobs"/);
 assert.match(summaryHtml, /data-metric="queued"/);
 assert.match(summaryHtml, /data-metric="heartbeat-overdue"/);
@@ -399,6 +517,26 @@ assert.match(clusterHtmlBefore, /data-archived="true"/);
 assert.match(clusterHtmlBefore, /已归档/);
 assert.match(clusterHtmlBefore, /目标已结束/);
 assert.match(clusterHtmlBefore, /无需调度/);
+assert.equal(fakeElements.get("agent-thread-count").textContent, 2);
+assert.match(agentThreadHtml, /Diagnostic Worker/);
+assert.match(agentThreadHtml, /thread thread-agent-busy/);
+assert.match(agentThreadHtml, /context/);
+assert.match(agentThreadHtml, /cache/);
+assert.match(agentThreadHtml, /uncached/);
+assert.match(agentThreadHtml, /last cache\/uncached 1,200 \/ 400/);
+assert.match(agentThreadHtml, /T-1 · 实现真实消费者/);
+assert.match(agentThreadHtml, /75%/);
+assert.match(agentThreadHtml, /忙碌中不可重置/);
+assert.match(agentThreadHtml, /请求重置/);
+assert.match(agentThreadHtml, /data-control-action="reset-agent"/);
+assert.match(agentThreadHtml, /最近事件 reset_requested/);
+assert.doesNotMatch(agentThreadHtml, /conversation|transcript/i);
+assert.match(taskCardHtml, /thread thread-task-1/);
+assert.match(taskCardHtml, /turn turn-3/);
+assert.match(taskCardHtml, /cache 75%/);
+assert.match(taskCardHtml, /1,500 cached/);
+assert.match(taskCardHtml, /500 uncached/);
+assert.doesNotMatch(taskCardHtml, /undefined/);
 assert.equal(
   hooks.renderBoard(secondBoard),
   false,
@@ -585,6 +723,32 @@ assert.equal(
   hooks.goalQueueReason({ status: "completed", queue_reason: "none" }).label,
   "无需调度",
   "terminal goals should not be presented as queued",
+);
+const sparseDiagnosticsBoard = JSON.parse(JSON.stringify(meaningfulBoard));
+sparseDiagnosticsBoard.tasks[0].active_job = {
+  role: "team_worker",
+  status: "running",
+};
+sparseDiagnosticsBoard.cluster_agents = [{
+  agent_id: "A-SPARSE",
+  status: "stored",
+  role: "team_worker",
+}];
+sparseDiagnosticsBoard.cluster_agent_events = [];
+assert.equal(
+  hooks.renderBoard(sparseDiagnosticsBoard),
+  true,
+  "partial diagnostic fields should still render",
+);
+assert.doesNotMatch(
+  fakeElements.get("cards-ready").innerHTML,
+  /undefined/,
+  "missing job token fields must not leak undefined into task cards",
+);
+assert.doesNotMatch(
+  fakeElements.get("agent-thread-list").innerHTML,
+  /undefined/,
+  "missing Agent fields must not leak undefined into diagnostics",
 );
 assert.deepEqual(
   [1, 2, 3, 4, 5, 6, 7].map((failures) => hooks.backoffDelay(failures)),

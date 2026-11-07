@@ -105,6 +105,77 @@ class TeamFlowTests(unittest.TestCase):
         )
         self.assertEqual(archive_args.cluster_command, "archive")
 
+    def test_create_task_persists_validated_continuity_mode(self) -> None:
+        default_task = self.team.create_task(
+            self.repo,
+            title="Default continuity",
+            description="Use the default continuity policy.",
+            acceptance="auto is persisted",
+            kind="read",
+            owner_role="team_explorer",
+        )
+        fresh_task = self.team.create_task(
+            self.repo,
+            title="Fresh continuity",
+            description="Force a fresh Agent thread.",
+            acceptance="fresh is persisted",
+            kind="write",
+            owner_role="team_worker",
+            continuity_mode=" FRESH ",
+        )
+        reuse_task = self.team.create_task(
+            self.repo,
+            title="Reuse continuity",
+            description="Reuse the current Agent thread.",
+            acceptance="reuse is persisted",
+            kind="read",
+            owner_role="team_explorer",
+            continuity_mode="reuse",
+        )
+
+        self.assertEqual(default_task["continuity_mode"], "auto")
+        self.assertEqual(fresh_task["continuity_mode"], "fresh")
+        self.assertEqual(reuse_task["continuity_mode"], "reuse")
+        events = self.team.get_task_events(fresh_task["task_id"])["events"]
+        self.assertEqual(events[0]["data"]["continuity_mode"], "fresh")
+        with self.assertRaisesRegex(
+            TeamError,
+            "continuity_mode must be auto, reuse, or fresh",
+        ):
+            self.team.create_task(
+                self.repo,
+                title="Invalid continuity",
+                description="Reject unsupported modes.",
+                acceptance="validation error",
+                kind="read",
+                owner_role="team_explorer",
+                continuity_mode="isolated",
+            )
+        with self.team.connection(write=False) as connection:
+            modes = {
+                row["task_id"]: row["continuity_mode"]
+                for row in connection.execute(
+                    """
+                    SELECT task_id, continuity_mode
+                    FROM tasks
+                    WHERE task_id IN (?, ?, ?)
+                    """,
+                    (
+                        default_task["task_id"],
+                        fresh_task["task_id"],
+                        reuse_task["task_id"],
+                    ),
+                )
+            }
+        self.assertEqual(
+            modes,
+            {
+                default_task["task_id"]: "auto",
+                fresh_task["task_id"]: "fresh",
+                reuse_task["task_id"]: "reuse",
+            },
+        )
+
     def test_write_task_requires_worktree_and_full_review_flow(self) -> None:
         task = self.team.create_task(
             self.repo,
@@ -537,6 +608,150 @@ class TeamFlowTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
+
+    def test_dashboard_snapshot_exposes_agent_and_job_token_diagnostics(
+        self,
+    ) -> None:
+        manager = ClusterManager(
+            self.settings,
+            team=self.team,
+            worktrees=self.worktrees,
+        )
+        goal = manager.create_goal(
+            self.repo,
+            objective="Inspect Agent continuity",
+            autonomy="auto",
+        )
+        task = self.team.create_task(
+            self.repo,
+            title="Inspect token usage",
+            description="Expose Agent diagnostics through the board.",
+            acceptance="snapshot fields are available",
+            kind="read",
+            owner_role="team_explorer",
+            goal_id=goal["goal_id"],
+        )
+        self.team.claim_task(task["task_id"], actor="agent-diagnostics")
+        now = "2026-11-07T11:00:00Z"
+        with self.team.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO cluster_jobs(
+                    job_id, goal_id, task_id, kind, role, status, pid,
+                    thread_id, attempt, log_path, output_path, started_at,
+                    turn_id, runtime, input_tokens, cached_input_tokens,
+                    uncached_input_tokens, output_tokens, context_tokens,
+                    model_context_window
+                ) VALUES (
+                    'J-AGENT-DIAG', ?, ?, 'worker', 'team_explorer', 'running',
+                    4321, 'thread-diag', 1, ?, ?, ?, 'turn-diag', 'exec',
+                    800, 600, 200, 120, 4096, 128000
+                )
+                """,
+                (
+                    goal["goal_id"],
+                    task["task_id"],
+                    str(self.base / "diagnostic.log"),
+                    str(self.base / "diagnostic.out"),
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO cluster_agents(
+                    agent_id, project_id, role, workstream_key, display_name,
+                    thread_id, status, model, model_provider, current_goal_id,
+                    current_task_id, current_job_id, last_turn_id,
+                    model_context_window, last_input_tokens,
+                    last_cached_input_tokens, last_uncached_input_tokens,
+                    total_input_tokens, total_cached_input_tokens,
+                    total_uncached_input_tokens, context_tokens, turn_count,
+                    last_used_at, created_at, updated_at
+                ) VALUES (
+                    'A-AGENT-DIAG', ?, 'team_explorer', 'diagnostics',
+                    'Diagnostic Explorer', 'thread-diag', 'loaded',
+                    'test-model', 'test-provider', ?, ?, 'J-AGENT-DIAG',
+                    'turn-diag', 128000, 400, 300, 100, 2000, 1500, 500,
+                    4096, 7, ?, ?, ?
+                )
+                """,
+                (
+                    task["project_id"],
+                    goal["goal_id"],
+                    task["task_id"],
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO cluster_agent_events(
+                    agent_id, event_type, actor, data_json, created_at
+                ) VALUES (
+                    'A-AGENT-DIAG', 'tokens_updated', 'app_server',
+                    '{"turn_id": "turn-diag"}', ?
+                )
+                """,
+                (now,),
+            )
+
+        dashboard = self.team.dashboard_snapshot(task["project_id"])
+        agent = next(
+            item
+            for item in dashboard["cluster_agents"]
+            if item["agent_id"] == "A-AGENT-DIAG"
+        )
+        self.assertEqual(agent["status"], "loaded")
+        self.assertEqual(agent["current_goal_id"], goal["goal_id"])
+        self.assertEqual(agent["current_task_id"], task["task_id"])
+        self.assertEqual(agent["current_task_title"], "Inspect token usage")
+        self.assertEqual(agent["current_goal_objective"], "Inspect Agent continuity")
+        self.assertEqual(agent["thread_id"], "thread-diag")
+        self.assertEqual(agent["model"], "test-model")
+        self.assertEqual(agent["model_provider"], "test-provider")
+        self.assertEqual(agent["model_context_window"], 128000)
+        self.assertEqual(agent["context_tokens"], 4096)
+        self.assertEqual(agent["last_cached_input_tokens"], 300)
+        self.assertEqual(agent["last_uncached_input_tokens"], 100)
+        self.assertEqual(agent["total_cached_input_tokens"], 1500)
+        self.assertEqual(agent["total_uncached_input_tokens"], 500)
+        self.assertEqual(agent["cache_hit_rate"], 0.75)
+        self.assertEqual(agent["turn_count"], 7)
+        self.assertEqual(agent["last_used_at"], now)
+        self.assertIsNone(agent["reset_requested_at"])
+
+        event = dashboard["cluster_agent_events"][-1]
+        self.assertEqual(event["agent_id"], "A-AGENT-DIAG")
+        self.assertEqual(event["event_type"], "tokens_updated")
+        self.assertEqual(event["data"], {"turn_id": "turn-diag"})
+
+        job = next(
+            item
+            for item in dashboard["cluster_jobs"]
+            if item["job_id"] == "J-AGENT-DIAG"
+        )
+        self.assertEqual(job["thread_id"], "thread-diag")
+        self.assertEqual(job["turn_id"], "turn-diag")
+        self.assertEqual(job["input_tokens"], 800)
+        self.assertEqual(job["cached_input_tokens"], 600)
+        self.assertEqual(job["uncached_input_tokens"], 200)
+        self.assertEqual(job["output_tokens"], 120)
+        self.assertEqual(job["context_tokens"], 4096)
+        self.assertEqual(job["model_context_window"], 128000)
+        self.assertEqual(job["cache_hit_rate"], 0.75)
+
+        snapshot_task = next(
+            item
+            for item in dashboard["tasks"]
+            if item["task_id"] == task["task_id"]
+        )
+        active_job = snapshot_task["active_job"]
+        self.assertEqual(active_job["thread_id"], "thread-diag")
+        self.assertEqual(active_job["turn_id"], "turn-diag")
+        self.assertEqual(active_job["cached_input_tokens"], 600)
+        self.assertEqual(active_job["uncached_input_tokens"], 200)
+        self.assertEqual(active_job["cache_hit_rate"], 0.75)
 
     def test_dashboard_cluster_goal_includes_project_name(self) -> None:
         manager = ClusterManager(
