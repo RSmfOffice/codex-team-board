@@ -386,6 +386,60 @@ class ClusterSchedulerTests(unittest.TestCase):
                 )
                 self.assertEqual(deferred[0]["data"]["ready_tasks"], 1)
 
+    def test_each_goal_gets_three_workers_without_a_shared_four_job_pool(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            manager = ClusterManager(
+                settings,
+                team=team,
+                agent_command=["codex"],
+                max_workers=DEFAULT_GOAL_WORKER_CAPACITY,
+                max_jobs=DEFAULT_GLOBAL_JOB_CAPACITY,
+                lead_cooldown_seconds=0,
+            )
+            first_repo = _repo(base, "first-workers")
+            second_repo = _repo(base, "second-workers")
+            first_goal, _ = self._goal_with_ready_tasks(
+                manager,
+                team,
+                first_repo,
+                4,
+            )
+            second_goal, _ = self._goal_with_ready_tasks(
+                manager,
+                team,
+                second_repo,
+                4,
+            )
+            dispatched: list[tuple[str, str]] = []
+            with patch.object(
+                manager,
+                "_dispatch_worker",
+                side_effect=self._fake_running_dispatch(
+                    manager,
+                    team,
+                    dispatched,
+                ),
+            ):
+                result = manager.tick()
+
+            self.assertEqual(len(result["scheduled"]), 6)
+            first_count = sum(
+                goal_id == first_goal["goal_id"]
+                for goal_id, _task_id in dispatched
+            )
+            second_count = sum(
+                goal_id == second_goal["goal_id"]
+                for goal_id, _task_id in dispatched
+            )
+            self.assertEqual(first_count, 3)
+            self.assertEqual(second_count, 3)
+            self.assertEqual(manager._active_job_count(), 6)
+
     def test_existing_active_job_fills_capacity_and_deferral_is_deduplicated(
         self,
     ) -> None:
@@ -605,7 +659,7 @@ class ClusterSchedulerTests(unittest.TestCase):
                 DEFAULT_LEAD_TIMEOUT_SECONDS,
                 45 * 60,
             )
-            self.assertEqual(DEFAULT_GLOBAL_JOB_CAPACITY, 4)
+            self.assertEqual(DEFAULT_GLOBAL_JOB_CAPACITY, 16)
             with patch.dict(
                 os.environ,
                 {
@@ -618,7 +672,7 @@ class ClusterSchedulerTests(unittest.TestCase):
                     team=TeamService(settings),
                     agent_command=["codex"],
                 )
-            self.assertEqual(capped.max_jobs, 16)
+            self.assertEqual(capped.max_jobs, 32)
             self.assertEqual(capped.max_workers, 8)
 
     def test_goal_does_not_complete_while_a_lead_job_is_active(self) -> None:

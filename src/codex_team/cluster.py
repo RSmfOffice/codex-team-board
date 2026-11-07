@@ -81,7 +81,7 @@ class ClusterManager:
             else int(max_jobs)
         )
         self.max_workers = max(1, min(configured_workers, 8))
-        self.max_jobs = max(1, min(configured_jobs, 16))
+        self.max_jobs = max(1, min(configured_jobs, 32))
         self.worker_timeout_seconds = env_int(
             "CODEX_TEAM_WORKER_TIMEOUT_SECONDS",
             DEFAULT_WORKER_TIMEOUT_SECONDS,

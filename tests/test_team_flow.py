@@ -1032,8 +1032,12 @@ class TeamFlowTests(unittest.TestCase):
                     )
                 dashboard = self.team.dashboard_snapshot()
                 summary = dashboard["cluster_summary"]
-                self.assertEqual(summary["global_jobs"], 3)
-                self.assertEqual(summary["global_capacity"], 4)
+                self.assertEqual(summary["active_jobs"], 3)
+                self.assertEqual(summary["global_jobs"], 2)
+                self.assertEqual(summary["global_capacity"], 6)
+                self.assertEqual(summary["worker_capacity_per_goal"], 3)
+                self.assertEqual(summary["system_jobs"], 3)
+                self.assertEqual(summary["system_capacity"], 4)
                 self.assertEqual(summary["heartbeat_overdue"], 2)
                 self.assertGreaterEqual(
                     summary["oldest_heartbeat_age_seconds"],
@@ -1044,6 +1048,8 @@ class TeamFlowTests(unittest.TestCase):
                 for field, minimum in (
                     ("global_jobs", 0),
                     ("global_capacity", 1),
+                    ("worker_capacity_per_goal", 1),
+                    ("system_capacity", 1),
                     ("queued_goals", 0),
                     ("heartbeat_overdue", 0),
                     ("oldest_heartbeat_age_seconds", 0),

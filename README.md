@@ -16,9 +16,9 @@
 - 无外部依赖的本地 Web Kanban
 - 可在 Web 看板创建、暂停、恢复、取消和归档自动集群目标
 - 集群健康摘要、下一步动作和需要关注的异常提示
-- 跨项目多集群的全局 Jobs 容量、每 goal Worker 容量和公平排队
+- 每个 active goal 独立保留 1 个 Lead 和最多 3 个 Worker；系统另有进程安全上限
 - 默认 2 小时 Worker、45 分钟 Lead 的长任务超时与心跳诊断
-- WebUI 全局槽位、排队、等待时长和 heartbeat 健康指标
+- WebUI Worker 槽位、Lead 数、排队、等待时长和 heartbeat 健康指标
 
 ## 两个仓库如何联动
 
@@ -334,8 +334,13 @@ running_tasks
 review_tasks
 blocked_tasks
 active_jobs
+active_workers
+active_leads
 global_jobs
 global_capacity
+worker_capacity_per_goal
+system_jobs
+system_capacity
 queued_goals
 heartbeat_overdue
 oldest_heartbeat_age_seconds
@@ -347,7 +352,8 @@ oldest_claim_wait_seconds
 每个 `cluster_goals` 项还包含 `health`、`next_action` 和
 `attention_task_count`，以及 `active_job_count`、`heartbeat_age_seconds`、
 `heartbeat_state`、`queue_reason` 和 `estimated_wait_seconds`。WebUI 顶部显示
-`JOBS`（活动全局 job/容量）、`QUEUED`（排队目标及公平等待数）和
+`WORKER SLOTS`（活动 Worker/所有 active goal 的 Worker 槽位总和）、
+`LEADS`（活动主 Agent 数）、`QUEUED`（排队目标及公平等待数）和
 `HB OVERDUE`（超过 warning 阈值的 job 数及最老心跳年龄）；集群卡显示每个
 目标的队列原因、`当前等待`时长、活动 Lead/Worker 和心跳状态。
 
@@ -622,7 +628,7 @@ ready/review/blocked ──取消──→ canceled
 
 | 环境变量 | 默认值 | 输入范围 | 实际调度值/作用 |
 | --- | ---: | ---: | --- |
-| `CODEX_TEAM_CLUSTER_MAX_JOBS` | `4` | `1..86400` | 调度器再硬限制为最多 `16`；统计所有项目 Lead+Worker 的活动 job |
+| `CODEX_TEAM_CLUSTER_MAX_JOBS` | `16` | `1..86400` | 系统安全上限，统计所有项目 Lead+Worker 的活动 job；硬限制为最多 `32` |
 | `CODEX_TEAM_CLUSTER_MAX_WORKERS` | `3` | `1..86400` | 调度器再硬限制为最多 `8`；限制每个 goal 的活动 Worker |
 | `CODEX_TEAM_WORKER_TIMEOUT_SECONDS` | `7200`（2 小时） | `1..86400` | Worker job 从启动到强制超时的时间 |
 | `CODEX_TEAM_LEAD_TIMEOUT_SECONDS` | `2700`（45 分钟） | `1..86400` | Lead job 从启动到强制超时的时间 |
@@ -636,7 +642,7 @@ ready/review/blocked ──取消──→ canceled
 ```powershell
 .\scripts\team.ps1 cluster stop-daemon
 
-$env:CODEX_TEAM_CLUSTER_MAX_JOBS = "6"
+$env:CODEX_TEAM_CLUSTER_MAX_JOBS = "24"
 $env:CODEX_TEAM_CLUSTER_MAX_WORKERS = "2"
 $env:CODEX_TEAM_WORKER_TIMEOUT_SECONDS = "7200"
 $env:CODEX_TEAM_LEAD_TIMEOUT_SECONDS = "2700"
@@ -648,19 +654,22 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 .\scripts\team.ps1 cluster daemon-status
 ```
 
-容量变量虽然接受 `1..86400` 的整数输入，但有效调度上限固定为全局 Jobs `16`、
-每 goal Workers `8`。例如输入 `999` 时，`teamd` 实际分别按 `16` 和 `8`
-调度。看板进程直接读取该进程环境中的整数配置；为避免显示值与实际调度不一致，
-应把变量设置在有效上限以内，并让 `teamd` 与看板使用相同环境。
+每个 active goal 的正常容量是 1 个 Lead 加 `CODEX_TEAM_CLUSTER_MAX_WORKERS`
+个 Worker，默认即 1 个主 Agent 加 3 个子 Agent。多个 goal 的 Worker 槽位分别
+计算，因此两个 active goal 默认有 6 个 Worker 槽位，而不会共享一个总数 4 的池。
+`CODEX_TEAM_CLUSTER_MAX_JOBS` 只是全机进程安全阀，默认 16，不是正常 per-session
+配额；只有达到该安全阀时才触发跨 goal 公平排队。输入 `999` 时，有效系统上限
+为 `32`，每 goal Worker 上限为 `8`。
 
 若 critical 阈值小于或等于 warning，调度器和看板都会把有效 critical 提升到
 warning，因此 critical 始终不早于 warning。两项心跳变量均可省略。
 
-WebUI 的 `global_capacity` 来自看板进程自身的环境。修改容量后还应停止并重新
-启动旧看板，使显示值、队列判断与 `teamd` 的实际调度保持一致。
+WebUI 的 `global_capacity` 是 active goal 数乘以每 goal Worker 容量；Lead 不
+占 Worker 槽位。`system_capacity` 才对应进程安全阀。修改配置后还应停止并重新
+启动看板，使显示值与 `teamd` 的实际调度保持一致。
 
-如果全局上限小于多个 goal 的 Worker 配额之和，全局上限优先。提高每 goal
-配额不会突破全局 Jobs 容量。
+如果系统安全阀低于多个 goal 的实际进程总数，安全阀优先并启用公平轮转；未达到
+安全阀时，各 goal 可在自己的 Worker 配额内独立推进。
 
 ### 长任务与心跳
 

@@ -620,7 +620,7 @@ class TeamService:
         *,
         include_archived: bool = False,
     ) -> dict[str, Any]:
-        global_capacity = env_int(
+        system_capacity = env_int(
             "CODEX_TEAM_CLUSTER_MAX_JOBS",
             DEFAULT_GLOBAL_JOB_CAPACITY,
         )
@@ -703,6 +703,11 @@ class TeamService:
                 ).fetchall()
             cluster_goals = [dict(row) for row in goal_rows]
             cluster_jobs = [dict(row) for row in job_rows]
+            schedulable_goal_count = sum(
+                goal["status"] in {"planning", "active"}
+                for goal in cluster_goals
+            )
+            global_capacity = schedulable_goal_count * goal_capacity
             task_archive_filter = (
                 "" if include_archived else "AND t.archived_at IS NULL"
             )
@@ -1077,7 +1082,7 @@ class TeamService:
                 if goal_status not in {"planning", "active"}:
                     queue_reason = "none"
                 elif (
-                    len(active_jobs) >= global_capacity
+                    len(active_jobs) >= system_capacity
                     and dispatchable_ready
                 ):
                     queue_reason = "global_capacity"
@@ -1198,8 +1203,15 @@ class TeamService:
                 "review_tasks": counts.get("review", 0),
                 "blocked_tasks": counts.get("blocked", 0),
                 "active_jobs": len(active_jobs),
-                "global_jobs": len(active_jobs),
+                "active_workers": len(worker_heartbeat_ages),
+                "active_leads": sum(
+                    job.get("kind") == "lead" for job in active_jobs
+                ),
+                "global_jobs": len(worker_heartbeat_ages),
                 "global_capacity": global_capacity,
+                "worker_capacity_per_goal": goal_capacity,
+                "system_jobs": len(active_jobs),
+                "system_capacity": system_capacity,
                 "queued_goals": sum(
                     goal["status"] in {"planning", "active"}
                     and goal["queue_reason"]

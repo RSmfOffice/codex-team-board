@@ -216,9 +216,13 @@ const firstBoard = {
     goals_failed: 0,
     active_jobs: 3,
     active_workers: 2,
+    active_leads: 1,
     attention_count: 2,
-    global_jobs: 3,
-    global_capacity: 4,
+    global_jobs: 2,
+    global_capacity: 6,
+    worker_capacity_per_goal: 3,
+    system_jobs: 3,
+    system_capacity: 16,
     queued_goals: 2,
     heartbeat_overdue: 2,
     oldest_heartbeat_age_seconds: 960,
@@ -357,7 +361,7 @@ const summaryHtml = fakeElements.get("cluster-summary").innerHTML;
 assert.match(summaryHtml, /data-metric="jobs"/);
 assert.match(summaryHtml, /data-metric="queued"/);
 assert.match(summaryHtml, /data-metric="heartbeat-overdue"/);
-assert.match(summaryHtml, /3\/4/);
+assert.match(summaryHtml, /2\/6/);
 assert.match(summaryHtml, /QUEUED/);
 assert.match(summaryHtml, /HB OVERDUE/);
 assert.match(summaryHtml, /公平等待 1/);
@@ -436,7 +440,9 @@ pausedBoard.cluster_summary.goals_active = 0;
 pausedBoard.cluster_summary.goals_paused = 2;
 pausedBoard.cluster_summary.active_jobs = 0;
 pausedBoard.cluster_summary.active_workers = 0;
+pausedBoard.cluster_summary.active_leads = 0;
 pausedBoard.cluster_summary.global_jobs = 0;
+pausedBoard.cluster_summary.global_capacity = 0;
 pausedBoard.cluster_summary.queued_goals = 0;
 pausedBoard.cluster_summary.fairness_wait_count = 0;
 pausedBoard.cluster_summary.attention_count = 0;
@@ -463,26 +469,28 @@ const metrics = Object.fromEntries(
   hooks.buildClusterMetrics(firstBoard).map(({ key, value }) => [key, value]),
 );
 assert.deepEqual(metrics, {
-  jobs: "3/4",
+  jobs: "2/6",
   queued: 2,
   "heartbeat-overdue": 2,
-    goals: 5,
+  goals: 5,
   active: 2,
   paused: 1,
   attention: 2,
-  workers: 2,
+  leads: 1,
 });
 const compatibilityBoard = JSON.parse(JSON.stringify(firstBoard));
 delete compatibilityBoard.cluster_summary.active_workers;
+delete compatibilityBoard.cluster_summary.global_jobs;
 const compatibilityMetrics = Object.fromEntries(
   hooks.buildClusterMetrics(compatibilityBoard)
     .map(({ key, value }) => [key, value]),
 );
 assert.equal(
-  compatibilityMetrics.workers,
-  2,
-  "WORKERS must count worker jobs instead of all active lead/worker jobs",
+  compatibilityMetrics.jobs,
+  "2/6",
+  "worker slots must fall back to active worker jobs",
 );
+assert.equal(compatibilityMetrics.leads, 1);
 assert.equal(hooks.goalHealth(firstBoard.cluster_goals[0]).attention, true);
 assert.deepEqual(
   JSON.parse(JSON.stringify(

@@ -397,14 +397,25 @@ function buildClusterMetrics(data = {}) {
     (job) => job.kind === "worker"
       && ["starting", "running"].includes(job.status),
   ).length;
+  const activeLeads = jobs.filter(
+    (job) => job.kind === "lead"
+      && ["starting", "running"].includes(job.status),
+  ).length;
   const globalJobs = summaryNumber(
     summary,
-    ["global_jobs", "active_jobs"],
-    jobs.filter(
-      (job) => ["starting", "running"].includes(job.status),
-    ).length,
+    ["global_jobs", "active_workers"],
+    activeWorkers,
   );
-  const globalCapacity = summaryNumber(summary, ["global_capacity"], 0);
+  const globalCapacity = summaryNumber(
+    summary,
+    ["global_capacity"],
+    activeGoals * 3,
+  );
+  const capacityPerGoal = summaryNumber(
+    summary,
+    ["worker_capacity_per_goal"],
+    3,
+  );
   const queuedGoals = summaryNumber(summary, ["queued_goals"], 0);
   const heartbeatOverdue = summaryNumber(
     summary,
@@ -431,9 +442,9 @@ function buildClusterMetrics(data = {}) {
   return [
     {
       key: "jobs",
-      label: "JOBS",
+      label: "WORKER SLOTS",
       value: `${globalJobs}/${globalCapacity || "—"}`,
-      detail: "全局任务槽位",
+      detail: `${activeGoals} 主 Agent · 每会话 ${capacityPerGoal} Worker`,
       tone: globalCapacity > 0 && globalJobs >= globalCapacity
         ? "warning"
         : "",
@@ -489,12 +500,12 @@ function buildClusterMetrics(data = {}) {
       ),
     },
     {
-      key: "workers",
-      label: "WORKERS",
+      key: "leads",
+      label: "LEADS",
       value: summaryNumber(
         summary,
-        ["workers", "active_workers", "running_workers"],
-        activeWorkers,
+        ["active_leads", "leads"],
+        activeLeads,
       ),
     },
   ];
