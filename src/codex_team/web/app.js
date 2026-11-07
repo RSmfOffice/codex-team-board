@@ -1,12 +1,33 @@
+const POLL_INTERVAL_MS = 2000;
+const MAX_POLL_BACKOFF_MS = 30000;
+const lanes = ["ready", "running", "review", "blocked", "done"];
+const terminalGoalStatuses = new Set(["completed", "failed", "canceled"]);
+const attentionHealthStates = new Set([
+  "attention",
+  "warning",
+  "critical",
+  "error",
+  "failed",
+  "degraded",
+  "needs_attention",
+  "unhealthy",
+  "stalled",
+]);
+
 let selectedProject = "";
 let selectedTaskId = "";
 let includeArchived = false;
 let projectsById = new Map();
 let tasksById = new Map();
 let eventsByTask = new Map();
-let timer = null;
-
-const lanes = ["ready", "running", "review", "blocked", "done"];
+let projectsLoaded = false;
+let pollTimer = null;
+let pollInFlight = false;
+let activeRequest = null;
+let pollFailures = 0;
+let refreshQueued = false;
+let queuedForceRender = false;
+let lastBoardSignature = "";
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -32,37 +53,101 @@ function ageText(seconds) {
 
 function syncTopbarHeight() {
   const topbar = document.querySelector(".topbar");
+  if (!topbar) return;
   document.documentElement.style.setProperty(
     "--topbar-height",
     `${topbar.getBoundingClientRect().height}px`,
   );
 }
 
-async function loadProjects() {
-  const query = includeArchived ? "?include_archived=1" : "";
-  const response = await fetch(`/api/projects${query}`, { cache: "no-store" });
-  if (!response.ok) throw new Error(`projects ${response.status}`);
-  const data = await response.json();
-  projectsById = new Map(
-    data.projects.map((project) => [project.project_id, project]),
-  );
-  if (selectedProject && !projectsById.has(selectedProject)) {
-    selectedProject = "";
+function setConnectionState(text, state) {
+  const health = document.getElementById("health");
+  health.textContent = text;
+  health.className = `health ${state}`;
+}
+
+function setActionStatus(elementId, text, state = "") {
+  const status = document.getElementById(elementId);
+  status.textContent = text;
+  status.className = `action-status ${state}`.trim();
+}
+
+async function requestJson(url, options = {}, label = "request") {
+  const response = await fetch(url, options);
+  let data = {};
+  try {
+    data = await response.json();
+  } catch {
+    data = {};
   }
-  const select = document.getElementById("project-select");
+  if (!response.ok) {
+    throw new Error(data.error || `${label} ${response.status}`);
+  }
+  return data;
+}
+
+function fillProjectSelect(select, projects, options) {
+  const {
+    allLabel = "",
+    preferredValue = "",
+    fallbackToSingleProject = false,
+  } = options;
   select.innerHTML = "";
-  const allOption = document.createElement("option");
-  allOption.value = "";
-  allOption.textContent = includeArchived ? "所有项目（含归档）" : "所有活动项目";
-  select.append(allOption);
-  for (const project of data.projects) {
+  if (allLabel) {
+    const allOption = document.createElement("option");
+    allOption.value = "";
+    allOption.textContent = allLabel;
+    select.append(allOption);
+  }
+  for (const project of projects) {
     const option = document.createElement("option");
     option.value = project.project_id;
     const archivedLabel = project.archived_at ? " · 已归档" : "";
     option.textContent = `${project.name} · ${project.project_id}${archivedLabel}`;
     select.append(option);
   }
-  select.value = selectedProject;
+  let value = projects.some((project) => project.project_id === preferredValue)
+    ? preferredValue
+    : "";
+  if (!value && fallbackToSingleProject && projects.length === 1) {
+    value = projects[0].project_id;
+  }
+  select.value = value;
+}
+
+async function loadProjects(signal) {
+  const query = includeArchived ? "?include_archived=1" : "";
+  const data = await requestJson(
+    `/api/projects${query}`,
+    { cache: "no-store", signal },
+    "projects",
+  );
+  const projects = Array.isArray(data.projects) ? data.projects : [];
+  projectsById = new Map(
+    projects.map((project) => [project.project_id, project]),
+  );
+  if (selectedProject && !projectsById.has(selectedProject)) {
+    selectedProject = "";
+  }
+  fillProjectSelect(
+    document.getElementById("project-select"),
+    projects,
+    {
+      allLabel: includeArchived ? "所有项目（含归档）" : "所有活动项目",
+      preferredValue: selectedProject,
+    },
+  );
+  fillProjectSelect(
+    document.getElementById("cluster-project-select"),
+    projects,
+    {
+      allLabel: "选择目标项目",
+      preferredValue:
+        document.getElementById("cluster-project-select").value || selectedProject,
+      fallbackToSingleProject: true,
+    },
+  );
+  projectsLoaded = true;
   updateArchiveButton();
 }
 
@@ -117,7 +202,172 @@ function renderCard(task) {
     </article>`;
 }
 
-function renderBoard(data) {
+function summaryNumber(summary, keys, fallback) {
+  for (const key of keys) {
+    if (!summary || !Object.prototype.hasOwnProperty.call(summary, key)) {
+      continue;
+    }
+    const value = summary[key];
+    if (Array.isArray(value)) return value.length;
+    if (typeof value === "boolean") return value ? 1 : 0;
+    const number = Number(value);
+    if (Number.isFinite(number)) return number;
+  }
+  return fallback;
+}
+
+function legacyGoalError(goal) {
+  const reason = String(goal?.last_error || "").trim();
+  if (!reason || !["planning", "active", "failed"].includes(goal?.status)) {
+    return "";
+  }
+  const userControlReason = /(?:pause|resume|cancel).*(?:requested|by user)|requested through dashboard/i;
+  return userControlReason.test(reason) ? "" : reason;
+}
+
+function goalHealth(goal) {
+  const rawHealth = goal?.health;
+  const rawState = typeof rawHealth === "object" && rawHealth !== null
+    ? rawHealth.state ?? rawHealth.status ?? rawHealth.level
+    : rawHealth;
+  const state = String(rawState ?? "").trim();
+  const normalizedState = state.toLowerCase();
+  const legacyError = legacyGoalError(goal);
+  const explicitAttention = goal?.attention === true
+    || Boolean(goal?.attention)
+    || Boolean(legacyError)
+    || (typeof rawHealth === "object"
+      && rawHealth !== null
+      && rawHealth.ok === false);
+  const attention = explicitAttention
+    || attentionHealthStates.has(normalizedState);
+  const rawLabel = typeof rawHealth === "object" && rawHealth !== null
+    ? rawHealth.label ?? rawHealth.message ?? rawHealth.summary
+    : "";
+  const labels = {
+    healthy: "正常",
+    ok: "正常",
+    attention: "需要关注",
+    warning: "警告",
+    critical: "异常",
+    error: "异常",
+    failed: "失败",
+    degraded: "降级",
+  };
+  const statusLabels = {
+    planning: "规划中",
+    active: "运行中",
+    paused: "已暂停",
+    completed: "已完成",
+    failed: "已终止",
+  };
+  const label = String(
+    rawLabel
+      || labels[normalizedState]
+      || (legacyError ? "执行异常" : "")
+      || state.replaceAll("_", " ")
+      || statusLabels[goal?.status]
+      || (attention ? "需要关注" : "未知"),
+  );
+  return { attention, state, label };
+}
+
+function nextActionText(goal) {
+  const value = goal?.next_action;
+  if (value === undefined || value === null || value === "") {
+    const fallbacks = {
+      planning: "等待 Lead 拆分任务",
+      active: "等待 Lead 继续调度",
+      paused: "可恢复目标继续推进",
+      completed: "目标已完成，无需操作",
+      failed: "目标已终止",
+    };
+    return fallbacks[goal?.status] || "—";
+  }
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => nextActionText({ next_action: item }))
+      .filter((item) => item !== "—")
+      .join("；") || "—";
+  }
+  if (typeof value === "object") {
+    return String(
+      value.label
+        ?? value.action
+        ?? value.summary
+        ?? value.description
+        ?? value.message
+        ?? "—",
+    );
+  }
+  return String(value);
+}
+
+function buildClusterMetrics(data = {}) {
+  const summary = data.cluster_summary || {};
+  const goals = Array.isArray(data.cluster_goals) ? data.cluster_goals : [];
+  const jobs = Array.isArray(data.cluster_jobs) ? data.cluster_jobs : [];
+  const activeGoals = goals.filter(
+    (goal) => ["planning", "active"].includes(goal.status),
+  ).length;
+  const pausedGoals = goals.filter((goal) => goal.status === "paused").length;
+  const attentionGoals = goals.filter((goal) => goalHealth(goal).attention).length;
+  const activeWorkers = jobs.filter(
+    (job) => job.kind === "worker"
+      && ["starting", "running"].includes(job.status),
+  ).length;
+  return [
+    {
+      key: "goals",
+      label: "GOALS",
+      value: summaryNumber(
+        summary,
+        ["total", "total_goals", "goals", "goal_count"],
+        goals.length,
+      ),
+    },
+    {
+      key: "active",
+      label: "ACTIVE",
+      value: summaryNumber(
+        summary,
+        ["active", "active_goals", "active_count", "running"],
+        activeGoals,
+      ),
+    },
+    {
+      key: "paused",
+      label: "PAUSED",
+      value: summaryNumber(
+        summary,
+        ["paused", "paused_goals", "paused_count"],
+        pausedGoals,
+      ),
+    },
+    {
+      key: "attention",
+      label: "ATTENTION",
+      value: summaryNumber(
+        summary,
+        ["attention", "attention_goals", "attention_count"],
+        attentionGoals,
+      ),
+    },
+    {
+      key: "workers",
+      label: "WORKERS",
+      value: summaryNumber(
+        summary,
+        ["workers", "active_workers", "running_workers", "active_jobs"],
+        activeWorkers,
+      ),
+    },
+  ];
+}
+
+function renderBoard(data, { force = false } = {}) {
+  const signature = buildBoardSignature(data);
+  if (!force && signature === lastBoardSignature) return false;
   tasksById = new Map(data.tasks.map((task) => [task.task_id, task]));
   if (selectedTaskId && !tasksById.has(selectedTaskId)) {
     closeDetail();
@@ -152,13 +402,26 @@ function renderBoard(data) {
 
   renderCluster(data.cluster_goals || [], data.cluster_jobs || [], data);
   renderMessages(data.messages || []);
-  document.querySelectorAll(".card").forEach((card) => {
-    card.addEventListener("click", () => showDetail(card.dataset.taskId));
-  });
   updateArchiveButton();
+  const detail = document.getElementById("detail");
+  if (selectedTaskId && !detail.classList.contains("hidden")) {
+    showDetail(selectedTaskId);
+  }
+  lastBoardSignature = signature;
+  return true;
 }
 
 function renderCluster(goals, jobs, data) {
+  const summaryContainer = document.getElementById("cluster-summary");
+  summaryContainer.innerHTML = buildClusterMetrics(data)
+    .map((metric) => `
+      <div class="cluster-metric ${metric.key === "attention" && metric.value ? "attention" : ""}"
+           data-metric="${escapeHtml(metric.key)}">
+        <strong>${escapeHtml(metric.value)}</strong>
+        <span>${escapeHtml(metric.label)}</span>
+      </div>`)
+    .join("");
+
   const container = document.getElementById("cluster-overview");
   const selectedName = data.projects.find(
     (project) => project.project_id === data.selected_project_id,
@@ -167,32 +430,64 @@ function renderCluster(goals, jobs, data) {
     const scope = selectedName ? `“${escapeHtml(selectedName)}”项目` : "当前范围";
     container.innerHTML = `
       <div class="cluster-empty">
-        ${scope}没有自动集群目标；下方泳道展示直接创建的普通任务。
+        ${scope}没有自动集群目标；可在上方创建，或继续使用下方普通任务泳道。
       </div>`;
     return;
   }
-  const activeJobs = jobs.filter((job) => ["starting", "running"].includes(job.status));
-  const cards = goals.slice(0, 4).map((goal) => {
+  const activeJobs = jobs.filter(
+    (job) => ["starting", "running"].includes(job.status),
+  );
+  const cards = goals.map((goal) => {
+    const health = goalHealth(goal);
     const goalJobs = activeJobs.filter((job) => job.goal_id === goal.goal_id);
     const runText = goalJobs.length
-      ? goalJobs.map((job) => `${job.kind}:${job.role} PID ${job.pid || "—"}`).join(" · ")
+      ? goalJobs
+        .slice(0, 3)
+        .map((job) => `${job.kind}:${job.role} PID ${job.pid || "—"}`)
+        .join(" · ")
       : "无活动进程";
+    const status = String(goal.status || "unknown");
+    const controls = [];
+    if (["planning", "active"].includes(status)) {
+      controls.push(
+        '<button class="goal-action" type="button" data-control-action="pause">暂停</button>',
+      );
+    }
+    if (status === "paused") {
+      controls.push(
+        '<button class="goal-action resume" type="button" data-control-action="resume">恢复</button>',
+      );
+    }
+    if (!terminalGoalStatuses.has(status)) {
+      controls.push(
+        '<button class="goal-action danger" type="button" data-control-action="cancel">取消</button>',
+      );
+    }
     return `
-      <article class="cluster-card">
+      <article class="cluster-card ${health.attention ? "attention" : ""}"
+               data-goal-id="${escapeHtml(goal.goal_id)}">
         <div class="card-top">
           <span class="task-id">${escapeHtml(goal.goal_id)}</span>
-          <span class="kind">${escapeHtml(goal.status)}</span>
+          <span class="kind">${escapeHtml(status)}</span>
         </div>
-        <h3>${escapeHtml(goal.objective)}</h3>
+        <h3 title="${escapeHtml(goal.objective)}">${escapeHtml(goal.objective)}</h3>
         <div class="card-meta">
           <span class="chip">${escapeHtml(goal.project_name || "未知项目")}</span>
           <span class="chip owner">${escapeHtml(goal.autonomy)}</span>
-          <span class="chip">lead ticks ${escapeHtml(goal.lead_ticks)}</span>
+          <span class="chip">lead ticks ${escapeHtml(goal.lead_ticks ?? 0)}</span>
           <span class="chip">${escapeHtml(runText)}</span>
+          ${health.attention ? '<span class="chip attention-chip">需关注</span>' : ""}
         </div>
+        <div class="cluster-guidance">
+          <span>健康</span>
+          <strong class="${health.attention ? "attention" : ""}">${escapeHtml(health.label)}</strong>
+          <span>下一步</span>
+          <p>${escapeHtml(nextActionText(goal))}</p>
+        </div>
+        ${controls.length ? `<div class="cluster-actions">${controls.join("")}</div>` : ""}
       </article>`;
   }).join("");
-  container.innerHTML = `<div class="cluster-title">自动集群目标 · ${activeJobs.length} 个活动进程</div>${cards}`;
+  container.innerHTML = `<div class="cluster-title">${goals.length} 个目标 · ${activeJobs.length} 个活动进程</div>${cards}`;
 }
 
 function renderMessages(messages) {
@@ -266,30 +561,123 @@ function closeDetail() {
   updateArchiveButton();
 }
 
-async function refresh() {
-  const health = document.getElementById("health");
+function buildBoardSignature(data) {
+  if (data?.signature || data?.response_signature) {
+    return String(data.signature || data.response_signature);
+  }
+  const normalized = JSON.parse(JSON.stringify(data ?? {}));
+  delete normalized.generated_at;
+  for (const task of normalized.tasks || []) {
+    delete task.claim_wait_seconds;
+    delete task.claim_wait_state;
+  }
+  return JSON.stringify(normalized);
+}
+
+function backoffDelay(failures) {
+  return Math.min(
+    POLL_INTERVAL_MS * (2 ** Math.max(0, failures - 1)),
+    MAX_POLL_BACKOFF_MS,
+  );
+}
+
+function clearPollTimer() {
+  if (pollTimer !== null) {
+    window.clearTimeout(pollTimer);
+    pollTimer = null;
+  }
+}
+
+function schedulePoll(delay) {
+  clearPollTimer();
+  if (document.hidden) return;
+  pollTimer = window.setTimeout(() => {
+    pollTimer = null;
+    void pollBoard();
+  }, delay);
+}
+
+async function pollBoard({ forceRender = false } = {}) {
+  clearPollTimer();
+  if (document.hidden) return false;
+  if (pollInFlight) {
+    refreshQueued = true;
+    queuedForceRender = queuedForceRender || forceRender;
+    return false;
+  }
+  pollInFlight = true;
+  activeRequest = new AbortController();
   try {
-    await loadProjects();
+    if (!projectsLoaded) {
+      await loadProjects(activeRequest.signal);
+    }
     const params = new URLSearchParams();
     if (selectedProject) params.set("project_id", selectedProject);
     if (includeArchived) params.set("include_archived", "1");
     const suffix = params.size ? `?${params.toString()}` : "";
-    const response = await fetch(`/api/board${suffix}`, { cache: "no-store" });
-    if (!response.ok) throw new Error(`board ${response.status}`);
-    const data = await response.json();
-    renderBoard(data);
-    health.textContent = `已同步 ${new Date().toLocaleTimeString("zh-CN")}`;
-    health.className = "health ok";
+    const data = await requestJson(
+      `/api/board${suffix}`,
+      { cache: "no-store", signal: activeRequest.signal },
+      "board",
+    );
+    renderBoard(data, { force: forceRender });
+    const downBefore = pollFailures > 0;
+    pollFailures = 0;
+    setConnectionState(
+      `已同步 ${new Date().toLocaleTimeString("zh-CN")}${downBefore ? " · 已恢复" : ""}`,
+      "ok",
+    );
+    schedulePoll(POLL_INTERVAL_MS);
+    return true;
   } catch (error) {
-    health.textContent = `连接失败：${error.message}`;
-    health.className = "health error";
+    if (error.name === "AbortError") return false;
+    pollFailures += 1;
+    const delay = backoffDelay(pollFailures);
+    setConnectionState(
+      `连接失败：${error.message} · ${Math.round(delay / 1000)} 秒后重试`,
+      "error",
+    );
+    schedulePoll(delay);
+    return false;
+  } finally {
+    pollInFlight = false;
+    activeRequest = null;
+    if (refreshQueued) {
+      const force = queuedForceRender;
+      refreshQueued = false;
+      queuedForceRender = false;
+      if (!document.hidden) {
+        clearPollTimer();
+        pollTimer = window.setTimeout(() => {
+          pollTimer = null;
+          void pollBoard({ forceRender: force });
+        }, 0);
+      }
+    }
   }
+}
+
+function requestImmediateRefresh({ forceRender = false } = {}) {
+  clearPollTimer();
+  return pollBoard({ forceRender });
+}
+
+function handleVisibilityChange() {
+  if (document.hidden) {
+    clearPollTimer();
+    refreshQueued = false;
+    queuedForceRender = false;
+    activeRequest?.abort();
+    setConnectionState("页面隐藏 · 轮询已暂停", "paused");
+    return;
+  }
+  refreshQueued = false;
+  void pollBoard();
 }
 
 async function toggleArchiveTarget() {
   const task = selectedTaskId ? tasksById.get(selectedTaskId) : null;
   const project = projectsById.get(selectedProject);
-  const health = document.getElementById("health");
   const target = task || project;
   if (!target) return;
   const archived = Boolean(target.archived_at);
@@ -307,42 +695,179 @@ async function toggleArchiveTarget() {
     const body = task
       ? { task_id: task.task_id, archived: !archived }
       : { project_id: project.project_id, archived: !archived };
-    const response = await fetch(endpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    const result = await response.json();
-    if (!response.ok) throw new Error(result.error || `archive ${response.status}`);
+    await requestJson(
+      endpoint,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+      "archive",
+    );
     if (task && !archived && !includeArchived) closeDetail();
     if (!task && !archived && !includeArchived) selectedProject = "";
-    await refresh();
+    projectsLoaded = false;
+    await requestImmediateRefresh({ forceRender: true });
   } catch (error) {
-    health.textContent = `归档失败：${error.message}`;
-    health.className = "health error";
+    setConnectionState(`归档失败：${error.message}`, "error");
+  } finally {
     updateArchiveButton();
   }
 }
 
-document.getElementById("project-select").addEventListener("change", (event) => {
-  closeDetail();
-  selectedProject = event.target.value;
-  refresh();
-});
-document.getElementById("show-archived").addEventListener("change", (event) => {
-  closeDetail();
-  includeArchived = event.target.checked;
-  const project = projectsById.get(selectedProject);
-  if (!includeArchived && project?.archived_at) selectedProject = "";
-  refresh();
-});
-document.getElementById("archive-target").addEventListener("click", toggleArchiveTarget);
-document.getElementById("detail-close").addEventListener("click", closeDetail);
-document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") closeDetail();
-});
-window.addEventListener("resize", syncTopbarHeight);
+function createClusterPayload(projectId, objective, autonomy = "auto") {
+  return {
+    project_id: projectId,
+    objective: objective.trim(),
+    autonomy,
+    max_worker_attempts: 3,
+    max_lead_attempts: 5,
+  };
+}
 
-syncTopbarHeight();
-refresh();
-timer = setInterval(refresh, 2000);
+async function handleCreateCluster(event) {
+  event.preventDefault();
+  const projectId = document.getElementById("cluster-project-select").value;
+  const objective = document.getElementById("cluster-objective").value.trim();
+  const autonomy = document.getElementById("cluster-autonomy").value;
+  if (!projectId || !objective) {
+    setActionStatus("cluster-create-status", "请选择项目并填写目标。", "error");
+    return;
+  }
+  const button = document.getElementById("cluster-create");
+  button.disabled = true;
+  setActionStatus("cluster-create-status", "正在创建目标…", "pending");
+  try {
+    const result = await requestJson(
+      "/api/clusters",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(createClusterPayload(projectId, objective, autonomy)),
+      },
+      "create cluster",
+    );
+    document.getElementById("cluster-objective").value = "";
+    setActionStatus(
+      "cluster-create-status",
+      `目标 ${result.goal?.goal_id || ""} 已创建`,
+      "success",
+    );
+    await requestImmediateRefresh();
+  } catch (error) {
+    setActionStatus(
+      "cluster-create-status",
+      `创建失败：${error.message}`,
+      "error",
+    );
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function handleClusterControl(button) {
+  const action = button.dataset.controlAction;
+  const card = button.closest(".cluster-card");
+  const goalId = card?.dataset.goalId;
+  if (!goalId || !["pause", "resume", "cancel"].includes(action)) return;
+  if (
+    action === "cancel"
+    && !window.confirm(`取消目标 ${goalId}？未完成任务会保留。`)
+  ) {
+    return;
+  }
+  const labels = {
+    pause: "正在暂停…",
+    resume: "正在恢复…",
+    cancel: "正在取消…",
+  };
+  button.disabled = true;
+  setActionStatus("cluster-action-status", labels[action], "pending");
+  try {
+    await requestJson(
+      "/api/clusters/control",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ goal_id: goalId, action }),
+      },
+      "cluster control",
+    );
+    const completedLabels = {
+      pause: "目标已暂停",
+      resume: "目标已恢复",
+      cancel: "目标已取消",
+    };
+    setActionStatus(
+      "cluster-action-status",
+      `${goalId} · ${completedLabels[action]}`,
+      "success",
+    );
+    await requestImmediateRefresh();
+  } catch (error) {
+    setActionStatus(
+      "cluster-action-status",
+      `${goalId} · 操作失败：${error.message}`,
+      "error",
+    );
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function initializeDashboard() {
+  const board = document.getElementById("board");
+  if (!board) return;
+  board.addEventListener("click", (event) => {
+    const card = event.target.closest(".card");
+    if (card) showDetail(card.dataset.taskId);
+  });
+  document.getElementById("cluster-overview").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-control-action]");
+    if (button) void handleClusterControl(button);
+  });
+  document.getElementById("cluster-create-form").addEventListener(
+    "submit",
+    handleCreateCluster,
+  );
+  document.getElementById("project-select").addEventListener("change", (event) => {
+    closeDetail();
+    selectedProject = event.target.value;
+    void requestImmediateRefresh();
+  });
+  document.getElementById("show-archived").addEventListener("change", (event) => {
+    closeDetail();
+    includeArchived = event.target.checked;
+    const project = projectsById.get(selectedProject);
+    if (!includeArchived && project?.archived_at) selectedProject = "";
+    projectsLoaded = false;
+    void requestImmediateRefresh();
+  });
+  document.getElementById("archive-target").addEventListener(
+    "click",
+    toggleArchiveTarget,
+  );
+  document.getElementById("detail-close").addEventListener("click", closeDetail);
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") closeDetail();
+  });
+  document.addEventListener("visibilitychange", handleVisibilityChange);
+  window.addEventListener("resize", syncTopbarHeight);
+
+  syncTopbarHeight();
+  void pollBoard({ forceRender: true });
+}
+
+if (typeof window !== "undefined") {
+  window.TeamBoardTestHooks = Object.freeze({
+    backoffDelay,
+    buildBoardSignature,
+    buildClusterMetrics,
+    createClusterPayload,
+    goalHealth,
+    nextActionText,
+    renderBoard,
+  });
+}
+
+initializeDashboard();

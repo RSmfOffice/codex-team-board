@@ -27,7 +27,37 @@
     </div>
   </header>
 
-  <section id="cluster-overview" class="cluster-overview"></section>
+  <section class="cluster-workspace" aria-labelledby="cluster-heading">
+    <div class="cluster-heading">
+      <div>
+        <div class="eyebrow">AUTOMATED WORKFLOW</div>
+        <h2 id="cluster-heading">自动集群目标</h2>
+      </div>
+      <span id="cluster-action-status" class="action-status" role="status"></span>
+    </div>
+    <form id="cluster-create-form" class="cluster-create">
+      <select id="cluster-project-select" aria-label="目标项目" required>
+        <option value="">选择目标项目</option>
+      </select>
+      <input
+        id="cluster-objective"
+        name="objective"
+        type="text"
+        maxlength="2000"
+        placeholder="输入一个可验收的目标"
+        aria-label="集群目标"
+        required
+      >
+      <select id="cluster-autonomy" aria-label="自治模式">
+        <option value="auto">自动推进</option>
+        <option value="supervised">Review 时暂停</option>
+      </select>
+      <button id="cluster-create" class="primary-button" type="submit">创建目标</button>
+      <span id="cluster-create-status" class="form-status" role="status"></span>
+    </form>
+    <div id="cluster-summary" class="cluster-summary" aria-live="polite"></div>
+    <div id="cluster-overview" class="cluster-overview"></div>
+  </section>
   <section class="summary" id="summary"></section>
 
   <main class="board" id="board">
