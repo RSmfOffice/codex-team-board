@@ -6,6 +6,7 @@ import tempfile
 import threading
 import unittest
 import urllib.request
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
@@ -546,6 +547,184 @@ class TeamFlowTests(unittest.TestCase):
         )
         self.assertEqual(saved["claim_wait_state"], "critical")
         self.assertGreaterEqual(saved["claim_wait_seconds"], 300)
+
+    def test_dashboard_cluster_summary_and_attention_thresholds(self) -> None:
+        manager = ClusterManager(
+            self.settings,
+            team=self.team,
+            worktrees=self.worktrees,
+        )
+        active_goal = manager.create_goal(
+            self.repo,
+            objective="Summarize active goal health",
+            autonomy="auto",
+        )
+        manager.set_goal_status(active_goal["goal_id"], "active")
+        project = self.team.register_project(self.repo)
+        now = datetime.now(UTC)
+        with self.team.connection() as connection:
+            for goal_id, status in (
+                ("G-PAUSED-TEST", "paused"),
+                ("G-FAILED-TEST", "failed"),
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO cluster_goals(
+                        goal_id, project_id, objective, status, autonomy,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 'auto', ?, ?)
+                    """,
+                    (
+                        goal_id,
+                        project["project_id"],
+                        status,
+                        status,
+                        now.isoformat().replace("+00:00", "Z"),
+                        now.isoformat().replace("+00:00", "Z"),
+                    ),
+                )
+
+        critical_task = self.team.create_task(
+            self.repo,
+            title="Critical ready task",
+            description="Waits longer than the critical threshold.",
+            acceptance="dashboard marks it critical",
+            kind="read",
+            owner_role="team_explorer",
+            goal_id=active_goal["goal_id"],
+        )
+        warning_task = self.team.create_task(
+            self.repo,
+            title="Warning ready task",
+            description="Waits longer than the warning threshold.",
+            acceptance="dashboard marks it warning",
+            kind="read",
+            owner_role="team_explorer",
+            goal_id=active_goal["goal_id"],
+        )
+        running_task = self.team.create_task(
+            self.repo,
+            title="Running task",
+            description="Provides a running task count.",
+            acceptance="dashboard counts it",
+            kind="read",
+            owner_role="team_explorer",
+            goal_id=active_goal["goal_id"],
+        )
+        review_task = self.team.create_task(
+            self.repo,
+            title="Review task",
+            description="Provides a review task count.",
+            acceptance="dashboard counts it",
+            kind="read",
+            owner_role="team_explorer",
+            goal_id=active_goal["goal_id"],
+        )
+        blocked_task = self.team.create_task(
+            self.repo,
+            title="Blocked task",
+            description="Provides a blocked task count.",
+            acceptance="dashboard counts it",
+            kind="read",
+            owner_role="team_explorer",
+            goal_id=active_goal["goal_id"],
+        )
+        with self.team.connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET created_at = ? WHERE task_id = ?",
+                (
+                    (now - timedelta(seconds=360))
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                    critical_task["task_id"],
+                ),
+            )
+            connection.execute(
+                "UPDATE tasks SET created_at = ? WHERE task_id = ?",
+                (
+                    (now - timedelta(seconds=90))
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                    warning_task["task_id"],
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO cluster_jobs(
+                    job_id, goal_id, task_id, kind, role, status,
+                    log_path, output_path, started_at
+                ) VALUES (?, ?, ?, 'worker', 'team_explorer', 'running', ?, ?, ?)
+                """,
+                (
+                    "J-ACTIVE-TEST",
+                    active_goal["goal_id"],
+                    running_task["task_id"],
+                    str(self.base / "active.log"),
+                    str(self.base / "active.out"),
+                    now.isoformat().replace("+00:00", "Z"),
+                ),
+            )
+        self.team.claim_task(running_task["task_id"], actor="runner")
+        claimed_review = self.team.claim_task(
+            review_task["task_id"],
+            actor="reviewer",
+        )
+        self.team.submit_task(
+            review_task["task_id"],
+            actor="reviewer",
+            claim_token=claimed_review["claim_token"],
+            result="ready for review",
+            tests="manual dashboard fixture",
+        )
+        self.team.block_task(
+            blocked_task["task_id"],
+            actor="worker",
+            reason="waiting for input",
+        )
+
+        dashboard = self.team.dashboard_snapshot()
+        summary = dashboard["cluster_summary"]
+        self.assertEqual(summary["goals_total"], 3)
+        self.assertEqual(summary["goals_active"], 1)
+        self.assertEqual(summary["goals_paused"], 1)
+        self.assertEqual(summary["goals_failed"], 1)
+        self.assertEqual(summary["ready_tasks"], 2)
+        self.assertEqual(summary["running_tasks"], 1)
+        self.assertEqual(summary["review_tasks"], 1)
+        self.assertEqual(summary["blocked_tasks"], 1)
+        self.assertEqual(summary["active_jobs"], 1)
+        self.assertEqual(summary["attention_count"], 5)
+        self.assertGreaterEqual(summary["oldest_claim_wait_seconds"], 360)
+
+        tasks_by_id = {
+            task["task_id"]: task for task in dashboard["tasks"]
+        }
+        self.assertEqual(
+            tasks_by_id[critical_task["task_id"]]["claim_wait_state"],
+            "critical",
+        )
+        self.assertEqual(
+            tasks_by_id[warning_task["task_id"]]["claim_wait_state"],
+            "warning",
+        )
+        goals_by_id = {
+            goal["goal_id"]: goal for goal in dashboard["cluster_goals"]
+        }
+        active = goals_by_id[active_goal["goal_id"]]
+        self.assertEqual(active["health"], "critical")
+        self.assertEqual(active["next_action"], "resolve_blocked_tasks")
+        self.assertEqual(active["attention_task_count"], 3)
+        self.assertEqual(goals_by_id["G-PAUSED-TEST"]["health"], "warning")
+        self.assertEqual(
+            goals_by_id["G-PAUSED-TEST"]["next_action"],
+            "resume_or_cancel_goal",
+        )
+        self.assertEqual(goals_by_id["G-PAUSED-TEST"]["attention_task_count"], 0)
+        self.assertEqual(goals_by_id["G-FAILED-TEST"]["health"], "critical")
+        self.assertEqual(
+            goals_by_id["G-FAILED-TEST"]["next_action"],
+            "inspect_failed_goal",
+        )
 
     def test_mcp_handoff_flow(self) -> None:
         create_tool = next(
