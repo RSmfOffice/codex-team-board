@@ -1541,6 +1541,7 @@ class TeamService:
         note: str,
         result: str | None = None,
         tests: str | None = None,
+        commit_sha: str | None = None,
     ) -> dict[str, Any]:
         with self.connection() as connection:
             task = self._authorized_task(connection, task_id, claim_token, actor)
@@ -1554,6 +1555,9 @@ class TeamService:
             if tests is not None:
                 fields.append("tests = ?")
                 parameters.append(tests)
+            if commit_sha is not None:
+                fields.append("commit_sha = ?")
+                parameters.append(commit_sha.strip())
             parameters.append(task_id)
             connection.execute(
                 f"UPDATE tasks SET {', '.join(fields)} WHERE task_id = ?",
@@ -1564,7 +1568,12 @@ class TeamService:
                 task_id,
                 "progress",
                 actor,
-                {"note": note, "result": result, "tests": tests},
+                {
+                    "note": note,
+                    "result": result,
+                    "tests": tests,
+                    "commit_sha": commit_sha,
+                },
             )
         return self.get_task(task_id)
 

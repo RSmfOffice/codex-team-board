@@ -1,9 +1,9 @@
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative, sep } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { fileURLToPath } from "node:url";
 
 const baseUrl = process.env.CODEX_TEAM_DASHBOARD_URL || "http://127.0.0.1:8765";
 const edgeCandidates = [
@@ -15,7 +15,12 @@ if (!edgePath) throw new Error("Microsoft Edge not found");
 
 const screenshotPath = join(process.cwd(), "artifacts", "dashboard-edge-smoke.png");
 await mkdir(join(process.cwd(), "artifacts"), { recursive: true });
-const profile = await mkdtemp(join(tmpdir(), "codex-team-edge-smoke-"));
+const profileRoot = fileURLToPath(
+  new URL("../artifacts/edge-smoke-profiles", import.meta.url),
+);
+await mkdir(profileRoot, { recursive: true });
+const profilePrefix = `edge-smoke-${process.pid}-`;
+const profile = await mkdtemp(join(profileRoot, profilePrefix));
 const failures = [];
 const checks = [];
 const network = new Map();
@@ -339,10 +344,11 @@ try {
     });
   }
   await delay(300);
-  const normalized = profile.toLowerCase();
+  const profileRelative = relative(profileRoot, profile);
   if (
-    normalized.startsWith(tmpdir().toLowerCase())
-    && normalized.includes("codex-team-edge-smoke-")
+    profileRelative.startsWith(profilePrefix)
+    && !profileRelative.includes(sep)
+    && !isAbsolute(profileRelative)
   ) {
     await rm(profile, { recursive: true, force: true, maxRetries: 5 });
   }

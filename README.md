@@ -871,10 +871,12 @@ node scripts/dashboard-ui-smoke.mjs
 node scripts/dashboard-edge-smoke.mjs
 ```
 
-`dashboard-edge-smoke.mjs` 假定看板已在默认 `http://127.0.0.1:8765` 运行。
-它使用唯一 CDP 端口和临时 Edge profile，验证 1120px 无横向溢出、Worker/Lead
-指标、项目联动、归档入口、网络状态和浏览器运行时错误，并在结束时清理子进程树
-与临时目录。
+运行 `dashboard-edge-smoke.mjs` 前，需确保看板监听默认
+`http://127.0.0.1:8765`；可用 `CODEX_TEAM_DASHBOARD_URL` 覆盖地址。脚本通过
+`--remote-debugging-port=0` 使用唯一 CDP 端口，并将 Edge profile 放在项目已忽略
+的 `artifacts/edge-smoke-profiles/edge-smoke-<PID>-<随机后缀>` 下，不依赖系统
+`TEMP`。它验证 1120px 无横向溢出、Worker/Lead 指标、项目联动、归档入口、网络
+状态和浏览器运行时错误，结束时只终止本次 Edge 进程树并清理本次 profile。
 
 ## 发布包
 

@@ -1563,6 +1563,12 @@ class TeamFlowTests(unittest.TestCase):
             for item in _tool_definitions()
             if item["name"] == "team_submit_task"
         )
+        update_tool = next(
+            item
+            for item in _tool_definitions()
+            if item["name"] == "team_update_task"
+        )
+        self.assertIn("commit_sha", update_tool["inputSchema"]["properties"])
         self.assertIn("commit_sha", submit_tool["inputSchema"]["properties"])
         mcp = TeamMcpServer(self.settings)
         task = mcp.call_tool(
@@ -1662,6 +1668,47 @@ class TeamFlowTests(unittest.TestCase):
             ensured["goal"]["goal_id"],
             reused["goal"]["goal_id"],
         )
+
+    def test_mcp_update_task_persists_commit_sha(self) -> None:
+        mcp = TeamMcpServer(self.settings)
+        task = mcp.call_tool(
+            "team_create_task",
+            {
+                "repo_root": str(self.repo),
+                "title": "MCP update commit",
+                "description": "Record a worker commit through MCP progress updates.",
+                "acceptance": "commit_sha persists and can be read back",
+                "kind": "write",
+                "owner_role": "team_worker",
+            },
+        )
+        worktree = self.worktrees.create(
+            task["task_id"],
+            repo=self.repo,
+            worktree_path=self.base / "mcp-update-worktree",
+        )
+        commit_sha = git(Path(worktree["worktree_path"]), "rev-parse", "HEAD")
+        claimed = mcp.call_tool(
+            "team_claim_task",
+            {"task_id": task["task_id"], "actor": "worker"},
+        )
+        updated = mcp.call_tool(
+            "team_update_task",
+            {
+                "task_id": task["task_id"],
+                "actor": "worker",
+                "claim_token": claimed["claim_token"],
+                "note": "implementation committed",
+                "commit_sha": commit_sha,
+            },
+        )
+        self.assertEqual(updated["status"], "running")
+        self.assertEqual(updated["commit_sha"], commit_sha)
+        fetched = mcp.call_tool(
+            "team_get_task",
+            {"task_id": task["task_id"]},
+        )
+        self.assertEqual(fetched["commit_sha"], commit_sha)
 
     def test_concurrent_claim_has_one_winner_and_expired_lease_can_move(self) -> None:
         task = self.team.create_task(
