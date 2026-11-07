@@ -14,6 +14,8 @@
 - append-only 任务事件与团队消息
 - Codex MCP stdio 服务
 - 无外部依赖的本地 Web Kanban
+- 可在 Web 看板创建、暂停、恢复和取消自动集群目标
+- 集群健康摘要、下一步动作和需要关注的异常提示
 
 ## 两个仓库如何联动
 
@@ -114,6 +116,25 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -File .\codex-context-meter-plugin\scripts\install.ps1 `
   -NoTeamBoardIntegration
+```
+
+### 升级已有安装
+
+先完全退出 Codex，并停止仍在运行的旧看板进程，再更新本仓库并重新运行安装器：
+
+```powershell
+Set-Location "D:\path\to\codex-team-board"
+git pull --ff-only
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File .\scripts\install.ps1
+```
+
+如果仍需联动上下文插件，追加
+`-ContextMeterRoot "D:\path\to\codex-context-meter"`。安装完成后重新打开 Codex，
+并确认健康接口返回 `"version": "0.3.0"`：
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8765/api/health
 ```
 
 上下文插件也可以通过 GitHub marketplace 安装：
@@ -269,9 +290,10 @@ Review 重点：
 .\scripts\dashboard.ps1
 ```
 
-浏览器打开 `http://127.0.0.1:8765`。看板每 2 秒刷新，只读展示：Ready、
-Running、Review、Blocked、Done 泳道，以及依赖、租约、分支、worktree、审计结果、
-交接事件和团队消息。所有写入仍通过 MCP 或 CLI 完成。
+浏览器打开 `http://127.0.0.1:8765`。看板展示 Ready、Running、Review、
+Blocked、Done 泳道，以及依赖、租约、分支、worktree、审计结果、交接事件、
+团队消息和自动集群目标。任务状态仍通过 MCP 或 CLI 写入；集群目标和归档操作
+可以直接在 WebUI 完成。
 
 也可以双击根目录的 `启动Codex团队看板.cmd`。
 
@@ -279,6 +301,126 @@ Running、Review、Blocked、Done 泳道，以及依赖、租约、分支、work
 `cluster start` 写入任务图的任务。普通 Codex 对话和原生子 Agent 不会自动变成
 看板任务；如果预期有任务但页面为空，先检查 `/api/board` 的 `tasks` 数量和
 `CODEX_TEAM_HOME` 是否指向同一数据库。
+
+### WebUI 集群控制
+
+看板顶部可以直接选择项目、填写目标并创建集群。`auto` 模式会持续调度到目标和
+任务完成；`supervised` 模式在执行到 Review 时暂停，等待人工决定。创建请求会
+同时确保 `teamd` 已启动。
+
+集群卡提供以下操作：
+
+- Active/Planning：暂停或取消。
+- Paused：恢复或取消；恢复会把目标改为 Active 并确保 `teamd` 已启动。
+- Completed/Failed：不显示操作按钮。
+
+取消在 Web API 中通过目标状态 `failed` 落板，具体原因保存在 `last_error`，不会
+删除目标、任务、事件或 Git worktree。
+
+### 集群健康与 attention
+
+`/api/board` 的 `cluster_summary` 汇总目标、任务、活动进程和 attention：
+
+```text
+goals_total
+goals_active
+goals_paused
+goals_failed
+ready_tasks
+running_tasks
+review_tasks
+blocked_tasks
+active_jobs
+attention_count
+oldest_claim_wait_seconds
+```
+
+每个 `cluster_goals` 项还包含 `health`、`next_action` 和
+`attention_task_count`。`health` 按以下优先级计算：
+
+| 值 | 条件 |
+| --- | --- |
+| `critical` | 目标 failed；存在 blocked 任务；或 ready 任务等待认领至少 300 秒 |
+| `warning` | 目标 paused；存在 review 任务；或 ready 任务等待认领 60–299 秒 |
+| `active` | 存在 starting/running Agent job 或 running 任务 |
+| `planning` | 目标仍处于 planning |
+| `healthy` | 其他状态 |
+
+attention 的计数口径如下：
+
+- blocked、review 和等待认领至少 300 秒的 ready 任务各计一个 attention 任务。
+- review 被视为需要人工处理，因此也会让目标进入 warning。
+- ready 等待 60–299 秒只把目标标为 warning，并更新
+  `oldest_claim_wait_seconds`，不单独增加 `attention_count`。
+- paused 或 failed 目标各增加一个 `attention_count`，但不计入目标的
+  `attention_task_count`；后者只统计该目标下的任务。
+- 同一目标可有多个任务分别计数，目标自身也可再计一次。因此
+  `attention_count` 表示待处理信号数量，不是去重后的目标数。
+
+`next_action` 是供 UI 和自动化消费的稳定枚举，可能为
+`inspect_failed_goal`、`resume_or_cancel_goal`、`resolve_blocked_tasks`、
+`assign_ready_tasks`、`review_completed_tasks`、`monitor_active_jobs`、
+`monitor_running_tasks`、`schedule_ready_tasks`、`wait_for_lead`、`none` 或
+`monitor_goal`。
+
+### 集群 API 示例
+
+创建目标需要项目 ID、目标和自治模式。重试次数是可选字段：
+`max_worker_attempts` 的范围是 `1..10`，默认 3；`max_lead_attempts` 的范围是
+`1..20`，默认 5。
+
+```powershell
+$base = "http://127.0.0.1:8765"
+$projectId = (Invoke-RestMethod "$base/api/board").projects[0].project_id
+$body = @{
+  project_id = $projectId
+  objective = "完成发版前的实现、测试和文档"
+  autonomy = "supervised"
+  max_worker_attempts = 3
+  max_lead_attempts = 5
+} | ConvertTo-Json
+
+$created = Invoke-RestMethod `
+  -Uri "$base/api/clusters" `
+  -Method Post `
+  -ContentType "application/json" `
+  -Body $body
+$created.goal.goal_id
+$created.daemon
+```
+
+暂停、恢复或取消使用同一个控制端点：
+
+```powershell
+$goalId = $created.goal.goal_id
+$control = @{
+  goal_id = $goalId
+  action = "pause"
+} | ConvertTo-Json
+
+Invoke-RestMethod `
+  -Uri "$base/api/clusters/control" `
+  -Method Post `
+  -ContentType "application/json" `
+  -Body $control
+```
+
+`action` 只接受 `pause`、`resume`、`cancel`。成功响应的形状为
+`{"goal": {...}, "daemon": {...}}`；参数错误返回 400，状态或项目冲突返回 409，
+错误响应包含 `error`。
+
+### 轮询效率
+
+页面首次加载会读取一次 `/api/projects`，之后常规轮询只请求 `/api/board`。
+项目归档状态或“显示已归档”筛选变化时才重新加载项目列表。
+
+看板默认每 2 秒轮询一次，并有以下保护：
+
+- 同一时间只有一个 board 请求在途；队列中的刷新会合并。
+- 页面隐藏时停止定时器并取消在途请求，返回页面时立即刷新。
+- 请求失败后按 2、4、8、16、30 秒退避，成功响应后恢复 2 秒间隔。
+- 只有 board 内容签名变化时才重绘；正常轮询中的 claim 年龄和
+  `generated_at` 更新不会单独触发表格重绘。
 
 ### 项目与任务归档
 
@@ -419,5 +561,5 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -File .\scripts\build-release.ps1
 ```
 
-输出位于 `dist\codex-team-board-v0.2.0.zip`，同时生成 SHA256 文件。GitHub
+输出位于 `dist\codex-team-board-v0.3.0.zip`，同时生成 SHA256 文件。GitHub
 Release 应附带 ZIP 与 `.sha256` 两个资产。
