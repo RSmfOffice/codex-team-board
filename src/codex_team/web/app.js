@@ -443,7 +443,7 @@ function buildClusterMetrics(data = {}) {
     {
       key: "jobs",
       label: "WORKER SLOTS",
-      value: `${globalJobs}/${globalCapacity || "—"}`,
+      value: `${globalJobs}/${globalCapacity}`,
       detail: `${activeGoals} 主 Agent · 每会话 ${capacityPerGoal} Worker`,
       tone: globalCapacity > 0 && globalJobs >= globalCapacity
         ? "warning"
