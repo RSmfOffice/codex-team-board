@@ -118,6 +118,83 @@ class MigrationTests(unittest.TestCase):
             finally:
                 upgraded.close()
 
+    def test_archived_goal_done_tasks_are_backfilled_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "backfill.sqlite"
+            connection = connect(path)
+            try:
+                now = "2026-11-07T00:00:00Z"
+                connection.execute(
+                    """
+                    INSERT INTO projects(
+                        project_id, name, root_path, created_at, updated_at
+                    ) VALUES ('P1', 'Project', 'D:/project', ?, ?)
+                    """,
+                    (now, now),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO cluster_goals(
+                        goal_id, project_id, objective, status, autonomy,
+                        created_at, updated_at, archived_at
+                    ) VALUES ('G1', 'P1', 'Archived goal', 'completed', 'auto',
+                              ?, ?, ?)
+                    """,
+                    (now, now, now),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO tasks(
+                        task_id, project_id, goal_id, title, description,
+                        acceptance, kind, status, priority, owner_role,
+                        created_at, updated_at
+                    ) VALUES ('T1', 'P1', 'G1', 'Done task', 'Description',
+                              'Acceptance', 'read', 'done', 2, 'team_explorer',
+                              ?, ?)
+                    """,
+                    (now, now),
+                )
+                connection.execute(
+                    "DELETE FROM metadata WHERE key = ?",
+                    ("goal_archive_done_backfill_v11",),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            upgraded = connect(path)
+            try:
+                task = upgraded.execute(
+                    """
+                    SELECT archived_at, archived_by_goal
+                    FROM tasks WHERE task_id = 'T1'
+                    """
+                ).fetchone()
+                self.assertIsNotNone(task["archived_at"])
+                self.assertEqual(task["archived_by_goal"], 1)
+                events = [
+                    row["event_type"]
+                    for row in upgraded.execute(
+                        """
+                        SELECT event_type FROM task_events
+                        WHERE task_id = 'T1'
+                        ORDER BY event_id
+                        """
+                    ).fetchall()
+                ]
+                self.assertEqual(events, ["archived_by_goal"])
+            finally:
+                upgraded.close()
+
+            reopened = connect(path)
+            try:
+                event_count = reopened.execute(
+                    "SELECT COUNT(*) FROM task_events WHERE task_id = 'T1'"
+                ).fetchone()[0]
+                self.assertEqual(event_count, 1)
+            finally:
+                reopened.close()
+
 
 if __name__ == "__main__":
     unittest.main()
