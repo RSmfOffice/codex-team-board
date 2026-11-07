@@ -67,26 +67,29 @@ def run(interval: float = 5.0, once: bool = False) -> int:
     settings.ensure()
     _, state_path, _ = daemon_paths(settings)
     manager = ClusterManager(settings)
-    with acquire_lock(settings):
-        while True:
-            try:
-                result = manager.tick()
-                state = {
-                    "ok": True,
-                    **result,
-                    "pid": os.getpid(),
-                }
-            except Exception as exc:
-                state = {
-                    "ok": False,
-                    "tick_at": utc_now(),
-                    "pid": os.getpid(),
-                    "error": str(exc),
-                }
-            write_json_atomic(state_path, state)
-            if once:
-                return 0 if state.get("ok") else 1
-            time.sleep(max(1.0, interval))
+    try:
+        with acquire_lock(settings):
+            while True:
+                try:
+                    result = manager.tick()
+                    state = {
+                        "ok": True,
+                        **result,
+                        "pid": os.getpid(),
+                    }
+                except Exception as exc:
+                    state = {
+                        "ok": False,
+                        "tick_at": utc_now(),
+                        "pid": os.getpid(),
+                        "error": str(exc),
+                    }
+                write_json_atomic(state_path, state)
+                if once:
+                    return 0 if state.get("ok") else 1
+                time.sleep(max(1.0, interval))
+    finally:
+        manager.close()
 
 
 def main(argv: list[str] | None = None) -> int:

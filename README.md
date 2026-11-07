@@ -497,6 +497,8 @@ MCP 的 `team_cluster_control.action` 除 `pause`、`resume`、`cancel` 外，�
   “恢复当前任务”；归档的集群目标则显示“恢复目标”。
 - 归档不会删除数据库记录、任务事件、worktree、分支或合并提交。
 - 有未结束的集群目标、Running 任务或活动 Agent 进程时禁止归档。
+- 项目归档后的下一 `teamd` tick 会同步归档其持久 Agent；恢复项目时同步恢复
+  Agent 记录，避免归档项目继续出现在 AgentPool 选择范围中。
 - 已归档任务不能 claim；已归档项目不能创建任务、cluster goal 或 worktree，
   恢复后解除限制。
 - 只有 `completed`/`failed` 集群目标可以在没有活动 job 时归档；归档目标不能
@@ -528,6 +530,9 @@ MCP 的 `team_cluster_control.action` 除 `pause`、`resume`、`cancel` 外，�
 - `team_cluster_ensure`
 - `team_cluster_status`
 - `team_cluster_control`
+- `team_goal_set_workstream`
+- `team_agent_list`
+- `team_agent_reset`
 
 ## 状态规则
 
@@ -553,7 +558,9 @@ ready/review/blocked ──取消──→ canceled
 - 子 Agent 的第一个团队动作必须是 claim；结束时必须 submit 或 block。
 - Lead 在子 Agent 返回后检查 `team_get_task_events`；没有 claim 和
   submit/block 事件的回答不能视为完成。
-- 已完成 Agent 不复用为下一任务；新材料和新审查创建新 thread。
+- 已完成 Agent 不会被隐式调用为 follow-up；是否复用持久 thread 由任务
+  `continuity_mode`、角色和 workstream 规则决定。`team_worker` 的 write 任务在
+  `auto` 模式下始终新建 thread，只有显式 `reuse` 才会跨任务复用。
 - 任务 ready 后 60 秒未 claim 显示黄色提醒，5 分钟显示红色异常。
 - 跨模块共享字段必须声明名称、单位、合法区间、枚举、更新者和消费方，并验证
   真实生产者到真实消费者的一体化路径。
@@ -585,6 +592,102 @@ ready/review/blocked ──取消──→ canceled
 
 `cluster start` 只用于显式新建目标；同一项目已有 `planning`/`active` 目标时会
 返回 `project already has active goal`。
+
+### Agent runtime、workstream 与缓存复用
+
+调度器默认使用 `exec`，不会因为已安装 App Server Runtime 就改变现有行为。
+需要持久 Agent thread 时，在启动 `teamd` 的环境中显式启用：
+
+```powershell
+$env:CODEX_TEAM_AGENT_RUNTIME = "app_server"
+$env:CODEX_TEAM_MODEL = ""            # 可选；空值使用 Codex 默认模型
+$env:CODEX_TEAM_MODEL_PROVIDER = ""   # 可选
+```
+
+`app_server` 模式由 `ClusterManager` 持有私有 App Server 进程。新 thread 使用
+`thread/start`，已存储且满足复用规则的 thread 使用 `thread/resume`，每次派发
+通过 `turn/start` 提交当前 goal/task。稳定 `developerInstructions` 只包含角色
+约束，不包含 goal ID、task ID、worktree 路径或时间戳；动态 board 和任务内容
+放在每个后续 turn 中。`turn/start` 的 `cwd` 始终是当前执行 worktree，因此同一
+thread 可以从一个 write worktree 安全切换到另一个 worktree，sandbox policy
+按当前任务重算。
+
+`workstream_key` 是项目内连续性作用域；省略时默认使用当前 `goal_id`。AgentPool
+只会在同一项目、同一角色和同一 workstream 内复用，不会跨项目误用 thread。
+`continuity_reason` 说明相关 goal 为什么可以延续同一 Lead 上下文。创建或恢复
+目标时可以直接提供：
+
+```powershell
+.\scripts\team.ps1 cluster ensure `
+  --repo "D:\path\to\repo" `
+  --objective "继续实现同一功能并验证缓存收益" `
+  --workstream-key "feature-cache" `
+  --continuity-reason "同一功能的多阶段实现" `
+  --no-daemon
+
+.\scripts\team.ps1 cluster set-workstream <goal-id> `
+  --workstream-key "feature-cache" `
+  --continuity-reason "同一功能的多阶段实现"
+```
+
+任务默认 `continuity_mode=auto`。`team_worker` 的 write 任务在 `auto` 下 fresh；
+read/review 和满足 Lead 连续性条件的任务可复用；`fresh` 强制新 thread，`reuse`
+显式允许复用。创建任务时可覆盖：
+
+```powershell
+.\scripts\team.ps1 task create `
+  --repo "D:\path\to\repo" `
+  --title "后续实现" `
+  --description "复用同一功能的上下文" `
+  --acceptance "测试通过" `
+  --kind write `
+  --owner-role team_worker `
+  --continuity-mode reuse
+```
+
+查看和重置持久 Agent：
+
+```powershell
+.\scripts\team.ps1 agent list --project-id <project-id>
+.\scripts\team.ps1 agent reset <agent-id> --reason "手动重置上下文"
+```
+
+`teamd` 每次 tick 会应用 reset 请求，对 App Server thread 调用
+`thread/unsubscribe`，再把旧 Agent 标记为 `superseded`。MCP 对应工具为
+`team_agent_list`、`team_agent_reset` 和 `team_goal_set_workstream`。
+
+App Server 初始化失败时会自动重启一次；第二次仍失败则记录
+`agent_runtime_fallback` 并让该 job 使用 exec。超时或取消会优先对活动 turn
+调用 `turn/interrupt`。daemon 重启后，数据库中的 stored Agent 仍可恢复；无法
+归属到仍存活 App Server 的活动 turn 会标记为 `lost`，其任务按既有重试策略
+恢复。`contextWindowExceeded` 会把旧 Agent 标记为 `needs_reset`，清理 thread
+并自动用新 thread 重试一次；连续第二次仍溢出时任务进入 blocked。
+
+### A/B 缓存基准
+
+A/B 默认 exec 作为基线，`app_server` 为需要显式开启的实验变体。
+`scripts/agent-cache-benchmark.py` 接受 fresh/reuse 的 JSON 或 JSONL 观测，
+汇总每轮的 last/total input、cached、uncached、output、context，首轮延迟和
+task success，并输出 JSON 与 Markdown：
+
+```powershell
+python .\scripts\agent-cache-benchmark.py `
+  --fresh .\bench\fresh.jsonl `
+  --reuse .\bench\reuse.jsonl `
+  --json .\bench\agent-cache-report.json `
+  --markdown .\bench\agent-cache-report.md
+```
+
+每条记录可使用扁平字段，也可使用 App Server 的嵌套 `usage.total` /
+`usage.last`。至少应提供首轮延迟（毫秒或秒）和 `task_success`。App Server 的
+累计 `total.inputTokens` 会跨复用 turn 增长；比较单轮成本时，应将本轮值减去
+同一 Agent 上一轮累计值后再写入 `total_input_tokens` 和相应 cached/uncached
+字段，避免把历史会话成本重复计入本轮。
+
+复用变体通过的门槛是：任务成功率不得下降，并且满足以下任一条件：
+
+- uncached input 相对 fresh 降低至少 10%；
+- 首轮延迟相对 fresh 降低至少 20%。
 
 ### 多集群容量与公平调度
 
@@ -623,7 +726,15 @@ ready/review/blocked ──取消──→ canceled
 
 ### 调度配置
 
-以下环境变量由 `teamd` 和相关管理命令读取。四个调度/超时变量控制实际行为，
+Agent runtime 与模型配置：
+
+| 环境变量 | 默认值 | 合法值/作用 |
+| --- | --- | --- |
+| `CODEX_TEAM_AGENT_RUNTIME` | `exec` | `exec` 或 `app_server`；只有 `app_server` 启用持久 thread |
+| `CODEX_TEAM_MODEL` | 空 | 可选模型覆盖；空值使用 Codex 默认模型 |
+| `CODEX_TEAM_MODEL_PROVIDER` | 空 | 可选 provider 覆盖；必须与 AgentPool 身份匹配 |
+
+以下调度变量由 `teamd` 和相关管理命令读取。四个调度/超时变量控制实际行为，
 两个 heartbeat 变量是可选诊断阈值：
 
 | 环境变量 | 默认值 | 输入范围 | 实际调度值/作用 |
@@ -648,6 +759,7 @@ $env:CODEX_TEAM_WORKER_TIMEOUT_SECONDS = "7200"
 $env:CODEX_TEAM_LEAD_TIMEOUT_SECONDS = "2700"
 $env:CODEX_TEAM_HEARTBEAT_WARNING_SECONDS = "300"
 $env:CODEX_TEAM_HEARTBEAT_CRITICAL_SECONDS = "900"
+$env:CODEX_TEAM_AGENT_RUNTIME = "app_server"
 
 powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -File .\scripts\ensure-cluster-daemon.ps1

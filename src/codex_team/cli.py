@@ -53,6 +53,11 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--actor", default="lead")
     create.add_argument("--priority", type=int, default=2, choices=range(0, 4))
     create.add_argument("--depends-on", action="append", default=[])
+    create.add_argument(
+        "--continuity-mode",
+        choices=["auto", "reuse", "fresh"],
+        default="auto",
+    )
 
     listing = task_sub.add_parser("list")
     listing.add_argument("--repo", default=".")
@@ -162,6 +167,8 @@ def build_parser() -> argparse.ArgumentParser:
     cluster_start.add_argument("--autonomy", choices=["auto", "supervised"], default="auto")
     cluster_start.add_argument("--max-worker-attempts", type=int, default=3)
     cluster_start.add_argument("--max-lead-attempts", type=int, default=5)
+    cluster_start.add_argument("--workstream-key")
+    cluster_start.add_argument("--continuity-reason", default="")
     cluster_start.add_argument("--no-daemon", action="store_true")
     cluster_ensure = cluster_sub.add_parser("ensure")
     cluster_ensure.add_argument("--repo", default=".")
@@ -169,6 +176,8 @@ def build_parser() -> argparse.ArgumentParser:
     cluster_ensure.add_argument("--autonomy", choices=["auto", "supervised"], default="auto")
     cluster_ensure.add_argument("--max-worker-attempts", type=int, default=3)
     cluster_ensure.add_argument("--max-lead-attempts", type=int, default=5)
+    cluster_ensure.add_argument("--workstream-key")
+    cluster_ensure.add_argument("--continuity-reason", default="")
     cluster_ensure.add_argument("--no-daemon", action="store_true")
     cluster_sub.add_parser("list")
     cluster_status = cluster_sub.add_parser("status")
@@ -183,6 +192,10 @@ def build_parser() -> argparse.ArgumentParser:
     cluster_archive.add_argument("goal_id")
     cluster_restore = cluster_sub.add_parser("restore")
     cluster_restore.add_argument("goal_id")
+    cluster_workstream = cluster_sub.add_parser("set-workstream")
+    cluster_workstream.add_argument("goal_id")
+    cluster_workstream.add_argument("--workstream-key")
+    cluster_workstream.add_argument("--continuity-reason")
     cluster_sub.add_parser("daemon-status")
     cluster_sub.add_parser("stop-daemon")
     daemon = cluster_sub.add_parser("daemon")
@@ -193,6 +206,16 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument("--host", default="127.0.0.1")
     dashboard.add_argument("--port", type=int, default=8765)
     dashboard.add_argument("--no-browser", action="store_true")
+
+    agent = sub.add_parser("agent", help="Inspect or reset persistent Agent threads")
+    agent_sub = agent.add_subparsers(dest="agent_command", required=True)
+    agent_list = agent_sub.add_parser("list")
+    agent_list.add_argument("--project-id")
+    agent_list.add_argument("--include-archived", action="store_true")
+    agent_reset = agent_sub.add_parser("reset")
+    agent_reset.add_argument("agent_id")
+    agent_reset.add_argument("--actor", default="human")
+    agent_reset.add_argument("--reason", default="manual reset requested through CLI")
 
     sub.add_parser("serve", help="Run the Codex MCP stdio server")
     return parser
@@ -230,6 +253,7 @@ def main(argv: list[str] | None = None) -> int:
                         priority=args.priority,
                         depends_on=args.depends_on,
                         goal_id=args.goal_id,
+                        continuity_mode=args.continuity_mode,
                     )
                 )
             elif args.task_command == "list":
@@ -373,6 +397,8 @@ def main(argv: list[str] | None = None) -> int:
                     autonomy=args.autonomy,
                     max_worker_attempts=args.max_worker_attempts,
                     max_lead_attempts=args.max_lead_attempts,
+                    workstream_key=args.workstream_key,
+                    continuity_reason=args.continuity_reason,
                 )
                 daemon = None if args.no_daemon else ensure_daemon(settings)
                 _print({"goal": goal, "daemon": daemon})
@@ -383,6 +409,8 @@ def main(argv: list[str] | None = None) -> int:
                     autonomy=args.autonomy,
                     max_worker_attempts=args.max_worker_attempts,
                     max_lead_attempts=args.max_lead_attempts,
+                    workstream_key=args.workstream_key,
+                    continuity_reason=args.continuity_reason,
                 )
                 daemon = None if args.no_daemon else ensure_daemon(settings)
                 _print({**result, "daemon": daemon})
@@ -416,6 +444,15 @@ def main(argv: list[str] | None = None) -> int:
                         actor="human",
                     )
                 )
+            elif args.cluster_command == "set-workstream":
+                _print(
+                    cluster.set_goal_workstream(
+                        args.goal_id,
+                        workstream_key=args.workstream_key,
+                        continuity_reason=args.continuity_reason,
+                        actor="human",
+                    )
+                )
             elif args.cluster_command == "daemon-status":
                 _print(daemon_status(settings))
             elif args.cluster_command == "stop-daemon":
@@ -424,6 +461,25 @@ def main(argv: list[str] | None = None) -> int:
                 from .clusterd import run as cluster_daemon_run
 
                 return cluster_daemon_run(interval=args.interval, once=args.once)
+        elif args.command == "agent":
+            cluster = ClusterManager(settings, team=team, worktrees=worktrees)
+            if args.agent_command == "list":
+                _print(
+                    {
+                        "agents": cluster.list_agents(
+                            args.project_id,
+                            include_archived=args.include_archived,
+                        )
+                    }
+                )
+            elif args.agent_command == "reset":
+                _print(
+                    cluster.reset_agent(
+                        args.agent_id,
+                        actor=args.actor,
+                        reason=args.reason,
+                    )
+                )
         elif args.command == "dashboard":
             serve_dashboard(
                 settings,
