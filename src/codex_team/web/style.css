@@ -17,7 +17,6 @@
 * { box-sizing: border-box; }
 body {
   margin: 0;
-  min-width: 1120px;
   background:
     radial-gradient(circle at 15% 0%, rgba(40, 117, 160, 0.18), transparent 30%),
     radial-gradient(circle at 90% 10%, rgba(125, 77, 199, 0.12), transparent 28%),
