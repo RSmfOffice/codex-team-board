@@ -2248,22 +2248,36 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
         first = values(state.get("first_usage")) or total
         baseline_input = 0
         baseline_cached = 0
+        baseline_output = 0
         agent_id = str(job.get("agent_id") or "")
         if agent_id:
             with self.team.connection(write=False) as connection:
                 agent = connection.execute(
                     """
-                    SELECT total_input_tokens, total_cached_input_tokens
-                    FROM cluster_agents
-                    WHERE agent_id = ?
+                    SELECT
+                        a.total_input_tokens,
+                        a.total_cached_input_tokens,
+                        COALESCE((
+                            SELECT SUM(j.output_tokens)
+                            FROM cluster_jobs j
+                            WHERE j.agent_id = a.agent_id
+                              AND j.job_id <> ?
+                              AND j.status = 'completed'
+                        ), 0) AS prior_output_tokens
+                    FROM cluster_agents a
+                    WHERE a.agent_id = ?
                     """,
-                    (agent_id,),
+                    (str(job.get("job_id") or ""), agent_id),
                 ).fetchone()
             if agent is not None:
                 baseline_input = max(0, int(agent["total_input_tokens"] or 0))
                 baseline_cached = max(
                     0,
                     int(agent["total_cached_input_tokens"] or 0),
+                )
+                baseline_output = max(
+                    0,
+                    int(agent["prior_output_tokens"] or 0),
                 )
 
         def number(mapping: Mapping[str, Any], name: str) -> int:
@@ -2295,7 +2309,10 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
             "input_tokens": input_tokens,
             "cached_input_tokens": cached_tokens,
             "uncached_input_tokens": input_tokens - cached_tokens,
-            "output_tokens": number(total, "output"),
+            "output_tokens": max(
+                0,
+                number(total, "output") - baseline_output,
+            ),
             "first_input_tokens": first_input,
             "first_cached_input_tokens": first_cached,
             "first_uncached_input_tokens": first_input - first_cached,

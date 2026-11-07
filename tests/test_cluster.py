@@ -1124,6 +1124,141 @@ class ClusterSchedulerTests(unittest.TestCase):
             self.assertEqual(agent["last_input_tokens"], 120)
             self.assertEqual(agent["last_uncached_input_tokens"], 100)
 
+    def test_app_server_reused_job_output_usage_is_cumulative_delta(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            repo = _repo(base, "app-server-output-usage")
+            project = team.init_project(repo)
+            runtime = StubAppServerRuntime()
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime=runtime,
+                runtime_mode="app_server",
+            )
+            goal = manager.create_goal(
+                repo,
+                objective="Measure cumulative App Server usage",
+                workstream_key="usage-reuse",
+                continuity_reason="two related read turns",
+            )
+            tasks = [
+                team.create_task(
+                    repo,
+                    title=f"Usage turn {index}",
+                    description="Exercise cumulative thread token usage.",
+                    acceptance="Only the current turn's tokens are recorded.",
+                    kind="read",
+                    owner_role="team_explorer",
+                    goal_id=goal["goal_id"],
+                    continuity_mode="reuse",
+                )
+                for index in (1, 2)
+            ]
+
+            first = manager._dispatch_worker(
+                manager.get_goal(goal["goal_id"]),
+                team.get_task(tasks[0]["task_id"]),
+            )
+            manager.app_turns[first["job_id"]].update(
+                {
+                    "status": "completed",
+                    "usage": {
+                        "input": 100,
+                        "cached": 50,
+                        "output": 60,
+                        "context": 70,
+                        "modelContextWindow": 200,
+                    },
+                    "first_usage": {
+                        "input": 100,
+                        "cached": 50,
+                        "output": 60,
+                        "context": 70,
+                        "modelContextWindow": 200,
+                    },
+                }
+            )
+            with team.connection() as connection:
+                connection.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'review', updated_at = ?, version = version + 1
+                    WHERE task_id = ?
+                    """,
+                    (utc_now(), tasks[0]["task_id"]),
+                )
+            manager._reconcile_jobs()
+            first_job = next(
+                item
+                for item in manager.get_goal(goal["goal_id"])["jobs"]
+                if item["job_id"] == first["job_id"]
+            )
+            self.assertEqual(first_job["output_tokens"], 60)
+
+            second = manager._dispatch_worker(
+                manager.get_goal(goal["goal_id"]),
+                team.get_task(tasks[1]["task_id"]),
+            )
+            self.assertEqual(runtime.resume_threads, [first["thread_id"]])
+            manager.app_turns[second["job_id"]].update(
+                {
+                    "status": "completed",
+                    "usage": {
+                        "input": 180,
+                        "cached": 80,
+                        "output": 90,
+                        "context": 70,
+                        "modelContextWindow": 200,
+                    },
+                    "first_usage": {
+                        "input": 150,
+                        "cached": 65,
+                        "output": 75,
+                        "context": 70,
+                        "modelContextWindow": 200,
+                    },
+                }
+            )
+            with team.connection() as connection:
+                connection.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'review', updated_at = ?, version = version + 1
+                    WHERE task_id = ?
+                    """,
+                    (utc_now(), tasks[1]["task_id"]),
+                )
+            manager._reconcile_jobs()
+            second_job = next(
+                item
+                for item in manager.get_goal(goal["goal_id"])["jobs"]
+                if item["job_id"] == second["job_id"]
+            )
+            self.assertEqual(second_job["input_tokens"], 80)
+            self.assertEqual(second_job["cached_input_tokens"], 30)
+            self.assertEqual(second_job["uncached_input_tokens"], 50)
+            self.assertEqual(second_job["output_tokens"], 30)
+            self.assertEqual(second_job["first_input_tokens"], 50)
+            self.assertEqual(second_job["first_cached_input_tokens"], 15)
+            self.assertEqual(second_job["first_uncached_input_tokens"], 35)
+            agent = manager.list_agents(project["project_id"])[0]
+            self.assertEqual(agent["total_input_tokens"], 180)
+            self.assertEqual(agent["total_cached_input_tokens"], 80)
+            clamped = manager._app_job_usage(
+                dict(second_job),
+                {
+                    "usage": {
+                        "input": 180,
+                        "cached": 80,
+                        "output": 40,
+                    }
+                },
+            )
+            self.assertEqual(clamped["output_tokens"], 0)
+
     @unittest.skipUnless(
         os.environ.get("CODEX_TEAM_REAL_APP_SERVER_TEST") == "1",
         "set CODEX_TEAM_REAL_APP_SERVER_TEST=1 to run the installed App Server",
