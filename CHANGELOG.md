@@ -11,19 +11,27 @@
   `fairness_deferred`，并对同一 goal 的重复事件做 60 秒去重。
 - 新增 `CODEX_TEAM_CLUSTER_MAX_JOBS`、`CODEX_TEAM_CLUSTER_MAX_WORKERS`、
   `CODEX_TEAM_WORKER_TIMEOUT_SECONDS` 和
-  `CODEX_TEAM_LEAD_TIMEOUT_SECONDS` 配置。
+  `CODEX_TEAM_LEAD_TIMEOUT_SECONDS` 调度/超时配置，以及可选的
+  `CODEX_TEAM_HEARTBEAT_WARNING_SECONDS`、
+  `CODEX_TEAM_HEARTBEAT_CRITICAL_SECONDS` 心跳阈值配置。
+- 容量输入接受 `1..86400`，但调度器将有效全局 Jobs 硬限制为最多 16、每 goal
+  Worker 硬限制为最多 8。
 - 长任务默认使用 2 小时 Worker 超时和 45 分钟 Lead 超时，超时后回收 job
   并按既有重试策略继续或 blocked。
 - 新增 Worker 心跳 5 分钟 warning、15 分钟 critical 审计事件；心跳告警不直接
-  终止进程。
+  终止进程。critical 的有效值不会低于 warning。
 - WebUI 新增全局 job/容量、排队 goal、公平等待、heartbeat overdue、最老心跳、
-  每 goal 活动 job、队列原因和预计等待指标。
+  每 goal 活动 job、队列原因和当前等待指标。
 
 ### Changed
 
 - 全局 Jobs 容量同时约束 Lead 和 Worker；每 goal Worker 容量只约束 Worker。
 - 同一项目仍只允许一个 `planning`/`active` goal；多集群并行需要为不同项目创建
   目标。
+- 新增 `dependency_wait` 队列原因和 WebUI“等待依赖完成”标签，避免把仍受依赖
+  限制的 ready 任务误报为可调度。
+- `read` 任务 Worker 与 Review Worker 改用 `read-only` 沙箱；`write` Worker
+  和 `auto` 模式 Lead 保留 `danger-full-access`。
 - 项目文档、健康接口版本和发布包版本统一升级到 `0.4.0`。
 
 ## [0.3.1] - 2026-11-07

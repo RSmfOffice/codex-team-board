@@ -349,7 +349,24 @@ oldest_claim_wait_seconds
 `heartbeat_state`、`queue_reason` 和 `estimated_wait_seconds`。WebUI 顶部显示
 `JOBS`（活动全局 job/容量）、`QUEUED`（排队目标及公平等待数）和
 `HB OVERDUE`（超过 warning 阈值的 job 数及最老心跳年龄）；集群卡显示每个
-目标的队列原因、预计已等待时长、活动 Lead/Worker 和心跳状态。
+目标的队列原因、`当前等待`时长、活动 Lead/Worker 和心跳状态。
+
+`queue_reason` 是供 UI 和自动化消费的稳定枚举：
+
+| 值 | WebUI 标签/含义 |
+| --- | --- |
+| `global_capacity` | 全局容量已满 |
+| `goal_capacity` | 目标容量已满 |
+| `review_pending` | 等待 Review |
+| `blocked` | 等待处理阻塞 |
+| `ready` | 等待调度 |
+| `dependency_wait` | 等待依赖完成；存在 ready 任务，但它们仍有未完成依赖 |
+| `running` | 活动 job 或任务正在运行 |
+| `waiting_for_lead` | 等待 Lead 规划 |
+| `none` | 无排队 |
+
+`estimated_wait_seconds` 是当前队列关注任务已等待的时长，不代表调度器承诺的
+剩余等待时间。因此 WebUI 使用“当前等待”，而不是“预计等待”。
 
 `health` 按以下优先级计算：
 
@@ -557,14 +574,17 @@ ready/review/blocked ──取消──→ canceled
 
 ### 调度配置
 
-以下环境变量由 `teamd` 和相关管理命令读取：
+以下环境变量由 `teamd` 和相关管理命令读取。四个调度/超时变量控制实际行为，
+两个 heartbeat 变量是可选诊断阈值：
 
-| 环境变量 | 默认值 | 合法范围 | 作用 |
+| 环境变量 | 默认值 | 输入范围 | 实际调度值/作用 |
 | --- | ---: | ---: | --- |
-| `CODEX_TEAM_CLUSTER_MAX_JOBS` | `4` | `1..86400` | 所有项目 Lead+Worker 的活动 job 总数上限 |
-| `CODEX_TEAM_CLUSTER_MAX_WORKERS` | `3` | `1..86400` | 每个 goal 的活动 Worker 数上限 |
+| `CODEX_TEAM_CLUSTER_MAX_JOBS` | `4` | `1..86400` | 调度器再硬限制为最多 `16`；统计所有项目 Lead+Worker 的活动 job |
+| `CODEX_TEAM_CLUSTER_MAX_WORKERS` | `3` | `1..86400` | 调度器再硬限制为最多 `8`；限制每个 goal 的活动 Worker |
 | `CODEX_TEAM_WORKER_TIMEOUT_SECONDS` | `7200`（2 小时） | `1..86400` | Worker job 从启动到强制超时的时间 |
 | `CODEX_TEAM_LEAD_TIMEOUT_SECONDS` | `2700`（45 分钟） | `1..86400` | Lead job 从启动到强制超时的时间 |
+| `CODEX_TEAM_HEARTBEAT_WARNING_SECONDS` | `300`（5 分钟） | `1..86400` | Worker 心跳超过该时长后进入 warning |
+| `CODEX_TEAM_HEARTBEAT_CRITICAL_SECONDS` | `900`（15 分钟） | `1..86400` | Worker 心跳超过该时长后进入 critical；有效值不会低于 warning |
 
 空值或非整数使用默认值，超出范围的值会被限制到合法边界。配置在 `teamd`、
 管理命令和看板进程启动时读取；修改后先停止旧 daemon，再在同一个 PowerShell
@@ -577,11 +597,21 @@ $env:CODEX_TEAM_CLUSTER_MAX_JOBS = "6"
 $env:CODEX_TEAM_CLUSTER_MAX_WORKERS = "2"
 $env:CODEX_TEAM_WORKER_TIMEOUT_SECONDS = "7200"
 $env:CODEX_TEAM_LEAD_TIMEOUT_SECONDS = "2700"
+$env:CODEX_TEAM_HEARTBEAT_WARNING_SECONDS = "300"
+$env:CODEX_TEAM_HEARTBEAT_CRITICAL_SECONDS = "900"
 
 powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -File .\scripts\ensure-cluster-daemon.ps1
 .\scripts\team.ps1 cluster daemon-status
 ```
+
+容量变量虽然接受 `1..86400` 的整数输入，但有效调度上限固定为全局 Jobs `16`、
+每 goal Workers `8`。例如输入 `999` 时，`teamd` 实际分别按 `16` 和 `8`
+调度。看板进程直接读取该进程环境中的整数配置；为避免显示值与实际调度不一致，
+应把变量设置在有效上限以内，并让 `teamd` 与看板使用相同环境。
+
+若 critical 阈值小于或等于 warning，调度器和看板都会把有效 critical 提升到
+warning，因此 critical 始终不早于 warning。两项心跳变量均可省略。
 
 WebUI 的 `global_capacity` 来自看板进程自身的环境。修改容量后还应停止并重新
 启动旧看板，使显示值、队列判断与 `teamd` 的实际调度保持一致。
@@ -616,7 +646,9 @@ Codex 的 `workspace-write` 沙箱会把 `.git/` 递归设为只读，即使工�
 
 - `write` Worker 和 `auto` 模式 Lead 使用 `danger-full-access`，以便执行
   `git commit`、合并和验收。
-- 只读调研与普通 Review Worker 继续使用 `workspace-write`。
+- `read` 任务 Worker 与 Review Worker 使用 `read-only`。
+- `supervised` 模式 Lead 使用 `workspace-write`，不会获得自动合并和终审所需
+  的完整写权限。
 - 这只应运行在可信的本地项目和由 `teamd` 分配的隔离 worktree 中。
 - 项目初始化是幂等的；未显式传入 `--max-threads` 时保留已有配置，不会因为
   Lead 再次确认项目而把干净 checkout 改脏。
