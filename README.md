@@ -735,7 +735,14 @@ watchdog 每分钟调用 `ensure-cluster-daemon.ps1`，并通过命名互斥量�
 ```powershell
 $env:PYTHONPATH = ".\src"
 python -m unittest discover -s tests -v
+node scripts/dashboard-ui-smoke.mjs
+node scripts/dashboard-edge-smoke.mjs
 ```
+
+`dashboard-edge-smoke.mjs` 假定看板已在默认 `http://127.0.0.1:8765` 运行。
+它使用唯一 CDP 端口和临时 Edge profile，验证 1120px 无横向溢出、Worker/Lead
+指标、项目联动、归档入口、网络状态和浏览器运行时错误，并在结束时清理子进程树
+与临时目录。
 
 ## 发布包
 
