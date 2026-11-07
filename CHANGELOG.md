@@ -37,6 +37,8 @@
 - 新增 App Server context overflow 自动换 thread 重试、超时/取消
   `turn/interrupt`、daemon 重启 lost turn 恢复、reset unsubscribe 和项目/Agent
   归档同步。
+- App Server job 持久化 `runtime_generation`；generation 漂移会在下一次
+  reconcile 立即标记旧 turn 为 lost，并复用既有 Worker/Lead recovery。
 - 新增 `scripts/agent-cache-benchmark.py`，汇总 fresh/reuse 的 token、首轮延迟
   和成功率并输出 JSON/Markdown；成功任务使用中位数，主指标为
   `last_uncached_input_tokens`，total 仅作诊断，并输出 sample count/median。
@@ -56,6 +58,8 @@
 - 项目文档、健康接口版本和发布包版本统一升级到 `0.4.0`。
 - `exec` 继续作为默认与 fallback；App Server 初始化自动重试一次，连续失败记录
   `agent_runtime_fallback` 后回退 exec。
+- 健康共享 App Server 上的单个 RPC 失败只影响当前 job，不再重启进程或中断
+  其它活动 turn；restart 前和完成后都会显式隔离其它旧 generation job。
 
 ### Fixed
 
@@ -73,6 +77,9 @@
 - 缓存 benchmark 要求显式 `task_success`；成功样本缺少有效 last 用量时固定 FAIL，
   cache-hit rate 改为按 last 单轮 cached/input 计算。
 - fake App Server fixture 强制 UTF-8 Python 环境，跨平台测试不再受控制台代码页影响。
+- App Server stderr 日志、fallback/restart/job 错误统一附带脱敏后的最近
+  stderr；Edge smoke 的 spawn error 和 early-exit 会给出明确错误并始终清理本次
+  profile。
 
 ## [0.3.1] - 2026-11-07
 

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence, TypedDict
 
 from . import __version__
+from .redaction import redact_sensitive_text
 
 
 __all__ = [
@@ -1066,7 +1067,7 @@ class AppServerRuntime:
                 with self._state_lock:
                     self._stderr_lines.append(text)
                 if log_stream is not None:
-                    log_stream.write(text + "\n")
+                    log_stream.write(redact_sensitive_text(text) + "\n")
                     log_stream.flush()
         except OSError as exc:
             with self._state_lock:

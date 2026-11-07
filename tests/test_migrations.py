@@ -38,7 +38,7 @@ class MigrationTests(unittest.TestCase):
             try:
                 self.assertEqual(
                     upgraded.execute("PRAGMA user_version").fetchone()[0],
-                    9,
+                    10,
                 )
                 columns = {
                     row["name"]
@@ -88,6 +88,7 @@ class MigrationTests(unittest.TestCase):
                     {
                         "agent_id",
                         "turn_id",
+                        "runtime_generation",
                         "cached_input_tokens",
                         "uncached_input_tokens",
                         "model_context_window",

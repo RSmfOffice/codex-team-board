@@ -10,7 +10,8 @@ const edgeCandidates = [
   "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
   "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
 ];
-const edgePath = edgeCandidates.find(existsSync);
+const configuredEdgePath = process.env.CODEX_TEAM_EDGE_PATH?.trim();
+const edgePath = configuredEdgePath || edgeCandidates.find(existsSync);
 if (!edgePath) throw new Error("Microsoft Edge not found");
 
 const screenshotPath = join(process.cwd(), "artifacts", "dashboard-edge-smoke.png");
@@ -119,6 +120,7 @@ async function waitFor(fn, timeoutMs = 15000, intervalMs = 120) {
       const value = await fn();
       if (value) return value;
     } catch (error) {
+      if (error instanceof EdgeProcessError) throw error;
       lastError = error.message;
     }
     await delay(intervalMs);
@@ -126,32 +128,64 @@ async function waitFor(fn, timeoutMs = 15000, intervalMs = 120) {
   throw new Error(`Timed out after ${timeoutMs}ms${lastError ? `: ${lastError}` : ""}`);
 }
 
-const edge = spawn(edgePath, [
-  "--headless=new",
-  "--disable-gpu",
-  "--disable-breakpad",
-  "--disable-crash-reporter",
-  "--disable-background-networking",
-  "--disable-component-update",
-  "--disable-extensions",
-  "--disable-sync",
-  "--metrics-recording-only",
-  "--noerrdialogs",
-  "--no-first-run",
-  "--no-default-browser-check",
-  "--remote-debugging-port=0",
-  `--user-data-dir=${profile}`,
-  "--window-size=1165,1000",
-  "about:blank",
-], {
-  stdio: "ignore",
-  windowsHide: true,
-});
+class EdgeProcessError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "EdgeProcessError";
+  }
+}
 
+let spawnError = null;
+let earlyExit = null;
 let client;
+let edge = null;
+
 try {
+  try {
+    edge = spawn(edgePath, [
+      "--headless=new",
+      "--disable-gpu",
+      "--disable-breakpad",
+      "--disable-crash-reporter",
+      "--disable-background-networking",
+      "--disable-component-update",
+      "--disable-extensions",
+      "--disable-sync",
+      "--metrics-recording-only",
+      "--noerrdialogs",
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--remote-debugging-port=0",
+      `--user-data-dir=${profile}`,
+      "--window-size=1165,1000",
+      "about:blank",
+    ], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+  } catch (error) {
+    throw new EdgeProcessError(`Edge spawn failed: ${error.message}`);
+  }
+
+  edge.once("error", (error) => {
+    spawnError = error;
+  });
+  edge.once("exit", (code, signal) => {
+    earlyExit = { code, signal };
+  });
+
   const portFile = join(profile, "DevToolsActivePort");
   const port = await waitFor(async () => {
+    if (spawnError) {
+      throw new EdgeProcessError(
+        `Edge spawn failed: ${spawnError.message}`,
+      );
+    }
+    if (earlyExit) {
+      throw new EdgeProcessError(
+        `Edge exited before CDP was ready (code=${earlyExit.code}, signal=${earlyExit.signal})`,
+      );
+    }
     if (!existsSync(portFile)) return 0;
     const [value] = (await readFile(portFile, "utf8")).trim().split(/\r?\n/);
     return Number(value) || 0;
@@ -324,6 +358,14 @@ try {
   check(badResponses.length === 0, "no 4xx/5xx responses", badResponses);
   check(pageErrors.length === 0, "no page errors", pageErrors);
   check(consoleErrors.length === 0, "no console errors", consoleErrors);
+  if (spawnError) {
+    throw new EdgeProcessError(`Edge spawn failed: ${spawnError.message}`);
+  }
+  if (earlyExit) {
+    throw new EdgeProcessError(
+      `Edge exited during smoke run (code=${earlyExit.code}, signal=${earlyExit.signal})`,
+    );
+  }
 
   console.log(JSON.stringify({
     ok: failures.length === 0,
@@ -337,7 +379,7 @@ try {
   if (failures.length) process.exitCode = 1;
 } finally {
   client?.close();
-  if (edge.pid) {
+  if (edge?.pid) {
     spawnSync("taskkill", ["/PID", String(edge.pid), "/T", "/F"], {
       windowsHide: true,
       stdio: "ignore",
