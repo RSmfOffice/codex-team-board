@@ -12,6 +12,8 @@
 ## 工作方式
 
 - 第一个团队动作必须是 `team_claim_task`；claim 失败时立即停止，不得先做完整分析。
+- 保存 `claim_token` 且不要泄露；预计超过 4 分钟或已经运行超过 4 分钟时，
+  至少每 3 分钟调用一次 `team_heartbeat`。
 - 完成前必须调用 `team_submit_task`，保存并提交 `claim_token`。聊天里的结论不算任务完成，
   只有任务状态进入 `review` 或 `blocked` 才算闭环。
 - 追踪真实执行路径，而不是只看命名。

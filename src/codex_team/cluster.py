@@ -890,8 +890,9 @@ class ClusterManager:
 
 Use the `codexTeamBoard` MCP tools. Do not spawn subagents or another team.
 First call `team_claim_task` for this task with actor `{actor}`.
-Work only on this task. Keep the claim token private. If your context approaches
-its limit, commit safe progress, call `team_block_task` with the reason
+Work only on this task. Keep the claim token private. For jobs that may exceed
+four minutes, call `team_heartbeat` at least every three minutes. If your context
+approaches its limit, commit safe progress, call `team_block_task` with the reason
 `worker-context-near-limit`, and stop. Before exiting, either call
 `team_submit_task` with commit SHA, result, changed files, risks, tests and
 review focus, or call `team_block_task` with a precise blocker.

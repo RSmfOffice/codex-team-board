@@ -234,6 +234,10 @@ class ClusterSchedulerTests(unittest.TestCase):
             self.assertIn("danger-full-access", initial)
             self.assertIn('sandbox_mode="danger-full-access"', resumed)
             self.assertNotIn("workspace-write", initial)
+            self.assertIn(
+                "team_heartbeat",
+                manager.team.role_prompt("team_reviewer")["prompt"],
+            )
             self.assertEqual(
                 manager._worker_sandbox_mode({"kind": "read"}),
                 "read-only",

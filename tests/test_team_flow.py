@@ -265,6 +265,14 @@ class TeamFlowTests(unittest.TestCase):
         self.assertIn("主 checkout 必须干净", after)
         self.assertNotEqual(before, "")
         self.assertIn("Review 重点", worker_prompt.read_text(encoding="utf-8"))
+        reviewer_prompt = (
+            self.repo / ".codex" / "team-roles" / "team-reviewer.md"
+        ).read_text(encoding="utf-8")
+        explorer_prompt = (
+            self.repo / ".codex" / "team-roles" / "team-explorer.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("team_heartbeat", reviewer_prompt)
+        self.assertIn("team_heartbeat", explorer_prompt)
 
     def test_worktree_creation_rejects_dirty_main_checkout(self) -> None:
         task = self.team.create_task(
