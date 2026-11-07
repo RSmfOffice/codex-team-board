@@ -233,9 +233,17 @@ try {
   const projectOptions = await evaluate(`[
     ...document.querySelectorAll("#project-select option")
   ].map((option) => ({ value: option.value, text: option.textContent.trim() }))`);
-  const project = projectOptions.find((option) => option.value);
+  const project = projectOptions.find(
+    (option) => option.value
+      && initial.goals.some(
+        (goal) => goal.project === option.text.split(" · ")[0],
+      ),
+  ) || projectOptions.find((option) => option.value);
   if (project) {
     const projectName = project.text.split(" · ")[0];
+    const expectsVisibleGoals = initial.goals.some(
+      (goal) => goal.project === projectName,
+    );
     await evaluate(`(() => {
       const select = document.getElementById("cluster-project-select");
       select.value = ${JSON.stringify(project.value)};
@@ -245,18 +253,25 @@ try {
       const value = await snapshot();
       return value.topProject === project.value
         && value.clusterProject === project.value
-        && value.goals.length > 0
-        && value.goals.every((goal) => goal.project === projectName)
+        && (
+          !expectsVisibleGoals
+          || (
+            value.goals.length > 0
+            && value.goals.every((goal) => goal.project === projectName)
+          )
+        )
         ? value
         : false;
     });
     await delay(2200);
     const selectedAfterRefresh = await snapshot();
-    check(
-      selected.goals.every((goal) => goal.project.length > 0),
-      "cluster project selector loaded project-scoped goals",
-      selectedAfterRefresh.goals,
-    );
+    if (expectsVisibleGoals) {
+      check(
+        selected.goals.every((goal) => goal.project.length > 0),
+        "cluster project selector loaded project-scoped goals",
+        selectedAfterRefresh.goals,
+      );
+    }
   }
 
   await evaluate(`(() => {
