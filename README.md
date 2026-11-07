@@ -698,7 +698,8 @@ Codex 的 `workspace-write` 沙箱会把 `.git/` 递归设为只读，即使工�
 
 - `write` Worker 和 `auto` 模式 Lead 使用 `danger-full-access`，以便执行
   `git commit`、合并和验收。
-- `read` 任务 Worker 与 Review Worker 使用 `read-only`。
+- `read`/`review` 任务由角色规则禁止修改源码，但使用 `workspace-write` 以运行
+  需要临时目录的测试。
 - `supervised` 模式 Lead 使用 `workspace-write`，不会获得自动合并和终审所需
   的完整写权限。
 - 这只应运行在可信的本地项目和由 `teamd` 分配的隔离 worktree 中。

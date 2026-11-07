@@ -240,11 +240,11 @@ class ClusterSchedulerTests(unittest.TestCase):
             )
             self.assertEqual(
                 manager._worker_sandbox_mode({"kind": "read"}),
-                "read-only",
+                "workspace-write",
             )
             self.assertEqual(
                 manager._worker_sandbox_mode({"kind": "review"}),
-                "read-only",
+                "workspace-write",
             )
             self.assertEqual(
                 manager._worker_sandbox_mode({"kind": "write"}),

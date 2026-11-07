@@ -38,8 +38,8 @@
   明确创建新目标的入口，避免重复创建集群。
 - 新增 `dependency_wait` 队列原因和 WebUI“等待依赖完成”标签，避免把仍受依赖
   限制的 ready 任务误报为可调度。
-- `read` 任务 Worker 与 Review Worker 改用 `read-only` 沙箱；`write` Worker
-  和 `auto` 模式 Lead 保留 `danger-full-access`。
+- `read`/`review` 任务仍禁止修改源码，但保留 `workspace-write` 沙箱以运行需要
+  临时目录的测试；`write` 任务继续使用独立 worktree。
 - 项目文档、健康接口版本和发布包版本统一升级到 `0.4.0`。
 
 ## [0.3.1] - 2026-11-07

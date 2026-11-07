@@ -914,7 +914,7 @@ review focus, or call `team_block_task` with a precise blocker.
         return (
             "danger-full-access"
             if task.get("kind") == "write"
-            else "read-only"
+            else "workspace-write"
         )
 
     def _dispatch_lead(
