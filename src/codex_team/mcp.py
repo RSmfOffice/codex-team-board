@@ -125,6 +125,15 @@ def _tool_definitions() -> list[dict[str, Any]]:
                         "items": {"type": "string"},
                         "default": [],
                     },
+                    "continuity_mode": {
+                        "type": "string",
+                        "enum": ["auto", "reuse", "fresh"],
+                        "default": "auto",
+                        "description": (
+                            "Write workers default fresh in auto mode; reuse only "
+                            "when explicitly requested."
+                        ),
+                    },
                 },
                 "required": [
                     "repo_root",
@@ -416,6 +425,14 @@ def _tool_definitions() -> list[dict[str, Any]]:
                         "maximum": 20,
                         "default": 5,
                     },
+                    "workstream_key": {
+                        "type": "string",
+                        "description": "Continuity scope; defaults to the goal ID.",
+                    },
+                    "continuity_reason": {
+                        "type": "string",
+                        "description": "Why related goals may reuse a Lead thread.",
+                    },
                 },
                 "required": ["repo_root", "objective"],
                 "additionalProperties": False,
@@ -449,6 +466,14 @@ def _tool_definitions() -> list[dict[str, Any]]:
                         "minimum": 1,
                         "maximum": 20,
                         "default": 5,
+                    },
+                    "workstream_key": {
+                        "type": "string",
+                        "description": "Continuity scope; defaults to the goal ID.",
+                    },
+                    "continuity_reason": {
+                        "type": "string",
+                        "description": "Why related goals may reuse a Lead thread.",
                     },
                 },
                 "required": ["repo_root", "objective"],
@@ -485,6 +510,61 @@ def _tool_definitions() -> list[dict[str, Any]]:
                     },
                 },
                 "required": ["goal_id", "action"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "team_goal_set_workstream",
+            "description": (
+                "Set a cluster goal's workstream key and continuity rationale "
+                "without starting or resuming the goal."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "goal_id": {"type": "string", "minLength": 1},
+                    "workstream_key": {"type": "string"},
+                    "continuity_reason": {"type": "string"},
+                },
+                "required": ["goal_id"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "team_agent_list",
+            "description": (
+                "List persistent Agent threads, cache usage, current assignment, "
+                "and reset state."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": {"type": "string"},
+                    "include_archived": {
+                        "type": "boolean",
+                        "default": False,
+                    },
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "team_agent_reset",
+            "description": (
+                "Request unsubscription and supersession of an idle persistent "
+                "Agent thread."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "agent_id": {"type": "string", "minLength": 1},
+                    "actor": {"type": "string", "default": "human"},
+                    "reason": {
+                        "type": "string",
+                        "default": "manual reset requested through MCP",
+                    },
+                },
+                "required": ["agent_id"],
                 "additionalProperties": False,
             },
         },
@@ -541,6 +621,7 @@ class TeamMcpServer:
                 priority=int(arguments.get("priority", 2)),
                 depends_on=list(arguments.get("depends_on", [])),
                 goal_id=arguments.get("goal_id"),
+                continuity_mode=arguments.get("continuity_mode", "auto"),
             )
         if name == "team_list_tasks":
             return {
@@ -650,6 +731,8 @@ class TeamMcpServer:
                 autonomy=arguments.get("autonomy", "auto"),
                 max_worker_attempts=int(arguments.get("max_worker_attempts", 3)),
                 max_lead_attempts=int(arguments.get("max_lead_attempts", 5)),
+                workstream_key=arguments.get("workstream_key"),
+                continuity_reason=arguments.get("continuity_reason", ""),
             )
             return {
                 "goal": self.cluster.get_goal(goal["goal_id"]),
@@ -662,6 +745,8 @@ class TeamMcpServer:
                 autonomy=arguments.get("autonomy", "auto"),
                 max_worker_attempts=int(arguments.get("max_worker_attempts", 3)),
                 max_lead_attempts=int(arguments.get("max_lead_attempts", 5)),
+                workstream_key=arguments.get("workstream_key"),
+                continuity_reason=arguments.get("continuity_reason", ""),
             )
             return {
                 **result,
@@ -706,6 +791,31 @@ class TeamMcpServer:
                     else cluster_daemon_status(self.settings)
                 ),
             }
+        if name == "team_goal_set_workstream":
+            return self.cluster.set_goal_workstream(
+                arguments["goal_id"],
+                workstream_key=arguments.get("workstream_key"),
+                continuity_reason=arguments.get("continuity_reason"),
+                actor="human",
+            )
+        if name == "team_agent_list":
+            return {
+                "agents": self.cluster.list_agents(
+                    arguments.get("project_id"),
+                    include_archived=bool(
+                        arguments.get("include_archived", False)
+                    ),
+                )
+            }
+        if name == "team_agent_reset":
+            return self.cluster.reset_agent(
+                arguments["agent_id"],
+                actor=arguments.get("actor", "human"),
+                reason=arguments.get(
+                    "reason",
+                    "manual reset requested through MCP",
+                ),
+            )
         raise TeamError(f"unknown tool: {name}")
 
 

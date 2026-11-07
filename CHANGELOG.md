@@ -27,6 +27,18 @@
   终止进程。critical 的有效值不会低于 warning。
 - WebUI 新增 Worker 槽位、Lead 数、排队 goal、公平等待、heartbeat overdue、最老心跳、
   每 goal 活动 job、队列原因和当前等待指标。
+- 新增可选 App Server Agent runtime：默认仍为 `exec`，显式设置
+  `CODEX_TEAM_AGENT_RUNTIME=app_server` 后使用持久 thread、后续 turn 和
+  `thread/resume`；稳定 developer instructions 不混入动态任务。
+- 新增项目内 `workstream_key` / `continuity_reason`、任务 `continuity_mode`、
+  Agent list/reset 与 goal workstream 控制；缺省 workstream 使用 goal ID，
+  `team_worker` 的 write 任务默认 fresh，只有显式 reuse 才复用。
+- 新增 App Server context overflow 自动换 thread 重试、超时/取消
+  `turn/interrupt`、daemon 重启 lost turn 恢复、reset unsubscribe 和项目/Agent
+  归档同步。
+- 新增 `scripts/agent-cache-benchmark.py`，汇总 fresh/reuse 的 token、首轮延迟
+  和成功率并输出 JSON/Markdown；门槛为成功率不下降且 uncached 降低 10% 或
+  首轮延迟降低 20%。
 
 ### Changed
 
@@ -41,6 +53,8 @@
 - `read`/`review` 任务仍禁止修改源码，但保留 `workspace-write` 沙箱以运行需要
   临时目录的测试；`write` 任务继续使用独立 worktree。
 - 项目文档、健康接口版本和发布包版本统一升级到 `0.4.0`。
+- `exec` 继续作为默认与 fallback；App Server 初始化自动重试一次，连续失败记录
+  `agent_runtime_fallback` 后回退 exec。
 
 ## [0.3.1] - 2026-11-07
 
