@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping
 
-from .agent_pool import AgentPool
+from .agent_pool import AgentPool, AgentPoolError
 from .app_server import AppServerEvents, AppServerRuntime
 from .config import Settings
 from .db import connect, connect_readonly, utc_now
@@ -69,6 +69,29 @@ do not merge or mark review tasks done; report that human review is required.
 Do not mark a task done without a real merge commit and passing integration
 tests. Return a concise progress summary and the next concrete board state.
 """
+
+
+def _stable_developer_instructions(
+    goal: Mapping[str, Any],
+    role: str,
+    instructions: str,
+) -> str:
+    """Prefix role instructions with stable, cache-friendly thread identity."""
+
+    workstream = str(goal.get("workstream_key") or "").strip()
+    if not workstream or workstream == str(goal.get("goal_id") or ""):
+        workstream = "default (goal-scoped)"
+    prefix = f"""## Stable Team Context
+
+- Project ID: `{goal.get("project_id") or "unknown"}`
+- Project root: `{goal.get("root_path") or "unknown"}`
+- Role: `{role}`
+- Workstream: `{workstream}`
+
+This identity is stable for the Agent thread. The current goal, assignment,
+board state, and task-specific instructions arrive in the turn input.
+"""
+    return f"{prefix.rstrip()}\n\n{instructions.strip()}"
 
 
 def _runtime_mode(value: str | None) -> str:
@@ -160,7 +183,8 @@ class ClusterManager:
         lead_cooldown_seconds: float = 8.0,
     ) -> None:
         self.settings = settings
-        self.team = team or TeamService(settings)
+        self.agent_pool = agent_pool or AgentPool(settings)
+        self.team = team or TeamService(settings, agent_pool=self.agent_pool)
         self.worktrees = worktrees or WorktreeManager(self.team)
         self.agent_command = agent_command or _default_codex_command()
         configured_runtime = os.environ.get("CODEX_TEAM_AGENT_RUNTIME")
@@ -173,7 +197,6 @@ class ClusterManager:
                 else ("app_server" if runtime is not None else "exec")
             )
         )
-        self.agent_pool = agent_pool or AgentPool(settings)
         self.model = _optional_text(
             os.environ.get("CODEX_TEAM_MODEL"),
             "CODEX_TEAM_MODEL",
@@ -764,11 +787,14 @@ class ClusterManager:
         actor: str = "human",
         reason: str = "manual reset requested through cluster",
     ) -> dict[str, Any]:
-        return self.team.reset_agent(
-            agent_id,
-            actor=actor,
-            reason=reason,
-        )
+        try:
+            return self.agent_pool.request_reset(
+                agent_id,
+                reason,
+                actor,
+            )
+        except AgentPoolError as exc:
+            raise ClusterError(str(exc)) from exc
 
     def close(self) -> None:
         if self.runtime is not None:
@@ -1541,6 +1567,11 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
         runtime = self.runtime
         if runtime is None:
             raise ClusterError("App Server runtime is not configured")
+        developer_instructions = _stable_developer_instructions(
+            goal,
+            role,
+            developer_instructions,
+        )
         workstream_key = str(goal.get("workstream_key") or goal["goal_id"])
         task_kind = "read" if kind == "lead" else str(
             self.team.get_task(task_id)["kind"]
@@ -2244,8 +2275,22 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
         def values(value: Any) -> Mapping[str, Any]:
             return value if isinstance(value, Mapping) else {}
 
-        total = values(state.get("usage"))
-        first = values(state.get("first_usage")) or total
+        usage = values(state.get("usage"))
+        nested_usage = "total" in usage or "last" in usage
+        total = values(usage.get("total")) if nested_usage else usage
+        last_value = usage.get("last")
+        last = values(last_value)
+        first_usage = values(state.get("first_usage")) or usage
+        first_nested_usage = (
+            "total" in first_usage or "last" in first_usage
+        )
+        first_total = (
+            values(first_usage.get("total"))
+            if first_nested_usage
+            else first_usage
+        )
+        first_last_value = first_usage.get("last")
+        first_last = values(first_last_value)
         baseline_input = 0
         baseline_cached = 0
         baseline_output = 0
@@ -2286,17 +2331,46 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
             except (TypeError, ValueError):
                 return 0
 
-        input_tokens = max(0, number(total, "input") - baseline_input)
-        cached_tokens = min(
-            max(0, number(total, "cached") - baseline_cached),
-            input_tokens,
+        def turn_values(
+            cumulative: Mapping[str, Any],
+            last_present: bool,
+            per_turn: Mapping[str, Any],
+        ) -> tuple[int, int, int, int]:
+            if last_present:
+                input_count = number(per_turn, "input")
+                cached_count = min(number(per_turn, "cached"), input_count)
+                output_count = number(per_turn, "output")
+                context_count = number(per_turn, "context")
+            else:
+                input_count = max(
+                    0,
+                    number(cumulative, "input") - baseline_input,
+                )
+                cached_count = min(
+                    max(0, number(cumulative, "cached") - baseline_cached),
+                    input_count,
+                )
+                output_count = max(
+                    0,
+                    number(cumulative, "output") - baseline_output,
+                )
+                context_count = number(cumulative, "context")
+            return input_count, cached_count, output_count, context_count
+
+        input_tokens, cached_tokens, output_tokens, context_tokens = turn_values(
+            total,
+            isinstance(last_value, Mapping),
+            last,
         )
-        first_input = max(0, number(first, "input") - baseline_input)
-        first_cached = min(
-            max(0, number(first, "cached") - baseline_cached),
-            first_input,
+        first_input, first_cached, _, _ = turn_values(
+            first_total,
+            isinstance(first_last_value, Mapping),
+            first_last,
         )
-        raw_window = total.get("modelContextWindow")
+        raw_window = usage.get(
+            "modelContextWindow",
+            total.get("modelContextWindow"),
+        )
         try:
             model_window = (
                 max(0, int(raw_window))
@@ -2309,14 +2383,11 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
             "input_tokens": input_tokens,
             "cached_input_tokens": cached_tokens,
             "uncached_input_tokens": input_tokens - cached_tokens,
-            "output_tokens": max(
-                0,
-                number(total, "output") - baseline_output,
-            ),
+            "output_tokens": output_tokens,
             "first_input_tokens": first_input,
             "first_cached_input_tokens": first_cached,
             "first_uncached_input_tokens": first_input - first_cached,
-            "context_tokens": number(total, "context"),
+            "context_tokens": context_tokens,
             "model_context_window": model_window,
         }
 

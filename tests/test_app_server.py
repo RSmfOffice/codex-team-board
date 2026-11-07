@@ -116,6 +116,8 @@ class AppServerRuntimeTests(unittest.TestCase):
     ) -> AppServerRuntime:
         env = {
             "PYTHONUNBUFFERED": "1",
+            "PYTHONIOENCODING": "utf-8",
+            "PYTHONUTF8": "1",
             "FAKE_APP_SERVER_TRACE": str(base / "trace.jsonl"),
         }
         if extra_env:
@@ -214,11 +216,20 @@ class AppServerRuntimeTests(unittest.TestCase):
         self.assertEqual(
             usage,
             {
-                "input": 120,
-                "cached": 20,
-                "uncached": 100,
-                "output": 30,
-                "context": 75,
+                "total": {
+                    "input": 120,
+                    "cached": 20,
+                    "uncached": 100,
+                    "output": 30,
+                    "context": 150,
+                },
+                "last": {
+                    "input": 50,
+                    "cached": 5,
+                    "uncached": 45,
+                    "output": 10,
+                    "context": 60,
+                },
                 "modelContextWindow": 200,
             },
         )
@@ -251,7 +262,8 @@ class AppServerRuntimeTests(unittest.TestCase):
             for item in events.token_usage
             if item[1] == overflow_turn["turn_id"]
         )
-        self.assertEqual(overflow_usage["uncached"], 0)
+        self.assertEqual(overflow_usage["total"]["uncached"], 0)
+        self.assertEqual(overflow_usage["last"]["uncached"], 0)
 
         runtime.interrupt_turn("thread-resumed", turn["turn_id"])
         wait_for(
@@ -406,14 +418,35 @@ class AppServerRuntimeTests(unittest.TestCase):
         self.assertEqual(
             usage,
             {
-                "input": 3,
-                "cached": 8,
-                "uncached": 0,
-                "output": 2,
-                "context": 5,
+                "total": {
+                    "input": 3,
+                    "cached": 3,
+                    "uncached": 0,
+                    "output": 2,
+                    "context": 0,
+                },
+                "last": {
+                    "input": 0,
+                    "cached": 0,
+                    "uncached": 0,
+                    "output": 0,
+                    "context": 5,
+                },
                 "modelContextWindow": None,
             },
         )
+        missing_last = map_token_usage(
+            {
+                "total": {
+                    "inputTokens": 12,
+                    "cachedInputTokens": 4,
+                    "outputTokens": 3,
+                    "totalTokens": 15,
+                }
+            }
+        )
+        self.assertIsNone(missing_last["last"])
+        self.assertEqual(missing_last["total"]["uncached"], 8)
 
 
 if __name__ == "__main__":

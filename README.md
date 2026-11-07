@@ -606,11 +606,17 @@ $env:CODEX_TEAM_MODEL_PROVIDER = ""   # 可选
 
 `app_server` 模式由 `ClusterManager` 持有私有 App Server 进程。新 thread 使用
 `thread/start`，已存储且满足复用规则的 thread 使用 `thread/resume`，每次派发
-通过 `turn/start` 提交当前 goal/task。稳定 `developerInstructions` 只包含角色
-约束，不包含 goal ID、task ID、worktree 路径或时间戳；动态 board 和任务内容
-放在每个后续 turn 中。`turn/start` 的 `cwd` 始终是当前执行 worktree，因此同一
+通过 `turn/start` 提交当前 goal/task。稳定 `developerInstructions` 以
+`Stable Team Context` 开头，包含项目 ID、项目根目录、角色和 workstream；不含
+goal ID、task ID、时间戳或日志路径。角色约束保持稳定，动态 board 和任务内容
+只放在后续 turn 中。`turn/start` 的 `cwd` 始终是当前执行 worktree，因此同一
 thread 可以从一个 write worktree 安全切换到另一个 worktree，sandbox policy
 按当前任务重算。
+
+App Server 的 `tokenUsage` 同时保留线程累计 `total` 和本轮 `last`。job 的
+input、cached、uncached、output 优先记录 `last`；只有 `last` 缺失时才使用
+同一 Agent 的累计差值兜底。这样跨 turn 复用不会把历史 input 或 output 重复
+计入单轮成本，同时仍保留 total 供诊断。
 
 `workstream_key` 是项目内连续性作用域；省略时默认使用当前 `goal_id`。AgentPool
 只会在同一项目、同一角色和同一 workstream 内复用，不会跨项目误用 thread。
@@ -655,6 +661,9 @@ read/review 和满足 Lead 连续性条件的任务可复用；`fresh` 强制新
 `teamd` 每次 tick 会应用 reset 请求，对 App Server thread 调用
 `thread/unsubscribe`，再把旧 Agent 标记为 `superseded`。MCP 对应工具为
 `team_agent_list`、`team_agent_reset` 和 `team_goal_set_workstream`。
+CLI、MCP、ClusterManager 和 WebUI 的 reset 都统一进入
+`AgentPool.request_reset`；`starting`/`busy`、`superseded` 和已归档 Agent
+会被拒绝，避免重置正在执行或已失效的 thread。
 
 App Server 初始化失败时会自动重启一次；第二次仍失败则记录
 `agent_runtime_fallback` 并让该 job 使用 exec。超时或取消会优先对活动 turn
@@ -667,8 +676,10 @@ App Server 初始化失败时会自动重启一次；第二次仍失败则记录
 
 A/B 默认 exec 作为基线，`app_server` 为需要显式开启的实验变体。
 `scripts/agent-cache-benchmark.py` 接受 fresh/reuse 的 JSON 或 JSONL 观测，
-汇总每轮的 last/total input、cached、uncached、output、context，首轮延迟和
-task success，并输出 JSON 与 Markdown：
+仅用成功任务计算 token 和延迟中位数，同时用全部样本计算成功率。主指标是
+成功任务的 `last_uncached_input_tokens` 中位数；`last_*` 全部保留，
+`total_*` 作为会话累计诊断，不参与过线判断。报告包含 `sample_count`、
+`successful_sample_count` 和 `median` 字段，并输出 JSON 与 Markdown：
 
 ```powershell
 python .\scripts\agent-cache-benchmark.py `
@@ -679,15 +690,17 @@ python .\scripts\agent-cache-benchmark.py `
 ```
 
 每条记录可使用扁平字段，也可使用 App Server 的嵌套 `usage.total` /
-`usage.last`。至少应提供首轮延迟（毫秒或秒）和 `task_success`。App Server 的
-累计 `total.inputTokens` 会跨复用 turn 增长；比较单轮成本时，应将本轮值减去
-同一 Agent 上一轮累计值后再写入 `total_input_tokens` 和相应 cached/uncached
-字段，避免把历史会话成本重复计入本轮。
+`usage.last`。至少应提供首轮延迟（毫秒或秒）和 `task_success`。失败样本仍
+计入 `sample_count` 和成功率，但不会污染成功成本中位数。手工构造旧格式记录时，
+`total_*` 可继续表示已换算的单轮累计差值；诊断字段不能替代 `last_*` 主门槛。
 
 复用变体通过的门槛是：任务成功率不得下降，并且满足以下任一条件：
 
-- uncached input 相对 fresh 降低至少 10%；
-- 首轮延迟相对 fresh 降低至少 20%。
+- 成功任务的 median `last_uncached_input_tokens` 相对 fresh 降低至少 10%；
+- 成功任务的 median 首轮延迟相对 fresh 降低至少 20%。
+
+基准结果是实验证据，不会自动切换 runtime 或修改配置。默认仍为 `exec`；
+小样本结果不能作为生产默认切换到 `app_server` 的依据。
 
 ### 多集群容量与公平调度
 

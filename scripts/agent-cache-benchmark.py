@@ -13,7 +13,7 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from statistics import mean
+from statistics import median
 from typing import Any, Iterable, Mapping
 
 METRIC_NAMES = (
@@ -183,21 +183,39 @@ def summarize(
         grouped[observation.variant].append(observation)
     result: dict[str, dict[str, Any]] = {}
     for variant, items in grouped.items():
-        latencies = [
-            item.first_turn_latency_ms
-            for item in items
-            if item.first_turn_latency_ms is not None
-        ]
+        successful = [item for item in items if item.task_success]
         metrics = {
-            name: mean([item.metrics[name] for item in items]) if items else None
+            name: (
+                median([item.metrics[name] for item in successful])
+                if successful
+                else None
+            )
             for name in METRIC_NAMES
         }
+        latencies = [
+            item.first_turn_latency_ms
+            for item in successful
+            if item.first_turn_latency_ms is not None
+        ]
         total_input = metrics["total_input_tokens"] or 0
         total_cached = metrics["total_cached_input_tokens"] or 0
         result[variant] = {
             **metrics,
+            **{
+                f"median_{name}": value
+                for name, value in metrics.items()
+            },
+            "median": metrics,
+            "metric_medians": metrics,
+            "metrics_basis": "successful_tasks",
             "runs": len(items),
-            "first_turn_latency_ms": mean(latencies) if latencies else None,
+            "sample_count": len(items),
+            "successful_sample_count": len(successful),
+            "first_turn_latency_sample_count": len(latencies),
+            "first_turn_latency_ms": median(latencies) if latencies else None,
+            "median_first_turn_latency_ms": (
+                median(latencies) if latencies else None
+            ),
             "task_success_rate": (
                 sum(1 for item in items if item.task_success) / len(items)
                 if items
@@ -211,8 +229,10 @@ def summarize(
 
 
 def compare(fresh: Mapping[str, Any], reuse: Mapping[str, Any]) -> dict[str, Any]:
-    fresh_uncached = fresh.get("total_uncached_input_tokens")
-    reuse_uncached = reuse.get("total_uncached_input_tokens")
+    fresh_uncached = fresh.get("median_last_uncached_input_tokens")
+    reuse_uncached = reuse.get("median_last_uncached_input_tokens")
+    fresh_total_uncached = fresh.get("median_total_uncached_input_tokens")
+    reuse_total_uncached = reuse.get("median_total_uncached_input_tokens")
     fresh_latency = fresh.get("first_turn_latency_ms")
     reuse_latency = reuse.get("first_turn_latency_ms")
     fresh_success = fresh.get("task_success_rate")
@@ -227,6 +247,15 @@ def compare(fresh: Mapping[str, Any], reuse: Mapping[str, Any]) -> dict[str, Any
         if fresh_latency not in {None, 0} and reuse_latency is not None
         else None
     )
+    total_uncached_change = (
+        (float(reuse_total_uncached) - float(fresh_total_uncached))
+        / float(fresh_total_uncached)
+        if (
+            fresh_total_uncached not in {None, 0}
+            and reuse_total_uncached is not None
+        )
+        else None
+    )
     uncached_gate = bool(uncached_change is not None and uncached_change <= -0.10)
     latency_gate = bool(latency_change is not None and latency_change <= -0.20)
     success_gate = bool(
@@ -235,7 +264,10 @@ def compare(fresh: Mapping[str, Any], reuse: Mapping[str, Any]) -> dict[str, Any
         and float(reuse_success) >= float(fresh_success)
     )
     return {
+        "primary_metric": "median last_uncached_input_tokens of successful tasks",
         "uncached_input_change": uncached_change,
+        "last_uncached_input_change": uncached_change,
+        "total_uncached_input_change_diagnostic": total_uncached_change,
         "first_turn_latency_change": latency_change,
         "success_rate_change": (
             float(reuse_success) - float(fresh_success)
@@ -271,15 +303,29 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         "",
         f"Generated: {report['generated_at']}",
         "",
-        "| Metric | Fresh | Reuse | Reuse delta |",
+        "Token and latency metrics are medians across successful tasks. "
+        "`last_*` is the primary single-turn cost; `total_*` is diagnostic "
+        "thread history and does not drive the gate.",
+        "",
+        "| Successful-task metric | Fresh | Reuse | Reuse delta |",
         "| --- | ---: | ---: | ---: |",
     ]
     rows = (
-        ("Runs", "runs", False),
-        ("First-turn latency (ms)", "first_turn_latency_ms", False),
-        ("Task success", "task_success_rate", True),
+        ("Sample count", "sample_count", False),
+        ("Successful samples", "successful_sample_count", False),
+        ("Task success rate", "task_success_rate", True),
+        ("Median first-turn latency (ms)", "first_turn_latency_ms", False),
         ("Cache hit rate", "cache_hit_rate", True),
-        *((name, name, False) for name in METRIC_NAMES),
+        *(
+            (
+                f"Median {name}" + (
+                    " (diagnostic)" if name.startswith("total_") else ""
+                ),
+                f"median_{name}",
+                False,
+            )
+            for name in METRIC_NAMES
+        ),
     )
     for label, key, percent in rows:
         left = fresh.get(key)
@@ -306,11 +352,13 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             "",
             "## Gate",
             "",
-            "Reuse passes only when task success does not decrease and either "
-            "uncached input falls by at least 10% or first-turn latency falls "
-            "by at least 20%.",
+            "Across successful tasks, reuse passes only when task success does "
+            "not decrease and either median `last_uncached_input_tokens` falls "
+            "by at least 10% or median first-turn latency falls by at least "
+            "20%. Median total tokens are retained only as diagnostics.",
             "",
-            f"- Uncached input change: {_format_number(comparison['uncached_input_change'], percent=True)}",
+            f"- Primary last uncached input change: {_format_number(comparison['last_uncached_input_change'], percent=True)}",
+            f"- Diagnostic total uncached input change: {_format_number(comparison['total_uncached_input_change_diagnostic'], percent=True)}",
             f"- First-turn latency change: {_format_number(comparison['first_turn_latency_change'], percent=True)}",
             f"- Success rate change: {_format_number(comparison['success_rate_change'], percent=True)}",
             f"- Result: {'PASS' if comparison['meets_gate'] else 'FAIL'}",

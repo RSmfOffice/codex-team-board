@@ -8,6 +8,9 @@ from pathlib import Path
 from typing import Any
 
 
+os.environ["PYTHONIOENCODING"] = "utf-8"
+os.environ["PYTHONUTF8"] = "1"
+
 _WRITE_LOCK = threading.Lock()
 
 
@@ -171,9 +174,13 @@ def main() -> int:
             if input_text == "usage-overflow":
                 input_tokens = 10
                 cached_tokens = 15
+                last_input_tokens = 8
+                last_cached_tokens = 12
             else:
                 input_tokens = 120
                 cached_tokens = 20
+                last_input_tokens = 50
+                last_cached_tokens = 5
             send(
                 {
                     "method": "thread/tokenUsage/updated",
@@ -189,11 +196,11 @@ def main() -> int:
                                 "totalTokens": input_tokens + 30,
                             },
                             "last": {
-                                "inputTokens": 50,
-                                "cachedInputTokens": 5,
+                                "inputTokens": last_input_tokens,
+                                "cachedInputTokens": last_cached_tokens,
                                 "outputTokens": 10,
                                 "reasoningOutputTokens": 1,
-                                "totalTokens": 75,
+                                "totalTokens": last_input_tokens + 10,
                             },
                             "modelContextWindow": 200,
                         },

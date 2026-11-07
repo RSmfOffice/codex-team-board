@@ -29,7 +29,8 @@
   每 goal 活动 job、队列原因和当前等待指标。
 - 新增可选 App Server Agent runtime：默认仍为 `exec`，显式设置
   `CODEX_TEAM_AGENT_RUNTIME=app_server` 后使用持久 thread、后续 turn 和
-  `thread/resume`；稳定 developer instructions 不混入动态任务。
+  `thread/resume`；稳定 developer instructions 以项目、角色和 workstream
+  前缀开头，不混入动态 goal/task。
 - 新增项目内 `workstream_key` / `continuity_reason`、任务 `continuity_mode`、
   Agent list/reset 与 goal workstream 控制；缺省 workstream 使用 goal ID，
   `team_worker` 的 write 任务默认 fresh，只有显式 reuse 才复用。
@@ -37,8 +38,8 @@
   `turn/interrupt`、daemon 重启 lost turn 恢复、reset unsubscribe 和项目/Agent
   归档同步。
 - 新增 `scripts/agent-cache-benchmark.py`，汇总 fresh/reuse 的 token、首轮延迟
-  和成功率并输出 JSON/Markdown；门槛为成功率不下降且 uncached 降低 10% 或
-  首轮延迟降低 20%。
+  和成功率并输出 JSON/Markdown；成功任务使用中位数，主指标为
+  `last_uncached_input_tokens`，total 仅作诊断，并输出 sample count/median。
 
 ### Changed
 
@@ -55,6 +56,14 @@
 - 项目文档、健康接口版本和发布包版本统一升级到 `0.4.0`。
 - `exec` 继续作为默认与 fallback；App Server 初始化自动重试一次，连续失败记录
   `agent_runtime_fallback` 后回退 exec。
+
+### Fixed
+
+- App Server `tokenUsage` 同时保留 total 与 last；单轮 input/cached/uncached/output
+  优先使用 last，缺失时才按同一 Agent 的累计差值兜底，避免重复计算 output。
+- ClusterManager、WebUI、CLI 和 MCP 的 Agent reset 统一走
+  `AgentPool.request_reset`，并拒绝 starting/busy、superseded 和 archived Agent。
+- fake App Server fixture 强制 UTF-8 Python 环境，跨平台测试不再受控制台代码页影响。
 
 ## [0.3.1] - 2026-11-07
 
