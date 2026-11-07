@@ -147,6 +147,8 @@ CREATE TABLE IF NOT EXISTS cluster_agents (
     model_provider TEXT NOT NULL DEFAULT '',
     current_goal_id TEXT REFERENCES cluster_goals(goal_id) ON DELETE SET NULL,
     current_task_id TEXT REFERENCES tasks(task_id) ON DELETE SET NULL,
+    current_job_id TEXT REFERENCES cluster_jobs(job_id) ON DELETE SET NULL,
+    last_turn_id TEXT,
     model_context_window INTEGER,
     last_input_tokens INTEGER NOT NULL DEFAULT 0,
     last_cached_input_tokens INTEGER NOT NULL DEFAULT 0,
@@ -159,11 +161,21 @@ CREATE TABLE IF NOT EXISTS cluster_agents (
     last_used_at TEXT,
     last_loaded_at TEXT,
     last_unloaded_at TEXT,
+    reset_requested_at TEXT,
     reset_reason TEXT NOT NULL DEFAULT '',
     last_error TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     archived_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS cluster_agent_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id TEXT NOT NULL REFERENCES cluster_agents(agent_id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    data_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS cluster_events (
@@ -204,6 +216,8 @@ CREATE INDEX IF NOT EXISTS idx_cluster_agents_pool
     ON cluster_agents(project_id, role, workstream_key, status, last_used_at);
 CREATE INDEX IF NOT EXISTS idx_cluster_jobs_turn
     ON cluster_jobs(thread_id, turn_id);
+CREATE INDEX IF NOT EXISTS idx_cluster_agent_events_agent
+    ON cluster_agent_events(agent_id, event_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_cluster_one_active_goal
     ON cluster_goals(project_id)
     WHERE status IN ('planning', 'active');
