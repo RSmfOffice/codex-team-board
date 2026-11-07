@@ -672,6 +672,7 @@ class TeamMcpServer:
                 note=arguments["note"],
                 result=arguments.get("result"),
                 tests=arguments.get("tests"),
+                commit_sha=arguments.get("commit_sha"),
             )
         if name == "team_submit_task":
             return self.team.submit_task(
