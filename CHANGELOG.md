@@ -2,6 +2,30 @@
 
 本项目遵循语义化版本。
 
+## [0.4.0] - 2026-11-07
+
+### Added
+
+- 新增跨项目多集群调度：全局 Jobs 容量默认 4，每 goal Worker 容量默认 3。
+- 新增按最久未启动 goal 优先的公平轮转；全局容量满时记录
+  `fairness_deferred`，并对同一 goal 的重复事件做 60 秒去重。
+- 新增 `CODEX_TEAM_CLUSTER_MAX_JOBS`、`CODEX_TEAM_CLUSTER_MAX_WORKERS`、
+  `CODEX_TEAM_WORKER_TIMEOUT_SECONDS` 和
+  `CODEX_TEAM_LEAD_TIMEOUT_SECONDS` 配置。
+- 长任务默认使用 2 小时 Worker 超时和 45 分钟 Lead 超时，超时后回收 job
+  并按既有重试策略继续或 blocked。
+- 新增 Worker 心跳 5 分钟 warning、15 分钟 critical 审计事件；心跳告警不直接
+  终止进程。
+- WebUI 新增全局 job/容量、排队 goal、公平等待、heartbeat overdue、最老心跳、
+  每 goal 活动 job、队列原因和预计等待指标。
+
+### Changed
+
+- 全局 Jobs 容量同时约束 Lead 和 Worker；每 goal Worker 容量只约束 Worker。
+- 同一项目仍只允许一个 `planning`/`active` goal；多集群并行需要为不同项目创建
+  目标。
+- 项目文档、健康接口版本和发布包版本统一升级到 `0.4.0`。
+
 ## [0.3.1] - 2026-11-07
 
 ### Fixed
