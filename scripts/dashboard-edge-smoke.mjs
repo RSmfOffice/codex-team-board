@@ -10,7 +10,8 @@ const edgeCandidates = [
   "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
   "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
 ];
-const edgePath = edgeCandidates.find(existsSync);
+const configuredEdgePath = process.env.CODEX_TEAM_EDGE_PATH?.trim();
+const edgePath = configuredEdgePath || edgeCandidates.find(existsSync);
 if (!edgePath) throw new Error("Microsoft Edge not found");
 
 const screenshotPath = join(process.cwd(), "artifacts", "dashboard-edge-smoke.png");
@@ -126,6 +127,9 @@ async function waitFor(fn, timeoutMs = 15000, intervalMs = 120) {
   throw new Error(`Timed out after ${timeoutMs}ms${lastError ? `: ${lastError}` : ""}`);
 }
 
+let spawnError = null;
+let earlyExit = null;
+let client;
 const edge = spawn(edgePath, [
   "--headless=new",
   "--disable-gpu",
@@ -148,10 +152,26 @@ const edge = spawn(edgePath, [
   windowsHide: true,
 });
 
-let client;
+edge.once("error", (error) => {
+  spawnError = error;
+});
+edge.once("exit", (code, signal) => {
+  if (!client) {
+    earlyExit = { code, signal };
+  }
+});
+
 try {
   const portFile = join(profile, "DevToolsActivePort");
   const port = await waitFor(async () => {
+    if (spawnError) {
+      throw new Error(`Edge spawn failed: ${spawnError.message}`);
+    }
+    if (earlyExit) {
+      throw new Error(
+        `Edge exited before CDP was ready (code=${earlyExit.code}, signal=${earlyExit.signal})`,
+      );
+    }
     if (!existsSync(portFile)) return 0;
     const [value] = (await readFile(portFile, "utf8")).trim().split(/\r?\n/);
     return Number(value) || 0;
