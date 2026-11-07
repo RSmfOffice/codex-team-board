@@ -4,7 +4,7 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     review_notes TEXT NOT NULL DEFAULT '',
     merge_commit TEXT NOT NULL DEFAULT '',
     version INTEGER NOT NULL DEFAULT 1,
+    continuity_mode TEXT NOT NULL DEFAULT 'auto',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     completed_at TEXT,
@@ -90,6 +91,8 @@ CREATE TABLE IF NOT EXISTS cluster_goals (
     lead_failures INTEGER NOT NULL DEFAULT 0,
     max_worker_attempts INTEGER NOT NULL DEFAULT 3,
     max_lead_attempts INTEGER NOT NULL DEFAULT 5,
+    workstream_key TEXT,
+    continuity_reason TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     completed_at TEXT,
@@ -114,7 +117,53 @@ CREATE TABLE IF NOT EXISTS cluster_jobs (
     started_at TEXT NOT NULL,
     finished_at TEXT,
     exit_code INTEGER,
-    error TEXT NOT NULL DEFAULT ''
+    error TEXT NOT NULL DEFAULT '',
+    agent_id TEXT REFERENCES cluster_agents(agent_id) ON DELETE SET NULL,
+    turn_id TEXT,
+    runtime TEXT NOT NULL DEFAULT 'exec',
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+    uncached_input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    first_input_tokens INTEGER NOT NULL DEFAULT 0,
+    first_cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+    first_uncached_input_tokens INTEGER NOT NULL DEFAULT 0,
+    context_tokens INTEGER NOT NULL DEFAULT 0,
+    model_context_window INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS cluster_agents (
+    agent_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+    role TEXT NOT NULL,
+    workstream_key TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    thread_id TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL CHECK(status IN (
+        'starting', 'busy', 'loaded', 'idle', 'stored',
+        'superseded', 'failed'
+    )),
+    model TEXT NOT NULL DEFAULT '',
+    model_provider TEXT NOT NULL DEFAULT '',
+    current_goal_id TEXT REFERENCES cluster_goals(goal_id) ON DELETE SET NULL,
+    current_task_id TEXT REFERENCES tasks(task_id) ON DELETE SET NULL,
+    model_context_window INTEGER,
+    last_input_tokens INTEGER NOT NULL DEFAULT 0,
+    last_cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+    last_uncached_input_tokens INTEGER NOT NULL DEFAULT 0,
+    total_input_tokens INTEGER NOT NULL DEFAULT 0,
+    total_cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+    total_uncached_input_tokens INTEGER NOT NULL DEFAULT 0,
+    context_tokens INTEGER NOT NULL DEFAULT 0,
+    turn_count INTEGER NOT NULL DEFAULT 0,
+    last_used_at TEXT,
+    last_loaded_at TEXT,
+    last_unloaded_at TEXT,
+    reset_reason TEXT NOT NULL DEFAULT '',
+    last_error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    archived_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS cluster_events (
@@ -151,6 +200,10 @@ CREATE INDEX IF NOT EXISTS idx_cluster_events_goal
     ON cluster_events(goal_id, event_id);
 CREATE INDEX IF NOT EXISTS idx_cluster_goals_archived
     ON cluster_goals(project_id, archived_at, updated_at);
+CREATE INDEX IF NOT EXISTS idx_cluster_agents_pool
+    ON cluster_agents(project_id, role, workstream_key, status, last_used_at);
+CREATE INDEX IF NOT EXISTS idx_cluster_jobs_turn
+    ON cluster_jobs(thread_id, turn_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_cluster_one_active_goal
     ON cluster_goals(project_id)
     WHERE status IN ('planning', 'active');
@@ -181,6 +234,7 @@ TASK_MIGRATION_COLUMNS = {
     "version": "INTEGER NOT NULL DEFAULT 1",
     "completed_at": "TEXT",
     "archived_at": "TEXT",
+    "continuity_mode": "TEXT NOT NULL DEFAULT 'auto'",
 }
 
 PROJECT_MIGRATION_COLUMNS = {
@@ -189,6 +243,23 @@ PROJECT_MIGRATION_COLUMNS = {
 
 CLUSTER_GOAL_MIGRATION_COLUMNS = {
     "archived_at": "TEXT",
+    "workstream_key": "TEXT",
+    "continuity_reason": "TEXT NOT NULL DEFAULT ''",
+}
+
+CLUSTER_JOB_MIGRATION_COLUMNS = {
+    "agent_id": "TEXT",
+    "turn_id": "TEXT",
+    "runtime": "TEXT NOT NULL DEFAULT 'exec'",
+    "input_tokens": "INTEGER NOT NULL DEFAULT 0",
+    "cached_input_tokens": "INTEGER NOT NULL DEFAULT 0",
+    "uncached_input_tokens": "INTEGER NOT NULL DEFAULT 0",
+    "output_tokens": "INTEGER NOT NULL DEFAULT 0",
+    "first_input_tokens": "INTEGER NOT NULL DEFAULT 0",
+    "first_cached_input_tokens": "INTEGER NOT NULL DEFAULT 0",
+    "first_uncached_input_tokens": "INTEGER NOT NULL DEFAULT 0",
+    "context_tokens": "INTEGER NOT NULL DEFAULT 0",
+    "model_context_window": "INTEGER",
 }
 
 
@@ -253,4 +324,13 @@ def _upgrade_schema(connection: sqlite3.Connection) -> None:
         if name not in cluster_goal_columns:
             connection.execute(
                 f"ALTER TABLE cluster_goals ADD COLUMN {name} {declaration}"
+            )
+    cluster_job_columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(cluster_jobs)").fetchall()
+    }
+    for name, declaration in CLUSTER_JOB_MIGRATION_COLUMNS.items():
+        if name not in cluster_job_columns:
+            connection.execute(
+                f"ALTER TABLE cluster_jobs ADD COLUMN {name} {declaration}"
             )

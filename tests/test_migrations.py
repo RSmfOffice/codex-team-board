@@ -38,7 +38,7 @@ class MigrationTests(unittest.TestCase):
             try:
                 self.assertEqual(
                     upgraded.execute("PRAGMA user_version").fetchone()[0],
-                    8,
+                    9,
                 )
                 columns = {
                     row["name"]
@@ -68,6 +68,47 @@ class MigrationTests(unittest.TestCase):
                     ).fetchall()
                 }
                 self.assertIn("archived_at", cluster_goal_columns)
+                self.assertTrue(
+                    {"workstream_key", "continuity_reason"}.issubset(
+                        cluster_goal_columns
+                    )
+                )
+                task_columns = {
+                    row["name"]
+                    for row in upgraded.execute("PRAGMA table_info(tasks)").fetchall()
+                }
+                self.assertIn("continuity_mode", task_columns)
+                job_columns = {
+                    row["name"]
+                    for row in upgraded.execute(
+                        "PRAGMA table_info(cluster_jobs)"
+                    ).fetchall()
+                }
+                self.assertTrue(
+                    {
+                        "agent_id",
+                        "turn_id",
+                        "cached_input_tokens",
+                        "uncached_input_tokens",
+                        "model_context_window",
+                    }.issubset(job_columns)
+                )
+                agent_columns = {
+                    row["name"]
+                    for row in upgraded.execute(
+                        "PRAGMA table_info(cluster_agents)"
+                    ).fetchall()
+                }
+                self.assertTrue(
+                    {
+                        "agent_id",
+                        "thread_id",
+                        "workstream_key",
+                        "role",
+                        "status",
+                        "total_cached_input_tokens",
+                    }.issubset(agent_columns)
+                )
                 self.assertEqual(
                     upgraded.execute("PRAGMA integrity_check").fetchone()[0],
                     "ok",
