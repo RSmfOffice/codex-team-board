@@ -378,7 +378,7 @@ def main(argv: list[str] | None = None) -> int:
                 _print(cluster.set_goal_status(args.goal_id, "active", reason="resumed by user"))
                 _print({"daemon": ensure_daemon(settings)})
             elif args.cluster_command == "cancel":
-                _print(cluster.set_goal_status(args.goal_id, "failed", reason="canceled by user"))
+                _print(cluster.cancel_goal(args.goal_id, reason="canceled by user"))
             elif args.cluster_command == "daemon-status":
                 _print(daemon_status(settings))
             elif args.cluster_command == "stop-daemon":

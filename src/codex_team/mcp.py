@@ -622,12 +622,19 @@ class TeamMcpServer:
             }
         if name == "team_cluster_control":
             action = arguments["action"]
-            status = {"pause": "paused", "resume": "active", "cancel": "failed"}[action]
-            goal = self.cluster.set_goal_status(
-                arguments["goal_id"],
-                status,
-                reason=f"{action} requested through MCP",
-            )
+            reason = f"{action} requested through MCP"
+            if action == "cancel":
+                goal = self.cluster.cancel_goal(
+                    arguments["goal_id"],
+                    reason=reason,
+                )
+            else:
+                status = "paused" if action == "pause" else "active"
+                goal = self.cluster.set_goal_status(
+                    arguments["goal_id"],
+                    status,
+                    reason=reason,
+                )
             return {
                 "goal": goal,
                 "daemon": ensure_daemon(self.settings) if action == "resume" else cluster_daemon_status(self.settings),

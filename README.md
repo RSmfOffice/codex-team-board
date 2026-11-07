@@ -131,7 +131,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 
 如果仍需联动上下文插件，追加
 `-ContextMeterRoot "D:\path\to\codex-context-meter"`。安装完成后重新打开 Codex，
-并确认健康接口返回 `"version": "0.3.0"`：
+并确认健康接口返回 `"version": "0.3.1"`：
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8765/api/health
@@ -478,6 +478,8 @@ ready/review/blocked ──取消──→ canceled
 - Worker 不能将任务直接标记 `done`。
 - 只有 `lead`、`main` 或 `human` 可以终审。
 - 非 Running 的失效任务可以由 Lead 取消；取消原因和事件永久保留。
+- 取消自动集群目标会终止其活动 Agent job，并把未完成任务保留为 blocked，
+  便于后续恢复、重派或审计。
 
 ## 集群可靠性约束
 
@@ -561,5 +563,5 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -File .\scripts\build-release.ps1
 ```
 
-输出位于 `dist\codex-team-board-v0.3.0.zip`，同时生成 SHA256 文件。GitHub
+输出位于 `dist\codex-team-board-v0.3.1.zip`，同时生成 SHA256 文件。GitHub
 Release 应附带 ZIP 与 `.sha256` 两个资产。

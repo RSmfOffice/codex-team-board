@@ -215,6 +215,73 @@ class ClusterManager:
             )
         return self.get_goal(goal_id)
 
+    def cancel_goal(self, goal_id: str, *, reason: str = "canceled by user") -> dict[str, Any]:
+        goal = self.get_goal(goal_id)
+        if goal["status"] in TERMINAL_GOAL_STATUSES:
+            raise ClusterError(f"cannot cancel terminal goal: {goal['status']}")
+        with self.team.connection(write=False) as connection:
+            active_jobs = [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT job_id, pid FROM cluster_jobs
+                    WHERE goal_id = ? AND status IN ('starting', 'running')
+                    """,
+                    (goal_id,),
+                ).fetchall()
+            ]
+            tasks = [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT task_id, status FROM tasks
+                    WHERE goal_id = ? AND status NOT IN ('done', 'canceled')
+                    """,
+                    (goal_id,),
+                ).fetchall()
+            ]
+        for job in active_jobs:
+            self.processes.pop(job["job_id"], None)
+            pid = int(job.get("pid") or 0)
+            if pid and pid_is_running(pid):
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+        now = utc_now()
+        with self.team.connection() as connection:
+            for job in active_jobs:
+                connection.execute(
+                    """
+                    UPDATE cluster_jobs
+                    SET status = 'interrupted', finished_at = ?, exit_code = -9,
+                        error = ?
+                    WHERE job_id = ?
+                    """,
+                    (now, reason, job["job_id"]),
+                )
+            for task in tasks:
+                connection.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'blocked', blocker = ?, claimed_by = NULL,
+                        claim_token = NULL, lease_until = NULL,
+                        updated_at = ?, version = version + 1
+                    WHERE task_id = ?
+                    """,
+                    (f"goal canceled: {reason}", now, task["task_id"]),
+                )
+                self.team._event(
+                    connection,
+                    task["task_id"],
+                    "goal_canceled",
+                    "teamd",
+                    {"goal_id": goal_id, "reason": reason},
+                )
+        return self.set_goal_status(goal_id, "failed", reason=reason)
+
     def tick(self) -> dict[str, Any]:
         self._reconcile_jobs()
         goals = self.list_goals(["planning", "active"])

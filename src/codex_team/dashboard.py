@@ -192,18 +192,28 @@ class DashboardHandler(BaseHTTPRequestHandler):
             payload = self._read_json()
             goal_id = self._required_text(payload, "goal_id")
             action = payload.get("action")
-            statuses = {"pause": "paused", "resume": "active", "cancel": "failed"}
-            if not isinstance(action, str) or action not in statuses:
+            if not isinstance(action, str) or action not in {
+                "pause",
+                "resume",
+                "cancel",
+            }:
                 raise ValueError("action must be pause, resume, or cancel")
             cluster = ClusterManager(
                 self.team_service.settings,
                 team=self.team_service,
             )
-            goal = cluster.set_goal_status(
-                goal_id,
-                statuses[action],
-                reason=f"{action} requested through dashboard",
-            )
+            if action == "cancel":
+                goal = cluster.cancel_goal(
+                    goal_id,
+                    reason="cancel requested through dashboard",
+                )
+            else:
+                status = "paused" if action == "pause" else "active"
+                goal = cluster.set_goal_status(
+                    goal_id,
+                    status,
+                    reason=f"{action} requested through dashboard",
+                )
             daemon = (
                 ensure_daemon(self.team_service.settings)
                 if action == "resume"

@@ -153,6 +153,35 @@ class DashboardClusterControlTests(unittest.TestCase):
             )
             self.assertEqual(board_goal["status"], "active")
 
+            task = self.team.create_task(
+                self.repo,
+                title="Canceled with goal",
+                description="Must be blocked when the goal is canceled.",
+                acceptance="blocked with goal cancellation reason",
+                kind="read",
+                owner_role="team_explorer",
+                goal_id=goal["goal_id"],
+            )
+            self.team.claim_task(task["task_id"], actor="worker")
+            with self.team.connection() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO cluster_jobs(
+                        job_id, goal_id, task_id, kind, role, status,
+                        log_path, output_path, started_at
+                    ) VALUES (
+                        'J-CANCEL-TEST', ?, ?, 'worker', 'team_explorer', 'running',
+                        ?, ?, ?
+                    )
+                    """,
+                    (
+                        goal["goal_id"],
+                        task["task_id"],
+                        str(self.base / "cancel.log"),
+                        str(self.base / "cancel.out"),
+                        "2026-11-07T10:00:00Z",
+                    ),
+                )
             status, canceled = self.post(
                 "/api/clusters/control",
                 {"goal_id": goal["goal_id"], "action": "cancel"},
@@ -161,6 +190,15 @@ class DashboardClusterControlTests(unittest.TestCase):
             self.assertEqual(canceled["goal"]["status"], "failed")
             self.assertIn("cancel requested", canceled["goal"]["last_error"])
             current_daemon.assert_called()
+            canceled_task = self.team.get_task(task["task_id"])
+            self.assertEqual(canceled_task["status"], "blocked")
+            self.assertIn("goal canceled", canceled_task["blocker"])
+            with self.team.connection(write=False) as connection:
+                job = connection.execute(
+                    "SELECT status, error FROM cluster_jobs WHERE job_id = 'J-CANCEL-TEST'"
+                ).fetchone()
+            self.assertEqual(job["status"], "interrupted")
+            self.assertIn("cancel requested", job["error"])
             status, invalid_resume = self.post(
                 "/api/clusters/control",
                 {"goal_id": goal["goal_id"], "action": "resume"},
