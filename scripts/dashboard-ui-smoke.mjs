@@ -204,6 +204,13 @@ assert.equal(
   hooks.buildBoardSignature(secondBoard),
   "generated time and claim-age-only changes must not force a redraw",
 );
+const thresholdBoard = JSON.parse(JSON.stringify(secondBoard));
+thresholdBoard.tasks[0].claim_wait_state = "critical";
+assert.notEqual(
+  hooks.buildBoardSignature(firstBoard),
+  hooks.buildBoardSignature(thresholdBoard),
+  "claim-wait severity changes must trigger a redraw",
+);
 
 assert.equal(hooks.renderBoard(firstBoard), true, "first board should render");
 const clusterHtmlBefore = fakeElements.get("cluster-overview").innerHTML;

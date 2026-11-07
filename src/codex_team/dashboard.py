@@ -9,7 +9,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from . import __version__
-from .cluster import ClusterManager, daemon_status, ensure_daemon
+from .cluster import ClusterError, ClusterManager, daemon_status, ensure_daemon
 from .config import Settings
 from .db import utc_now
 from .service import TeamError, TeamService
@@ -29,6 +29,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlsplit(self.path)
+        if parsed.path == "/favicon.ico":
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.end_headers()
+            return
         if parsed.path in STATIC_FILES:
             self._serve_static(parsed.path)
             return
@@ -152,10 +157,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 max_worker_attempts=max_worker_attempts,
                 max_lead_attempts=max_lead_attempts,
             )
+            try:
+                daemon = ensure_daemon(self.team_service.settings)
+            except Exception as exc:
+                try:
+                    cluster.set_goal_status(
+                        goal["goal_id"],
+                        "failed",
+                        reason=f"daemon start failed: {exc}",
+                    )
+                finally:
+                    raise ClusterError(
+                        f"goal created but cluster daemon failed to start: {exc}"
+                    ) from exc
             self._send_json(
                 {
                     "goal": goal,
-                    "daemon": ensure_daemon(self.team_service.settings),
+                    "daemon": daemon,
                 }
             )
         except TeamError as exc:

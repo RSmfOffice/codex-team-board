@@ -798,7 +798,7 @@ class TeamService:
             for task in tasks:
                 task["active_job"] = active_jobs_by_task.get(task["task_id"])
                 wait_seconds = 0
-                if task["status"] == "ready":
+                if task["status"] == "ready" and not task["blocked_by"]:
                     try:
                         created = datetime.fromisoformat(
                             str(task["created_at"]).replace("Z", "+00:00")

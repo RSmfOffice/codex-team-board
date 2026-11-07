@@ -569,7 +569,6 @@ function buildBoardSignature(data) {
   delete normalized.generated_at;
   for (const task of normalized.tasks || []) {
     delete task.claim_wait_seconds;
-    delete task.claim_wait_state;
   }
   return JSON.stringify(normalized);
 }

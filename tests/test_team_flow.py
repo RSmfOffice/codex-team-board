@@ -430,6 +430,11 @@ class TeamFlowTests(unittest.TestCase):
         try:
             port = server.server_address[1]
             with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/favicon.ico",
+                timeout=5,
+            ) as response:
+                self.assertEqual(response.status, 204)
+            with urllib.request.urlopen(
                 f"http://127.0.0.1:{port}/api/board",
                 timeout=5,
             ) as response:
@@ -547,6 +552,38 @@ class TeamFlowTests(unittest.TestCase):
         )
         self.assertEqual(saved["claim_wait_state"], "critical")
         self.assertGreaterEqual(saved["claim_wait_seconds"], 300)
+
+    def test_dependency_blocked_task_does_not_trigger_claim_warning(self) -> None:
+        dependency = self.team.create_task(
+            self.repo,
+            title="Dependency",
+            description="Must finish first.",
+            acceptance="dependency completes",
+            kind="read",
+            owner_role="team_explorer",
+        )
+        blocked = self.team.create_task(
+            self.repo,
+            title="Dependency blocked",
+            description="Must not be treated as unclaimed.",
+            acceptance="wait state remains normal",
+            kind="review",
+            owner_role="team_reviewer",
+            depends_on=[dependency["task_id"]],
+        )
+        with self.team.connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET created_at = ? WHERE task_id = ?",
+                ("2000-01-01T00:00:00Z", blocked["task_id"]),
+            )
+        saved = next(
+            item
+            for item in self.team.dashboard_snapshot()["tasks"]
+            if item["task_id"] == blocked["task_id"]
+        )
+        self.assertEqual(len(saved["blocked_by"]), 1)
+        self.assertEqual(saved["claim_wait_seconds"], 0)
+        self.assertEqual(saved["claim_wait_state"], "normal")
 
     def test_dashboard_cluster_summary_and_attention_thresholds(self) -> None:
         manager = ClusterManager(

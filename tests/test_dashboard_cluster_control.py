@@ -10,7 +10,7 @@ import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
-from codex_team.cluster import ClusterManager
+from codex_team.cluster import ClusterError, ClusterManager
 from codex_team.config import Settings
 from codex_team.dashboard import build_server
 from codex_team.service import TeamService
@@ -161,6 +161,35 @@ class DashboardClusterControlTests(unittest.TestCase):
             self.assertEqual(canceled["goal"]["status"], "failed")
             self.assertIn("cancel requested", canceled["goal"]["last_error"])
             current_daemon.assert_called()
+            status, invalid_resume = self.post(
+                "/api/clusters/control",
+                {"goal_id": goal["goal_id"], "action": "resume"},
+            )
+            self.assertEqual(status, 409)
+            self.assertIn("invalid goal transition", invalid_resume["error"])
+
+    def test_daemon_start_failure_marks_goal_failed(self) -> None:
+        with patch(
+            "codex_team.dashboard.ensure_daemon",
+            side_effect=ClusterError("daemon unavailable"),
+        ):
+            status, body = self.post(
+                "/api/clusters",
+                {
+                    "project_id": self.project["project_id"],
+                    "objective": "Daemon failure rollback",
+                },
+            )
+        self.assertEqual(status, 409)
+        self.assertIn("failed to start", body["error"])
+        board = self.get("/api/board")
+        failed = next(
+            goal
+            for goal in board["cluster_goals"]
+            if goal["objective"] == "Daemon failure rollback"
+        )
+        self.assertEqual(failed["status"], "failed")
+        self.assertIn("daemon start failed", failed["last_error"])
 
     def test_archived_project_is_rejected_before_starting_daemon(self) -> None:
         self.team.set_project_archived(self.project["project_id"], True)

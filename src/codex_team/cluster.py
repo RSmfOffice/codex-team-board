@@ -22,6 +22,13 @@ from .worktrees import WorktreeManager
 TERMINAL_GOAL_STATUSES = frozenset({"completed", "failed"})
 ACTIVE_JOB_STATUSES = frozenset({"starting", "running"})
 TERMINAL_TASK_STATUSES = frozenset({"done", "canceled"})
+GOAL_STATUS_TRANSITIONS = {
+    "planning": frozenset({"active", "paused", "failed"}),
+    "active": frozenset({"paused", "completed", "failed"}),
+    "paused": frozenset({"active", "failed"}),
+    "completed": frozenset(),
+    "failed": frozenset(),
+}
 WORKER_TIMEOUT_SECONDS = 30 * 60
 LEAD_TIMEOUT_SECONDS = 20 * 60
 _CLAIM_TOKEN_RE = re.compile(
@@ -169,6 +176,28 @@ class ClusterManager:
             ).fetchone()
             if row is None:
                 raise ClusterError(f"cluster goal not found: {goal_id}")
+            current_status = row["status"]
+            if (
+                status != current_status
+                and status not in GOAL_STATUS_TRANSITIONS[current_status]
+            ):
+                raise ClusterError(
+                    f"invalid goal transition: {current_status} -> {status}"
+                )
+            if status == "active":
+                competing = connection.execute(
+                    """
+                    SELECT goal_id FROM cluster_goals
+                    WHERE project_id = ? AND goal_id != ?
+                      AND status IN ('planning', 'active')
+                    LIMIT 1
+                    """,
+                    (row["project_id"], goal_id),
+                ).fetchone()
+                if competing:
+                    raise ClusterError(
+                        f"project already has active goal: {competing['goal_id']}"
+                    )
             connection.execute(
                 """
                 UPDATE cluster_goals
