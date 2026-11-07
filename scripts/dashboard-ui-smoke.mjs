@@ -58,6 +58,34 @@ expectText(app, "goal?.next_action", "app.js");
 expectText(app, 'allLabel: "选择目标项目"', "app.js");
 expectText(css, ".cluster-card.attention", "style.css");
 expectText(css, ".cluster-actions", "style.css");
+expectText(css, ".cluster-card.heartbeat-warning", "style.css");
+expectText(css, ".cluster-card.heartbeat-critical", "style.css");
+expectText(css, ".cluster-diagnostic.heartbeat-warning", "style.css");
+expectText(css, ".cluster-diagnostic.heartbeat-critical", "style.css");
+for (const field of [
+  "global_jobs",
+  "global_capacity",
+  "queued_goals",
+  "heartbeat_overdue",
+  "oldest_heartbeat_age_seconds",
+  "fairness_wait_count",
+  "active_job_count",
+  "heartbeat_state",
+  "heartbeat_age_seconds",
+  "queue_reason",
+  "estimated_wait_seconds",
+]) {
+  expectText(app, field, "app.js");
+}
+
+const clusterSummaryCss = between(
+  css,
+  ".cluster-summary {",
+  ".cluster-metric {",
+);
+expectText(clusterSummaryCss, "repeat(8, minmax(0, 1fr))", "cluster metrics");
+const boardCss = between(css, ".board {", ".lane {");
+expectText(boardCss, "repeat(5, minmax(0, 1fr))", "board layout");
 
 expectPattern(app, /function\s+buildBoardSignature\s*\(/, "app.js");
 expectPattern(app, /function\s+schedulePoll\s*\(/, "app.js");
@@ -170,39 +198,103 @@ const firstBoard = {
   messages: [],
   events: [],
   cluster_summary: {
-    total_goals: 3,
-    active_goals: 1,
-    paused_goals: 1,
-    attention_goals: 1,
+    goals_total: 3,
+    goals_active: 2,
+    goals_paused: 1,
+    goals_failed: 0,
+    active_jobs: 3,
     active_workers: 2,
+    attention_count: 2,
+    global_jobs: 3,
+    global_capacity: 4,
+    queued_goals: 2,
+    heartbeat_overdue: 2,
+    oldest_heartbeat_age_seconds: 960,
+    fairness_wait_count: 1,
   },
-  cluster_goals: [{
-    goal_id: "G-1",
-    status: "active",
-    objective: "验证集群状态渲染",
-    project_name: "Demo",
-    autonomy: "auto",
-    lead_ticks: 2,
-    health: { state: "attention", label: "Worker 连续失败" },
-    next_action: { action: "重试 Worker 或检查日志" },
-  }],
-  cluster_jobs: [{
-    goal_id: "G-1",
-    kind: "worker",
-    role: "team_worker",
-    status: "running",
-    pid: 4321,
-  }],
+  cluster_goals: [
+    {
+      goal_id: "G-WARNING",
+      status: "active",
+      objective: "验证两个并发目标的警告心跳与全局容量队列",
+      project_name: "Demo",
+      autonomy: "auto",
+      lead_ticks: 2,
+      health: { state: "warning", label: "Worker 心跳延迟" },
+      next_action: { action: "检查 Worker 进度" },
+      active_job_count: 2,
+      heartbeat_state: "warning",
+      heartbeat_age_seconds: 320,
+      queue_reason: "global_capacity",
+      estimated_wait_seconds: 120,
+    },
+    {
+      goal_id: "G-CRITICAL",
+      status: "active",
+      objective: "验证关键心跳、目标容量排队与完整卡片展示",
+      project_name: "Demo",
+      autonomy: "supervised",
+      lead_ticks: 5,
+      health: { state: "critical", label: "心跳严重超时" },
+      next_action: { action: "排查卡住的 Worker" },
+      active_job_count: 1,
+      heartbeat_state: "critical",
+      heartbeat_age_seconds: 960,
+      queue_reason: "goal_capacity",
+      estimated_wait_seconds: 300,
+    },
+    {
+      goal_id: "G-PAUSED",
+      status: "paused",
+      objective: "保留暂停目标控制",
+      project_name: "Demo",
+      autonomy: "supervised",
+      lead_ticks: 1,
+      active_job_count: 0,
+      heartbeat_state: "idle",
+      heartbeat_age_seconds: 0,
+      queue_reason: "none",
+      estimated_wait_seconds: 0,
+    },
+  ],
+  cluster_jobs: [
+    {
+      goal_id: "G-WARNING",
+      kind: "lead",
+      role: "team_lead",
+      status: "running",
+      pid: 4320,
+    },
+    {
+      goal_id: "G-WARNING",
+      kind: "worker",
+      role: "team_worker",
+      status: "running",
+      pid: 4321,
+    },
+    {
+      goal_id: "G-CRITICAL",
+      kind: "worker",
+      role: "team_worker",
+      status: "starting",
+      pid: 4322,
+    },
+  ],
 };
 const secondBoard = JSON.parse(JSON.stringify(firstBoard));
 secondBoard.generated_at = "2026-11-07T10:00:02Z";
 secondBoard.tasks[0].claim_wait_seconds = 64;
 secondBoard.tasks[0].claim_wait_state = "warning";
+secondBoard.cluster_summary.oldest_heartbeat_age_seconds = 962;
+secondBoard.cluster_goals[0].heartbeat_age_seconds = 322;
+secondBoard.cluster_goals[0].estimated_wait_seconds = 122;
+secondBoard.cluster_goals[1].heartbeat_age_seconds = 962;
+secondBoard.cluster_goals[1].estimated_wait_seconds = 302;
 
 assert.equal(
   hooks.buildBoardSignature(firstBoard),
   hooks.buildBoardSignature(secondBoard),
-  "generated time and claim-age-only changes must not force a redraw",
+  "generated time and age-only changes must not force a redraw",
 );
 const thresholdBoard = JSON.parse(JSON.stringify(secondBoard));
 thresholdBoard.tasks[0].claim_wait_state = "critical";
@@ -211,16 +303,50 @@ assert.notEqual(
   hooks.buildBoardSignature(thresholdBoard),
   "claim-wait severity changes must trigger a redraw",
 );
+const heartbeatThresholdBoard = JSON.parse(JSON.stringify(secondBoard));
+heartbeatThresholdBoard.cluster_goals[0].heartbeat_state = "critical";
+assert.notEqual(
+  hooks.buildBoardSignature(firstBoard),
+  hooks.buildBoardSignature(heartbeatThresholdBoard),
+  "heartbeat severity changes must trigger a redraw",
+);
 
 assert.equal(hooks.renderBoard(firstBoard), true, "first board should render");
 const clusterHtmlBefore = fakeElements.get("cluster-overview").innerHTML;
-assert.match(
-  fakeElements.get("cluster-summary").innerHTML,
-  /data-metric="attention"/,
+const summaryHtml = fakeElements.get("cluster-summary").innerHTML;
+assert.match(summaryHtml, /data-metric="jobs"/);
+assert.match(summaryHtml, /data-metric="queued"/);
+assert.match(summaryHtml, /data-metric="heartbeat-overdue"/);
+assert.match(summaryHtml, /3\/4/);
+assert.match(summaryHtml, /QUEUED/);
+assert.match(summaryHtml, /HB OVERDUE/);
+assert.match(summaryHtml, /公平等待 1/);
+assert.match(summaryHtml, /最老 16 分钟/);
+assert.match(summaryHtml, /data-metric="attention"/);
+assert.match(clusterHtmlBefore, /G-WARNING/);
+assert.match(clusterHtmlBefore, /G-CRITICAL/);
+assert.match(clusterHtmlBefore, /活动任务 2/);
+assert.match(clusterHtmlBefore, /心跳延迟/);
+assert.match(clusterHtmlBefore, /心跳超时/);
+assert.match(clusterHtmlBefore, /warning · 5 分钟/);
+assert.match(clusterHtmlBefore, /critical · 16 分钟/);
+assert.match(clusterHtmlBefore, /全局容量已满/);
+assert.match(clusterHtmlBefore, /目标容量已满/);
+assert.match(clusterHtmlBefore, /预计等待 2 分钟/);
+assert.match(clusterHtmlBefore, /预计等待 5 分钟/);
+assert.match(clusterHtmlBefore, /data-heartbeat-state="warning"/);
+assert.match(clusterHtmlBefore, /data-heartbeat-state="critical"/);
+assert.match(clusterHtmlBefore, /data-queue-reason="global_capacity"/);
+assert.match(clusterHtmlBefore, /data-queue-reason="goal_capacity"/);
+assert.match(clusterHtmlBefore, /class="cluster-card .*heartbeat-critical"/);
+assert.equal(
+  (clusterHtmlBefore.match(/data-control-action="pause"/g) || []).length,
+  2,
+  "both active goals must retain pause controls",
 );
 assert.match(clusterHtmlBefore, /需关注/);
-assert.match(clusterHtmlBefore, /Worker 连续失败/);
-assert.match(clusterHtmlBefore, /重试 Worker 或检查日志/);
+assert.match(clusterHtmlBefore, /Worker 心跳延迟/);
+assert.match(clusterHtmlBefore, /检查 Worker 进度/);
 assert.match(clusterHtmlBefore, /data-control-action="pause"/);
 assert.match(clusterHtmlBefore, /data-control-action="cancel"/);
 assert.equal(
@@ -235,11 +361,20 @@ assert.equal(
 );
 
 const meaningfulBoard = JSON.parse(JSON.stringify(secondBoard));
-meaningfulBoard.cluster_summary.attention_goals = 0;
+meaningfulBoard.cluster_summary.attention_count = 0;
+meaningfulBoard.cluster_summary.heartbeat_overdue = 0;
 meaningfulBoard.cluster_goals[0].health = {
   state: "healthy",
   label: "运行正常",
 };
+meaningfulBoard.cluster_goals[0].heartbeat_state = "normal";
+meaningfulBoard.cluster_goals[0].queue_reason = "running";
+meaningfulBoard.cluster_goals[1].health = {
+  state: "healthy",
+  label: "运行正常",
+};
+meaningfulBoard.cluster_goals[1].heartbeat_state = "normal";
+meaningfulBoard.cluster_goals[1].queue_reason = "running";
 assert.notEqual(
   hooks.buildBoardSignature(firstBoard),
   hooks.buildBoardSignature(meaningfulBoard),
@@ -251,12 +386,26 @@ assert.match(clusterHtmlAfter, /运行正常/);
 assert.doesNotMatch(clusterHtmlAfter, /需关注/);
 
 const pausedBoard = JSON.parse(JSON.stringify(meaningfulBoard));
-pausedBoard.cluster_summary.active_goals = 0;
-pausedBoard.cluster_summary.paused_goals = 1;
-pausedBoard.cluster_summary.attention_goals = 0;
-delete pausedBoard.cluster_goals[0].health;
-delete pausedBoard.cluster_goals[0].next_action;
-pausedBoard.cluster_goals[0].status = "paused";
+pausedBoard.cluster_summary.goals_active = 0;
+pausedBoard.cluster_summary.goals_paused = 2;
+pausedBoard.cluster_summary.active_jobs = 0;
+pausedBoard.cluster_summary.active_workers = 0;
+pausedBoard.cluster_summary.global_jobs = 0;
+pausedBoard.cluster_summary.queued_goals = 0;
+pausedBoard.cluster_summary.fairness_wait_count = 0;
+pausedBoard.cluster_summary.attention_count = 0;
+pausedBoard.cluster_summary.heartbeat_overdue = 0;
+pausedBoard.cluster_jobs = [];
+for (const goal of pausedBoard.cluster_goals.slice(0, 2)) {
+  delete goal.health;
+  delete goal.next_action;
+  goal.status = "paused";
+  goal.active_job_count = 0;
+  goal.heartbeat_state = "idle";
+  goal.heartbeat_age_seconds = 0;
+  goal.queue_reason = "none";
+  goal.estimated_wait_seconds = 0;
+}
 assert.equal(hooks.renderBoard(pausedBoard), true, "paused state should redraw");
 const pausedClusterHtml = fakeElements.get("cluster-overview").innerHTML;
 assert.match(pausedClusterHtml, /data-control-action="resume"/);
@@ -268,16 +417,86 @@ const metrics = Object.fromEntries(
   hooks.buildClusterMetrics(firstBoard).map(({ key, value }) => [key, value]),
 );
 assert.deepEqual(metrics, {
+  jobs: "3/4",
+  queued: 2,
+  "heartbeat-overdue": 2,
   goals: 3,
-  active: 1,
+  active: 2,
   paused: 1,
-  attention: 1,
+  attention: 2,
   workers: 2,
 });
+const compatibilityBoard = JSON.parse(JSON.stringify(firstBoard));
+delete compatibilityBoard.cluster_summary.active_workers;
+const compatibilityMetrics = Object.fromEntries(
+  hooks.buildClusterMetrics(compatibilityBoard)
+    .map(({ key, value }) => [key, value]),
+);
+assert.equal(
+  compatibilityMetrics.workers,
+  2,
+  "WORKERS must count worker jobs instead of all active lead/worker jobs",
+);
 assert.equal(hooks.goalHealth(firstBoard.cluster_goals[0]).attention, true);
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    hooks.goalHeartbeatInfo(firstBoard.cluster_goals[1]),
+  )),
+  { state: "critical", label: "心跳超时", tone: "critical" },
+);
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    hooks.goalQueueReason(firstBoard.cluster_goals[0]),
+  )),
+  { state: "global_capacity", label: "全局容量已满" },
+);
+assert.equal(hooks.waitDurationText(0), "0 秒");
+assert.equal(hooks.waitDurationText(125), "2 分钟");
+assert.equal(hooks.waitDurationText(undefined), "—");
+assert.deepEqual(
+  {
+    idle: hooks.goalHeartbeatInfo({ heartbeat_state: "idle" }).label,
+    normal: hooks.goalHeartbeatInfo({ heartbeat_state: "normal" }).label,
+    warning: hooks.goalHeartbeatInfo({ heartbeat_state: "warning" }).label,
+    critical: hooks.goalHeartbeatInfo({ heartbeat_state: "critical" }).label,
+  },
+  {
+    idle: "无活动心跳",
+    normal: "心跳正常",
+    warning: "心跳延迟",
+    critical: "心跳超时",
+  },
+);
+assert.deepEqual(
+  Object.fromEntries(
+    [
+      "running",
+      "review_pending",
+      "blocked",
+      "ready",
+      "global_capacity",
+      "goal_capacity",
+      "waiting_for_lead",
+      "none",
+    ].map((state) => [
+      state,
+      hooks.goalQueueReason({ queue_reason: state }).label,
+    ]),
+  ),
+  {
+    running: "运行中",
+    review_pending: "等待 Review",
+    blocked: "任务受阻",
+    ready: "等待调度",
+    global_capacity: "全局容量已满",
+    goal_capacity: "目标容量已满",
+    waiting_for_lead: "等待 Lead 规划",
+    none: "无排队",
+  },
+);
 assert.equal(
   hooks.nextActionText(firstBoard.cluster_goals[0]),
-  "重试 Worker 或检查日志",
+  "检查 Worker 进度",
 );
 assert.equal(
   hooks.goalHealth({ status: "active", last_error: "lead dispatch failed" }).attention,
