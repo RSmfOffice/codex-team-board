@@ -9,6 +9,7 @@ import urllib.request
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import patch
 
 from codex_team.config import Settings
 from codex_team.cli import build_parser
@@ -530,6 +531,17 @@ class TeamFlowTests(unittest.TestCase):
             if item["goal_id"] == goal["goal_id"]
         )
         self.assertEqual(saved["project_name"], self.repo.name)
+        self.assertEqual(saved["active_job_count"], 0)
+        self.assertEqual(saved["heartbeat_state"], "idle")
+        self.assertEqual(saved["heartbeat_age_seconds"], 0)
+        self.assertEqual(saved["queue_reason"], "waiting_for_lead")
+        self.assertGreaterEqual(saved["estimated_wait_seconds"], 0)
+        summary = dashboard["cluster_summary"]
+        self.assertEqual(summary["global_jobs"], 0)
+        self.assertGreaterEqual(summary["global_capacity"], 1)
+        self.assertEqual(summary["heartbeat_overdue"], 0)
+        self.assertEqual(summary["oldest_heartbeat_age_seconds"], 0)
+        self.assertEqual(summary["fairness_wait_count"], 0)
 
     def test_dashboard_flags_old_ready_task_for_claim_followup(self) -> None:
         task = self.team.create_task(
@@ -762,6 +774,282 @@ class TeamFlowTests(unittest.TestCase):
             goals_by_id["G-FAILED-TEST"]["next_action"],
             "inspect_failed_goal",
         )
+
+    def test_dashboard_cluster_capacity_queue_and_heartbeat_diagnostics(self) -> None:
+        manager = ClusterManager(
+            self.settings,
+            team=self.team,
+            worktrees=self.worktrees,
+        )
+        first_goal = manager.create_goal(
+            self.repo,
+            objective="First concurrent goal",
+            autonomy="auto",
+        )
+        manager.set_goal_status(first_goal["goal_id"], "active")
+        second_repo = self.base / "second-repo"
+        second_repo.mkdir()
+        git(second_repo, "init")
+        git(second_repo, "config", "user.email", "team-test@example.invalid")
+        git(second_repo, "config", "user.name", "Team Test")
+        (second_repo / "README.md").write_text("# Second\n", encoding="utf-8")
+        git(second_repo, "add", "README.md")
+        git(second_repo, "commit", "-m", "initial")
+        second_goal = manager.create_goal(
+            second_repo,
+            objective="Second concurrent goal",
+            autonomy="auto",
+        )
+        manager.set_goal_status(second_goal["goal_id"], "active")
+
+        critical_task = self.team.create_task(
+            self.repo,
+            title="Critical worker",
+            description="Uses an old claimed heartbeat.",
+            acceptance="reported critical",
+            kind="read",
+            owner_role="team_explorer",
+            goal_id=first_goal["goal_id"],
+        )
+        warning_task = self.team.create_task(
+            second_repo,
+            title="Warning worker",
+            description="Uses an old progress heartbeat.",
+            acceptance="reported warning",
+            kind="read",
+            owner_role="team_explorer",
+            goal_id=second_goal["goal_id"],
+        )
+        claimed_critical = self.team.claim_task(
+            critical_task["task_id"],
+            actor="critical-worker",
+        )
+        claimed_warning = self.team.claim_task(
+            warning_task["task_id"],
+            actor="warning-worker",
+        )
+        self.assertTrue(claimed_critical["claim_token"])
+        self.assertTrue(claimed_warning["claim_token"])
+
+        now = datetime.now(UTC)
+        critical_activity = (now - timedelta(seconds=1200)).isoformat().replace(
+            "+00:00",
+            "Z",
+        )
+        warning_activity = (now - timedelta(seconds=420)).isoformat().replace(
+            "+00:00",
+            "Z",
+        )
+        queue_activity = (now - timedelta(seconds=600)).isoformat().replace(
+            "+00:00",
+            "Z",
+        )
+        with self.team.connection() as connection:
+            connection.execute(
+                """
+                UPDATE task_events SET created_at = ?
+                WHERE task_id = ? AND event_type = 'claimed'
+                """,
+                (critical_activity, critical_task["task_id"]),
+            )
+            connection.execute(
+                """
+                UPDATE task_events SET created_at = ?
+                WHERE task_id = ? AND event_type = 'claimed'
+                """,
+                (critical_activity, warning_task["task_id"]),
+            )
+            connection.execute(
+                """
+                INSERT INTO task_events(
+                    task_id, event_type, actor, data_json, created_at
+                ) VALUES (?, 'progress', 'warning-worker', '{}', ?)
+                """,
+                (warning_task["task_id"], warning_activity),
+            )
+            job_rows = (
+                (
+                    "J-CRITICAL-WORKER",
+                    first_goal["goal_id"],
+                    critical_task["task_id"],
+                    "worker",
+                    "team_explorer",
+                    now.isoformat().replace("+00:00", "Z"),
+                ),
+                (
+                    "J-WARNING-WORKER",
+                    second_goal["goal_id"],
+                    warning_task["task_id"],
+                    "worker",
+                    "team_explorer",
+                    now.isoformat().replace("+00:00", "Z"),
+                ),
+                (
+                    "J-LEAD-NORMAL",
+                    second_goal["goal_id"],
+                    None,
+                    "lead",
+                    "lead",
+                    (now - timedelta(seconds=180))
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                ),
+            )
+            for job_id, goal_id, task_id, kind, role, started_at in job_rows:
+                connection.execute(
+                    """
+                    INSERT INTO cluster_jobs(
+                        job_id, goal_id, task_id, kind, role, status,
+                        log_path, output_path, started_at
+                    ) VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?)
+                    """,
+                    (
+                        job_id,
+                        goal_id,
+                        task_id,
+                        kind,
+                        role,
+                        str(self.base / f"{job_id}.log"),
+                        str(self.base / f"{job_id}.out"),
+                        started_at,
+                    ),
+                )
+
+        queue_task = self.team.create_task(
+            second_repo,
+            title="Queued task",
+            description="Changes waiting reason.",
+            acceptance="reason is reported",
+            kind="read",
+            owner_role="team_explorer",
+            goal_id=second_goal["goal_id"],
+        )
+        with self.team.connection() as connection:
+            connection.execute(
+                """
+                UPDATE tasks SET created_at = ?, updated_at = ?
+                WHERE task_id = ?
+                """,
+                (queue_activity, queue_activity, queue_task["task_id"]),
+            )
+
+        heartbeat_environment = {
+            "CODEX_TEAM_CLUSTER_MAX_JOBS": "4",
+            "CODEX_TEAM_CLUSTER_MAX_WORKERS": "3",
+            "CODEX_TEAM_HEARTBEAT_WARNING_SECONDS": "300",
+            "CODEX_TEAM_HEARTBEAT_CRITICAL_SECONDS": "900",
+        }
+        allowed_heartbeat_states = {"idle", "normal", "warning", "critical"}
+        allowed_queue_reasons = {
+            "running",
+            "review_pending",
+            "blocked",
+            "ready",
+            "global_capacity",
+            "goal_capacity",
+            "waiting_for_lead",
+            "none",
+        }
+        with patch.dict("os.environ", heartbeat_environment):
+            for task_status, expected_reason in (
+                ("review", "review_pending"),
+                ("blocked", "blocked"),
+                ("ready", "ready"),
+            ):
+                with self.team.connection() as connection:
+                    connection.execute(
+                        """
+                        UPDATE tasks SET status = ?, updated_at = ?
+                        WHERE task_id = ?
+                        """,
+                        (task_status, queue_activity, queue_task["task_id"]),
+                    )
+                dashboard = self.team.dashboard_snapshot()
+                summary = dashboard["cluster_summary"]
+                self.assertEqual(summary["global_jobs"], 3)
+                self.assertEqual(summary["global_capacity"], 4)
+                self.assertEqual(summary["heartbeat_overdue"], 2)
+                self.assertGreaterEqual(
+                    summary["oldest_heartbeat_age_seconds"],
+                    1200,
+                )
+                self.assertEqual(summary["fairness_wait_count"], 0)
+                self.assertEqual(summary["queued_goals"], 1)
+                for field, minimum in (
+                    ("global_jobs", 0),
+                    ("global_capacity", 1),
+                    ("queued_goals", 0),
+                    ("heartbeat_overdue", 0),
+                    ("oldest_heartbeat_age_seconds", 0),
+                    ("fairness_wait_count", 0),
+                ):
+                    self.assertIsInstance(summary[field], int)
+                    self.assertGreaterEqual(summary[field], minimum)
+                goals = {
+                    goal["goal_id"]: goal for goal in dashboard["cluster_goals"]
+                }
+                first = goals[first_goal["goal_id"]]
+                second = goals[second_goal["goal_id"]]
+                self.assertEqual(first["active_job_count"], 1)
+                self.assertEqual(first["heartbeat_state"], "critical")
+                self.assertGreaterEqual(first["heartbeat_age_seconds"], 1200)
+                self.assertEqual(first["queue_reason"], "running")
+                self.assertEqual(second["active_job_count"], 2)
+                self.assertEqual(second["heartbeat_state"], "warning")
+                self.assertGreaterEqual(second["heartbeat_age_seconds"], 420)
+                self.assertEqual(second["queue_reason"], expected_reason)
+                self.assertGreaterEqual(second["estimated_wait_seconds"], 590)
+                for goal in dashboard["cluster_goals"]:
+                    self.assertIn(
+                        goal["heartbeat_state"],
+                        allowed_heartbeat_states,
+                    )
+                    self.assertIn(goal["queue_reason"], allowed_queue_reasons)
+                    for field in (
+                        "active_job_count",
+                        "heartbeat_age_seconds",
+                        "estimated_wait_seconds",
+                    ):
+                        self.assertIsInstance(goal[field], int)
+                        self.assertGreaterEqual(goal[field], 0)
+
+            with patch.dict(
+                "os.environ",
+                {
+                    "CODEX_TEAM_CLUSTER_MAX_JOBS": "3",
+                    "CODEX_TEAM_CLUSTER_MAX_WORKERS": "1",
+                },
+            ):
+                dashboard = self.team.dashboard_snapshot()
+                capacity_goal = next(
+                    goal
+                    for goal in dashboard["cluster_goals"]
+                    if goal["goal_id"] == second_goal["goal_id"]
+                )
+                self.assertEqual(capacity_goal["queue_reason"], "global_capacity")
+                self.assertEqual(
+                    dashboard["cluster_summary"]["fairness_wait_count"],
+                    1,
+                )
+
+            with patch.dict(
+                "os.environ",
+                {
+                    "CODEX_TEAM_CLUSTER_MAX_JOBS": "4",
+                    "CODEX_TEAM_CLUSTER_MAX_WORKERS": "1",
+                },
+            ):
+                dashboard = self.team.dashboard_snapshot()
+                capacity_goal = next(
+                    goal
+                    for goal in dashboard["cluster_goals"]
+                    if goal["goal_id"] == second_goal["goal_id"]
+                )
+                self.assertEqual(capacity_goal["queue_reason"], "goal_capacity")
+                self.assertEqual(
+                    dashboard["cluster_summary"]["fairness_wait_count"],
+                    0,
+                )
 
     def test_mcp_handoff_flow(self) -> None:
         create_tool = next(

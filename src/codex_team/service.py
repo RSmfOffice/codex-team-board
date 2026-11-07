@@ -13,6 +13,13 @@ from typing import Any, Iterator
 
 from .config import Settings
 from .db import connect, connect_readonly, utc_now
+from .scheduling import (
+    DEFAULT_GLOBAL_JOB_CAPACITY,
+    DEFAULT_GOAL_WORKER_CAPACITY,
+    DEFAULT_HEARTBEAT_CRITICAL_SECONDS,
+    DEFAULT_HEARTBEAT_WARNING_SECONDS,
+    env_int,
+)
 
 TERMINAL_STATUSES = frozenset({"done", "canceled"})
 ACTIVE_STATUSES = frozenset({"ready", "running", "review", "blocked"})
@@ -613,6 +620,25 @@ class TeamService:
         *,
         include_archived: bool = False,
     ) -> dict[str, Any]:
+        global_capacity = env_int(
+            "CODEX_TEAM_CLUSTER_MAX_JOBS",
+            DEFAULT_GLOBAL_JOB_CAPACITY,
+        )
+        goal_capacity = env_int(
+            "CODEX_TEAM_CLUSTER_MAX_WORKERS",
+            DEFAULT_GOAL_WORKER_CAPACITY,
+        )
+        heartbeat_warning_seconds = env_int(
+            "CODEX_TEAM_HEARTBEAT_WARNING_SECONDS",
+            DEFAULT_HEARTBEAT_WARNING_SECONDS,
+        )
+        heartbeat_critical_seconds = max(
+            heartbeat_warning_seconds,
+            env_int(
+                "CODEX_TEAM_HEARTBEAT_CRITICAL_SECONDS",
+                DEFAULT_HEARTBEAT_CRITICAL_SECONDS,
+            ),
+        )
         with self.connection(write=False) as connection:
             if project_id:
                 project_rows = connection.execute(
@@ -780,6 +806,31 @@ class TeamService:
                 task.pop("claim_token", None)
                 task["blocked_by"] = blocked_by.get(task["task_id"], [])
                 task["lease_expired"] = self._lease_expired(task.get("lease_until"))
+            if project_id:
+                active_job_rows = connection.execute(
+                    """
+                    SELECT j.*, g.objective
+                    FROM cluster_jobs j
+                    JOIN cluster_goals g ON g.goal_id = j.goal_id
+                    WHERE g.project_id = ?
+                      AND j.status IN ('starting', 'running')
+                    ORDER BY j.started_at, j.job_id
+                    """,
+                    (project_id,),
+                ).fetchall()
+            else:
+                active_job_rows = connection.execute(
+                    f"""
+                    SELECT j.*, g.objective
+                    FROM cluster_jobs j
+                    JOIN cluster_goals g ON g.goal_id = j.goal_id
+                    JOIN projects p ON p.project_id = g.project_id
+                    WHERE j.status IN ('starting', 'running')
+                    {archive_filter}
+                    ORDER BY j.started_at, j.job_id
+                    """
+                ).fetchall()
+            active_jobs = [dict(row) for row in active_job_rows]
             active_jobs_by_task = {
                 job["task_id"]: {
                     "job_id": job["job_id"],
@@ -790,11 +841,70 @@ class TeamService:
                     "attempt": job.get("attempt"),
                     "started_at": job.get("started_at"),
                 }
-                for job in cluster_jobs
+                for job in active_jobs
                 if job.get("task_id")
-                and job.get("status") in {"starting", "running"}
             }
+            active_jobs_by_goal: dict[str, list[dict[str, Any]]] = {}
+            active_worker_jobs_by_goal: dict[str, list[dict[str, Any]]] = {}
+            active_task_ids: list[str] = []
+            for job in active_jobs:
+                goal_id = job.get("goal_id")
+                if goal_id:
+                    active_jobs_by_goal.setdefault(goal_id, []).append(job)
+                    if job.get("kind") == "worker":
+                        active_worker_jobs_by_goal.setdefault(goal_id, []).append(job)
+                task_id = job.get("task_id")
+                if task_id:
+                    active_task_ids.append(task_id)
+            latest_task_activity: dict[str, str] = {}
+            if active_task_ids:
+                placeholders = ",".join("?" for _ in active_task_ids)
+                activity_rows = connection.execute(
+                    f"""
+                    SELECT e.task_id, e.created_at
+                    FROM task_events e
+                    WHERE e.task_id IN ({placeholders})
+                      AND e.event_type IN ('claimed', 'heartbeat', 'progress')
+                    ORDER BY e.task_id, e.created_at DESC, e.event_id DESC
+                    """,
+                    active_task_ids,
+                ).fetchall()
+                for row in activity_rows:
+                    latest_task_activity.setdefault(
+                        str(row["task_id"]),
+                        str(row["created_at"]),
+                    )
             now_utc = datetime.now(UTC)
+
+            def age_seconds(value: str | None) -> int:
+                if not value:
+                    return 0
+                try:
+                    parsed = datetime.fromisoformat(
+                        str(value).replace("Z", "+00:00")
+                    )
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=UTC)
+                except (TypeError, ValueError):
+                    return 0
+                return max(0, int((now_utc - parsed).total_seconds()))
+
+            def heartbeat_state(age: int) -> str:
+                if age >= heartbeat_critical_seconds:
+                    return "critical"
+                if age >= heartbeat_warning_seconds:
+                    return "warning"
+                return "normal"
+
+            job_heartbeat_ages: dict[str, int] = {}
+            for job in active_jobs:
+                heartbeat_at = job.get("started_at")
+                if job.get("kind") == "worker" and job.get("task_id"):
+                    heartbeat_at = latest_task_activity.get(
+                        str(job["task_id"]),
+                        heartbeat_at,
+                    )
+                job_heartbeat_ages[str(job["job_id"])] = age_seconds(heartbeat_at)
             for task in tasks:
                 task["active_job"] = active_jobs_by_task.get(task["task_id"])
                 wait_seconds = 0
@@ -814,6 +924,11 @@ class TeamService:
                     if wait_seconds >= CLAIM_WAIT_WARNING_SECONDS
                     else "normal"
                 )
+            tasks_by_goal: dict[str, list[dict[str, Any]]] = {}
+            for task in tasks:
+                goal_id = task.get("goal_id")
+                if goal_id:
+                    tasks_by_goal.setdefault(str(goal_id), []).append(task)
             goal_states: dict[str, dict[str, Any]] = {}
             attention_count = 0
             for task in tasks:
@@ -859,9 +974,8 @@ class TeamService:
                 state["has_running"] = state["has_running"] or task_status == "running"
             active_goal_ids = {
                 job["goal_id"]
-                for job in cluster_jobs
+                for job in active_jobs
                 if job.get("goal_id")
-                and job.get("status") in {"starting", "running"}
             }
             for goal in cluster_goals:
                 state = goal_states.get(goal["goal_id"], {})
@@ -916,6 +1030,94 @@ class TeamService:
                     goal["next_action"] = "none"
                 else:
                     goal["next_action"] = "monitor_goal"
+                goal_jobs = active_jobs_by_goal.get(goal["goal_id"], [])
+                goal["active_job_count"] = len(goal_jobs)
+                goal_heartbeat_age = max(
+                    (
+                        job_heartbeat_ages[str(job["job_id"])]
+                        for job in goal_jobs
+                    ),
+                    default=0,
+                )
+                goal["heartbeat_age_seconds"] = goal_heartbeat_age
+                goal["heartbeat_state"] = (
+                    heartbeat_state(goal_heartbeat_age)
+                    if goal_jobs
+                    else "idle"
+                )
+                goal_tasks = tasks_by_goal.get(goal["goal_id"], [])
+                review_tasks = [
+                    task for task in goal_tasks if task["status"] == "review"
+                ]
+                blocked_tasks = [
+                    task for task in goal_tasks if task["status"] == "blocked"
+                ]
+                ready_tasks = [
+                    task for task in goal_tasks if task["status"] == "ready"
+                ]
+                dispatchable_ready = [
+                    task for task in ready_tasks if not task["blocked_by"]
+                ]
+                active_worker_jobs = active_worker_jobs_by_goal.get(
+                    goal["goal_id"],
+                    [],
+                )
+                if goal_status not in {"planning", "active"}:
+                    queue_reason = "none"
+                elif (
+                    len(active_jobs) >= global_capacity
+                    and dispatchable_ready
+                ):
+                    queue_reason = "global_capacity"
+                elif (
+                    len(active_worker_jobs) >= goal_capacity
+                    and dispatchable_ready
+                ):
+                    queue_reason = "goal_capacity"
+                elif review_tasks:
+                    queue_reason = "review_pending"
+                elif blocked_tasks:
+                    queue_reason = "blocked"
+                elif ready_tasks:
+                    queue_reason = "ready"
+                elif goal_jobs or any(
+                    task["status"] == "running" for task in goal_tasks
+                ):
+                    queue_reason = "running"
+                elif goal_status == "planning" or not goal_jobs:
+                    queue_reason = "waiting_for_lead"
+                else:
+                    queue_reason = "none"
+                goal["queue_reason"] = queue_reason
+                if queue_reason in {"global_capacity", "goal_capacity"}:
+                    wait_tasks = dispatchable_ready
+                    wait_field = "created_at"
+                elif queue_reason == "review_pending":
+                    wait_tasks = review_tasks
+                    wait_field = "updated_at"
+                elif queue_reason == "blocked":
+                    wait_tasks = blocked_tasks
+                    wait_field = "updated_at"
+                elif queue_reason == "ready":
+                    wait_tasks = ready_tasks
+                    wait_field = "created_at"
+                elif queue_reason == "waiting_for_lead":
+                    wait_tasks = []
+                    wait_field = "updated_at"
+                else:
+                    wait_tasks = []
+                    wait_field = "updated_at"
+                goal["estimated_wait_seconds"] = max(
+                    (
+                        age_seconds(task.get(wait_field))
+                        for task in wait_tasks
+                    ),
+                    default=(
+                        age_seconds(goal.get("updated_at"))
+                        if queue_reason == "waiting_for_lead"
+                        else 0
+                    ),
+                )
                 if goal_status in {"paused", "failed"}:
                     attention_count += 1
             messages = [dict(row) for row in reversed(message_rows)]
@@ -978,9 +1180,27 @@ class TeamService:
                 "running_tasks": counts.get("running", 0),
                 "review_tasks": counts.get("review", 0),
                 "blocked_tasks": counts.get("blocked", 0),
-                "active_jobs": sum(
-                    job.get("status") in {"starting", "running"}
-                    for job in cluster_jobs
+                "active_jobs": len(active_jobs),
+                "global_jobs": len(active_jobs),
+                "global_capacity": global_capacity,
+                "queued_goals": sum(
+                    goal["status"] in {"planning", "active"}
+                    and goal["queue_reason"]
+                    not in {"running", "none"}
+                    for goal in cluster_goals
+                ),
+                "heartbeat_overdue": sum(
+                    age >= heartbeat_warning_seconds
+                    for age in job_heartbeat_ages.values()
+                ),
+                "oldest_heartbeat_age_seconds": max(
+                    job_heartbeat_ages.values(),
+                    default=0,
+                ),
+                "fairness_wait_count": sum(
+                    goal["status"] in {"planning", "active"}
+                    and goal["queue_reason"] == "global_capacity"
+                    for goal in cluster_goals
                 ),
                 "attention_count": attention_count,
                 "oldest_claim_wait_seconds": max(
