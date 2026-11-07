@@ -9,9 +9,10 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from . import __version__
+from .cluster import ClusterManager, daemon_status, ensure_daemon
 from .config import Settings
-from .service import TeamError, TeamService
 from .db import utc_now
+from .service import TeamError, TeamService
 
 WEB_ROOT = Path(__file__).resolve().parent / "web"
 STATIC_FILES = {
@@ -69,6 +70,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlsplit(self.path)
+        if parsed.path == "/api/clusters":
+            self._create_cluster_goal()
+            return
+        if parsed.path == "/api/clusters/control":
+            self._control_cluster_goal()
+            return
         if parsed.path not in {"/api/projects/archive", "/api/tasks/archive"}:
             self._send_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
             return
@@ -105,6 +112,119 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 {"error": str(exc)},
                 status=HTTPStatus.BAD_REQUEST,
             )
+
+    def _create_cluster_goal(self) -> None:
+        try:
+            payload = self._read_json()
+            project_id = self._required_text(payload, "project_id")
+            objective = self._required_text(payload, "objective")
+            autonomy = payload.get("autonomy", "auto")
+            if not isinstance(autonomy, str) or autonomy not in {
+                "auto",
+                "supervised",
+            }:
+                raise ValueError("autonomy must be auto or supervised")
+            max_worker_attempts = self._optional_integer(
+                payload,
+                "max_worker_attempts",
+                default=3,
+                minimum=1,
+                maximum=10,
+            )
+            max_lead_attempts = self._optional_integer(
+                payload,
+                "max_lead_attempts",
+                default=5,
+                minimum=1,
+                maximum=20,
+            )
+            project = self.team_service.get_project(project_id)
+            if project.get("archived_at"):
+                raise TeamError("project is archived; restore it before making changes")
+            cluster = ClusterManager(
+                self.team_service.settings,
+                team=self.team_service,
+            )
+            goal = cluster.create_goal(
+                project["root_path"],
+                objective=objective,
+                autonomy=autonomy,
+                max_worker_attempts=max_worker_attempts,
+                max_lead_attempts=max_lead_attempts,
+            )
+            self._send_json(
+                {
+                    "goal": goal,
+                    "daemon": ensure_daemon(self.team_service.settings),
+                }
+            )
+        except TeamError as exc:
+            self._send_json(
+                {"error": str(exc)},
+                status=HTTPStatus.CONFLICT,
+            )
+        except (OSError, ValueError) as exc:
+            self._send_json(
+                {"error": str(exc)},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+
+    def _control_cluster_goal(self) -> None:
+        try:
+            payload = self._read_json()
+            goal_id = self._required_text(payload, "goal_id")
+            action = payload.get("action")
+            statuses = {"pause": "paused", "resume": "active", "cancel": "failed"}
+            if not isinstance(action, str) or action not in statuses:
+                raise ValueError("action must be pause, resume, or cancel")
+            cluster = ClusterManager(
+                self.team_service.settings,
+                team=self.team_service,
+            )
+            goal = cluster.set_goal_status(
+                goal_id,
+                statuses[action],
+                reason=f"{action} requested through dashboard",
+            )
+            daemon = (
+                ensure_daemon(self.team_service.settings)
+                if action == "resume"
+                else daemon_status(self.team_service.settings)
+            )
+            self._send_json({"goal": goal, "daemon": daemon})
+        except TeamError as exc:
+            self._send_json(
+                {"error": str(exc)},
+                status=HTTPStatus.CONFLICT,
+            )
+        except (OSError, ValueError) as exc:
+            self._send_json(
+                {"error": str(exc)},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+
+    @staticmethod
+    def _required_text(payload: dict[str, object], key: str) -> str:
+        value = payload.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{key} is required")
+        return value.strip()
+
+    @staticmethod
+    def _optional_integer(
+        payload: dict[str, object],
+        key: str,
+        *,
+        default: int,
+        minimum: int,
+        maximum: int,
+    ) -> int:
+        value = payload.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{key} must be an integer")
+        if not minimum <= value <= maximum:
+            raise ValueError(f"{key} must be between {minimum} and {maximum}")
+        return value
 
     def _read_json(self) -> dict[str, object]:
         length = int(self.headers.get("Content-Length", "0"))

@@ -1,0 +1,241 @@
+from __future__ import annotations
+
+import json
+import subprocess
+import tempfile
+import threading
+import unittest
+import urllib.error
+import urllib.request
+from pathlib import Path
+from unittest.mock import patch
+
+from codex_team.cluster import ClusterManager
+from codex_team.config import Settings
+from codex_team.dashboard import build_server
+from codex_team.service import TeamService
+
+
+def git(cwd: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if result.returncode != 0:
+        raise AssertionError(result.stderr)
+    return result.stdout.strip()
+
+
+class DashboardClusterControlTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary.name)
+        self.repo = self.base / "repo"
+        self.repo.mkdir()
+        git(self.repo, "init")
+        git(self.repo, "config", "user.email", "dashboard-test@example.invalid")
+        git(self.repo, "config", "user.name", "Dashboard Test")
+        (self.repo / "README.md").write_text("# Dashboard test\n", encoding="utf-8")
+        git(self.repo, "add", "README.md")
+        git(self.repo, "commit", "-m", "initial")
+        self.settings = Settings(
+            project_root=Path(__file__).resolve().parents[1],
+            home=self.base / "team-home",
+            db_path=self.base / "team-home" / "team.sqlite",
+            logs_dir=self.base / "team-home" / "logs",
+        )
+        self.team = TeamService(self.settings)
+        self.project = self.team.init_project(self.repo)
+        git(self.repo, "add", ".codex", "AGENTS.md")
+        git(self.repo, "commit", "-m", "initialize team policy")
+        self.server = build_server(self.settings, port=0)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base_url = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+        self.temporary.cleanup()
+
+    def post(self, path: str, payload: object) -> tuple[int, dict[str, object]]:
+        request = urllib.request.Request(
+            self.base_url + path,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            try:
+                return exc.code, json.loads(exc.read().decode("utf-8"))
+            finally:
+                exc.close()
+
+    def get(self, path: str) -> dict[str, object]:
+        with urllib.request.urlopen(self.base_url + path, timeout=5) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def test_create_cluster_goal_and_start_daemon(self) -> None:
+        daemon = {"running": True, "pid": 1234}
+        with patch(
+            "codex_team.dashboard.ensure_daemon",
+            return_value=daemon,
+        ) as start_daemon:
+            status, body = self.post(
+                "/api/clusters",
+                {
+                    "project_id": self.project["project_id"],
+                    "objective": "Build the release",
+                    "autonomy": "supervised",
+                    "max_worker_attempts": 4,
+                    "max_lead_attempts": 6,
+                },
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body["daemon"], daemon)
+        goal = body["goal"]
+        self.assertEqual(goal["project_id"], self.project["project_id"])
+        self.assertEqual(goal["objective"], "Build the release")
+        self.assertEqual(goal["autonomy"], "supervised")
+        self.assertEqual(goal["max_worker_attempts"], 4)
+        self.assertEqual(goal["max_lead_attempts"], 6)
+        start_daemon.assert_called_once_with(self.settings)
+
+    def test_control_cluster_goal_pause_resume_and_cancel(self) -> None:
+        cluster = ClusterManager(self.settings, team=self.team)
+        goal = cluster.create_goal(
+            self.repo,
+            objective="Control the release",
+            autonomy="auto",
+        )
+        daemon = {"running": True, "pid": 4321}
+        with (
+            patch(
+                "codex_team.dashboard.daemon_status",
+                return_value=daemon,
+            ) as current_daemon,
+            patch(
+                "codex_team.dashboard.ensure_daemon",
+                return_value=daemon,
+            ) as start_daemon,
+        ):
+            status, paused = self.post(
+                "/api/clusters/control",
+                {"goal_id": goal["goal_id"], "action": "pause"},
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(paused["goal"]["status"], "paused")
+            self.assertEqual(paused["daemon"], daemon)
+            start_daemon.assert_not_called()
+
+            status, resumed = self.post(
+                "/api/clusters/control",
+                {"goal_id": goal["goal_id"], "action": "resume"},
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(resumed["goal"]["status"], "active")
+            self.assertEqual(resumed["daemon"], daemon)
+            start_daemon.assert_called_once_with(self.settings)
+            board = self.get("/api/board")
+            board_goal = next(
+                item
+                for item in board["cluster_goals"]
+                if item["goal_id"] == goal["goal_id"]
+            )
+            self.assertEqual(board_goal["status"], "active")
+
+            status, canceled = self.post(
+                "/api/clusters/control",
+                {"goal_id": goal["goal_id"], "action": "cancel"},
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(canceled["goal"]["status"], "failed")
+            self.assertIn("cancel requested", canceled["goal"]["last_error"])
+            current_daemon.assert_called()
+
+    def test_archived_project_is_rejected_before_starting_daemon(self) -> None:
+        self.team.set_project_archived(self.project["project_id"], True)
+        with patch("codex_team.dashboard.ensure_daemon") as start_daemon:
+            status, body = self.post(
+                "/api/clusters",
+                {
+                    "project_id": self.project["project_id"],
+                    "objective": "Must not start",
+                },
+            )
+
+        self.assertEqual(status, 409)
+        self.assertIn("archived", body["error"])
+        start_daemon.assert_not_called()
+
+    def test_invalid_cluster_requests_return_json_errors(self) -> None:
+        requests = [
+            (
+                "/api/clusters",
+                {"project_id": self.project["project_id"]},
+            ),
+            (
+                "/api/clusters",
+                {
+                    "project_id": self.project["project_id"],
+                    "objective": "Invalid autonomy",
+                    "autonomy": "manual",
+                },
+            ),
+            (
+                "/api/clusters",
+                {
+                    "project_id": self.project["project_id"],
+                    "objective": "Invalid autonomy type",
+                    "autonomy": [],
+                },
+            ),
+            (
+                "/api/clusters",
+                {
+                    "project_id": self.project["project_id"],
+                    "objective": "Invalid attempts",
+                    "max_worker_attempts": 0,
+                },
+            ),
+            (
+                "/api/clusters/control",
+                {"goal_id": "G-MISSING", "action": "restart"},
+            ),
+        ]
+        with patch("codex_team.dashboard.ensure_daemon") as start_daemon:
+            for path, payload in requests:
+                with self.subTest(path=path, payload=payload):
+                    status, body = self.post(path, payload)
+                    self.assertGreaterEqual(status, 400)
+                    self.assertLess(status, 500)
+                    self.assertIn("error", body)
+            start_daemon.assert_not_called()
+
+    def test_malformed_json_returns_json_error(self) -> None:
+        request = urllib.request.Request(
+            self.base_url + "/api/clusters",
+            data=b"{",
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(request, timeout=5)
+        error = caught.exception
+        self.assertEqual(error.code, 400)
+        body = json.loads(error.read().decode("utf-8"))
+        error.close()
+        self.assertIn("error", body)
+
+
+if __name__ == "__main__":
+    unittest.main()
