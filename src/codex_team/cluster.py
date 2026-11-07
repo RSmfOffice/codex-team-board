@@ -1346,6 +1346,11 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
             kind,
             job_id=job_id,
         )
+        runtime_generation = (
+            self._current_runtime_generation()
+            if selected_runtime == "app_server"
+            else None
+        )
         runtime_error = (
             self._runtime_fallback_reason
             if self.agent_runtime == "app_server" and selected_runtime == "exec"
@@ -1361,8 +1366,9 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                 """
                 INSERT INTO cluster_jobs(
                     job_id, goal_id, task_id, kind, role, status,
-                    attempt, log_path, output_path, runtime, error, started_at
-                ) VALUES (?, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?)
+                    attempt, log_path, output_path, runtime,
+                    runtime_generation, error, started_at
+                ) VALUES (?, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -1374,6 +1380,7 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                     str(log_path),
                     str(output_path),
                     selected_runtime,
+                    runtime_generation,
                     runtime_error,
                     utc_now(),
                 ),
@@ -1390,6 +1397,7 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                     "role": role,
                     "attempt": attempt,
                     "runtime": selected_runtime,
+                    "runtime_generation": runtime_generation,
                     "resume_thread_id": resume_thread_id,
                     "sandbox_mode": sandbox_mode,
                 },
@@ -1523,6 +1531,7 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                 process.stdin.write(prompt)
                 process.stdin.close()
         except Exception as exc:
+            safe_error = self._redact_error(str(exc))
             with self.team.connection() as connection:
                 connection.execute(
                     """
@@ -1530,16 +1539,18 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                     SET status = 'failed', finished_at = ?, error = ?
                     WHERE job_id = ?
                     """,
-                    (utc_now(), str(exc), job_id),
+                    (utc_now(), safe_error, job_id),
                 )
                 self._event(
                     connection,
                     goal["goal_id"],
                     "job_start_failed",
                     "teamd",
-                    {"job_id": job_id, "error": str(exc)},
+                    {"job_id": job_id, "error": safe_error},
                 )
-            raise ClusterError(f"could not start {kind} process: {exc}") from exc
+            raise ClusterError(
+                f"could not start {kind} process: {safe_error}"
+            ) from exc
         self.processes[job_id] = process
         with self.team.connection() as connection:
             connection.execute(
@@ -1594,7 +1605,8 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                 """
                 UPDATE cluster_jobs
                 SET runtime = 'exec', status = 'starting', pid = NULL,
-                    thread_id = NULL, agent_id = NULL, turn_id = NULL, error = ?
+                    thread_id = NULL, agent_id = NULL, turn_id = NULL,
+                    runtime_generation = NULL, error = ?
                 WHERE job_id = ?
                 """,
                 (runtime_error, job_id),
@@ -1645,6 +1657,11 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
         if self.agent_runtime != "app_server":
             return "exec"
         reason = self._ensure_app_server_runtime(job_id)
+        if not reason and self._current_runtime_generation() is None:
+            reason = (
+                "App Server runtime is healthy but did not report a generation"
+            )
+            self._runtime_fallback_reason = reason
         if not reason:
             return "app_server"
         with self.team.connection() as connection:
@@ -1729,6 +1746,51 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
             return {}
         return health if isinstance(health, Mapping) else {}
 
+    def _current_runtime_generation(
+        self,
+        runtime: Any | None = None,
+    ) -> int | None:
+        selected_runtime = self.runtime if runtime is None else runtime
+        if selected_runtime is None:
+            return None
+        health = self._runtime_health(selected_runtime)
+        value: Any = health.get("generation")
+        if value is None:
+            try:
+                value = selected_runtime.generation
+            except Exception:
+                return None
+        return self._runtime_generation_value(value)
+
+    @staticmethod
+    def _runtime_generation_value(value: Any) -> int | None:
+        try:
+            generation = int(value)
+        except (TypeError, ValueError):
+            return None
+        return generation if generation >= 0 else None
+
+    def _record_app_turn_generation(
+        self,
+        job_id: str,
+        generation: int | None,
+    ) -> None:
+        if not job_id or generation is None:
+            return
+        with self._app_state_lock:
+            state = self.app_turns.get(job_id)
+            if state is not None:
+                state["runtime_generation"] = generation
+        with self.team.connection() as connection:
+            connection.execute(
+                """
+                UPDATE cluster_jobs
+                SET runtime_generation = ?
+                WHERE job_id = ?
+                """,
+                (generation, job_id),
+            )
+
     @staticmethod
     def _redact_error(message: str) -> str:
         return _redact_sensitive_log(str(message))
@@ -1811,12 +1873,30 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
         try:
             health = runtime.restart()
         except Exception as exc:
+            try:
+                self._lose_other_app_server_jobs(
+                    current_job_id=current_job_id,
+                    reason=f"{reason} after failed restart",
+                )
+            except Exception as isolation_error:
+                exc = ClusterError(
+                    f"{exc}; post-restart job isolation failed: "
+                    f"{isolation_error}"
+                )
             raise ClusterError(
                 self._app_server_failure(
                     f"restart failed: {self._redact_error(str(exc))}",
                     runtime,
                 )
             ) from exc
+        self._record_app_turn_generation(
+            current_job_id or "",
+            self._current_runtime_generation(runtime),
+        )
+        self._lose_other_app_server_jobs(
+            current_job_id=current_job_id,
+            reason=f"{reason} after restart",
+        )
         return health if isinstance(health, Mapping) else {}
 
     def _start_fresh_app_thread(
@@ -2068,10 +2148,16 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                 job_id,
                 None,
             )
+            runtime_generation = self._current_runtime_generation(runtime)
+            if runtime_generation is None:
+                raise _AppServerJobStartError(
+                    "App Server runtime did not report an active generation"
+                )
             with self._app_state_lock:
                 self.app_turns[job_id] = {
                     "thread_id": thread_id,
                     "turn_id": None,
+                    "runtime_generation": runtime_generation,
                     "status": "starting",
                     "usage": {},
                     "first_usage": {},
@@ -2085,10 +2171,16 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                 connection.execute(
                     """
                     UPDATE cluster_jobs
-                    SET status = 'running', thread_id = ?, agent_id = ?
+                    SET status = 'running', thread_id = ?, agent_id = ?,
+                        runtime_generation = ?
                     WHERE job_id = ?
                     """,
-                    (thread_id, agent["agent_id"], job_id),
+                    (
+                        thread_id,
+                        agent["agent_id"],
+                        runtime_generation,
+                        job_id,
+                    ),
                 )
             self._append_app_event(
                 log_path,
@@ -2098,6 +2190,7 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                     "thread_id": thread_id,
                     "agent_id": agent["agent_id"],
                     "runtime": "app_server",
+                    "runtime_generation": runtime_generation,
                 },
             )
             turn = self._start_app_turn_with_restart(
@@ -2114,9 +2207,10 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                 self.app_turns.pop(job_id, None)
             if agent is not None:
                 try:
+                    safe_error = self._redact_error(str(exc))
                     self.agent_pool.mark_failed(
                         str(agent["agent_id"]),
-                        f"App Server turn start failed: {exc}",
+                        f"App Server turn start failed: {safe_error}",
                         needs_reset=True,
                     )
                 except Exception:
@@ -2129,13 +2223,20 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
             if isinstance(exc, _AppServerJobStartError):
                 raise
             raise _AppServerJobStartError(
-                f"App Server job start failed: {exc}"
+                self._app_server_failure(
+                    f"App Server job start failed: "
+                    f"{self._redact_error(str(exc))}",
+                    runtime,
+                )
             ) from exc
         turn_id = turn["turn_id"]
+        active_generation = self._current_runtime_generation(runtime)
         with self._app_state_lock:
             state = self.app_turns.setdefault(job_id, {})
             state["thread_id"] = thread_id
             state["turn_id"] = turn_id
+            if active_generation is not None:
+                state["runtime_generation"] = active_generation
             if state.get("status") not in {"completed", "failed", "interrupted"}:
                 state["status"] = turn.get("status") or "inProgress"
             self.app_turn_jobs[turn_id] = job_id
@@ -2150,10 +2251,11 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
             connection.execute(
                 """
                 UPDATE cluster_jobs
-                SET turn_id = ?
+                SET turn_id = ?,
+                    runtime_generation = COALESCE(?, runtime_generation)
                 WHERE job_id = ?
                 """,
-                (turn_id, job_id),
+                (turn_id, active_generation, job_id),
             )
             connection.execute(
                 """
@@ -2173,6 +2275,7 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                 "turn_id": turn_id,
                 "cwd": str(cwd),
                 "sandbox_mode": sandbox_mode,
+                "runtime_generation": active_generation,
             },
         )
         output_path.write_text(
@@ -2485,23 +2588,69 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
         with self._app_state_lock:
             state = dict(self.app_turns.get(job["job_id"], {}))
         status = str(state.get("status") or "")
-        if state.get("context_window_exceeded"):
-            self._finish_app_server_context_overflow(job, state)
-            return
         if status == "completed":
             self._finish_job(job, 0)
             return
-        if status in {"failed", "interrupted"}:
-            exit_code = -15 if status == "interrupted" else 1
-            error = self._app_turn_error(state) or f"App Server turn {status}"
-            self._finish_job(job, exit_code, forced_error=error)
+        if status == "interrupted":
+            error = self._app_turn_error(state) or "App Server turn interrupted"
+            self._finish_job(job, -15, forced_error=error)
+            return
+        if not state:
+            self._finish_lost_app_server_job(job)
+            return
+        job_generation = self._runtime_generation_value(
+            job.get("runtime_generation")
+        )
+        state_generation = self._runtime_generation_value(
+            state.get("runtime_generation")
+        )
+        current_generation = self._current_runtime_generation()
+        if (
+            state_generation is not None
+            and job_generation is not None
+            and state_generation != job_generation
+        ):
+            self._finish_lost_app_server_job(
+                job,
+                reason=(
+                    "App Server job generation changed from "
+                    f"{job_generation} to {state_generation}"
+                ),
+            )
+            return
+        recorded_generation = (
+            state_generation
+            if state_generation is not None
+            else job_generation
+        )
+        if recorded_generation is None or current_generation is None:
+            self._finish_lost_app_server_job(
+                job,
+                reason=(
+                    "App Server runtime generation is unavailable for an "
+                    "active job"
+                ),
+            )
+            return
+        if recorded_generation != current_generation:
+            self._finish_lost_app_server_job(
+                job,
+                reason=(
+                    "App Server runtime generation changed from "
+                    f"{recorded_generation} to {current_generation}"
+                ),
+            )
+            return
+        if state.get("context_window_exceeded"):
+            self._finish_app_server_context_overflow(job, state)
+            return
+        if status == "failed":
+            error = self._app_turn_error(state) or "App Server turn failed"
+            self._finish_job(job, 1, forced_error=error)
             return
         if self._job_timed_out(job):
             self._interrupt_app_turn(job, "job timeout")
             self._finish_job(job, -9, forced_error="job timeout")
-            return
-        if not state:
-            self._finish_lost_app_server_job(job)
             return
         if not self._app_runtime_healthy():
             self._finish_lost_app_server_job(job)
@@ -2542,7 +2691,7 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
     ) -> None:
         reason = self._redact_error(reason)
         with self.team.connection() as connection:
-            connection.execute(
+            updated = connection.execute(
                 """
                 UPDATE cluster_jobs
                 SET status = 'lost', finished_at = ?, error = ?
@@ -2554,6 +2703,8 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                     job["job_id"],
                 ),
             )
+            if updated.rowcount == 0:
+                return
             self._event(
                 connection,
                 job["goal_id"],
@@ -2564,6 +2715,10 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                     "task_id": job.get("task_id"),
                     "thread_id": job.get("thread_id"),
                     "turn_id": job.get("turn_id"),
+                    "runtime_generation": job.get("runtime_generation"),
+                    "current_runtime_generation": (
+                        self._current_runtime_generation()
+                    ),
                     "reason": reason,
                 },
             )

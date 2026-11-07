@@ -665,16 +665,28 @@ CLI、MCP、ClusterManager 和 WebUI 的 reset 都统一进入
 `AgentPool.request_reset`；`starting`/`busy`、`superseded` 和已归档 Agent
 会被拒绝，避免重置正在执行或已失效的 thread。
 
-App Server 初始化、`thread/start` 或 `turn/start` 失败时会先重启 runtime 重试
-一次；仍失败则记录 `agent_runtime_fallback`，清理该 job 的 thread/Agent 关联，
-并让同一 job 使用 exec。已选 thread 的 `thread/resume` 失败时，旧 Agent 会标记
-为 `needs_reset`，同一 job 只再创建一次 fresh thread。`goal.lead_thread_id` 仅是
-兼容字段，不能绕过 AgentPool 对项目、workstream、模型、provider、状态和 reset
-的检查。超时或取消会优先对活动 turn 调用 `turn/interrupt`。daemon 重启后，
-数据库中的 stored Agent 仍可恢复；无法归属到仍存活 App Server 的活动 turn 会
-标记为 `lost`，其任务按既有重试策略恢复。`contextWindowExceeded` 会把旧 Agent
-标记为 `needs_reset`，清理 thread 并自动用新 thread 重试一次；Lead 第二次仍
-溢出时 goal 进入 failed，Worker 第二次仍溢出时任务进入 blocked 并记录原因。
+App Server 初始化失败时会重启 runtime 重试一次；仍失败则记录
+`agent_runtime_fallback`，清理该 job 的 thread/Agent 关联，并让同一 job 使用
+exec。runtime 初始化完成后，单个 `thread/start` 或 `turn/start` RPC 失败不会
+重启健康的共享进程，只允许当前 job 做一次 fresh-thread 或 exec fallback，
+其它活动 turn 保持不变。只有 transport、健康检查或进程级故障才触发 restart；
+restart 前后都会显式把其它活动 job 收敛为 `lost`，避免旧进程的 turn 在恢复后
+残留。已选 thread 的 `thread/resume` 失败时，旧 Agent 会标记为 `needs_reset`，
+同一 job 只再创建一次 fresh thread。`goal.lead_thread_id` 仅是兼容字段，不能
+绕过 AgentPool 对项目、workstream、模型、provider、状态和 reset 的检查。
+
+每个活动 App Server job/turn state 都持久化创建时的 `runtime_generation`。
+reconcile 会与当前 runtime health 的 generation 比较；一旦进程被替换，旧
+generation 的 job 在下一次 reconcile 即标记为 `lost`，不等待 job 超时，并继续
+执行既有 Worker 重试或 Lead generation recovery。私有 runtime 的 stderr 写入
+`logs_dir/app-server.stderr.log`，fallback、restart 和 job 错误附带脱敏后的最近
+stderr，便于定位启动或传输故障。
+
+超时或取消会优先对活动 turn 调用 `turn/interrupt`。daemon 重启后，数据库中的
+stored Agent 仍可恢复；无法归属到仍存活 App Server 的活动 turn 会标记为
+`lost`，其任务按既有重试策略恢复。`contextWindowExceeded` 会把旧 Agent 标记为
+`needs_reset`，清理 thread 并自动用新 thread 重试一次；Lead 第二次仍溢出时
+goal 进入 failed，Worker 第二次仍溢出时任务进入 blocked 并记录原因。
 
 ### A/B 缓存基准
 

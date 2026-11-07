@@ -4,7 +4,7 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
@@ -121,6 +121,7 @@ CREATE TABLE IF NOT EXISTS cluster_jobs (
     agent_id TEXT REFERENCES cluster_agents(agent_id) ON DELETE SET NULL,
     turn_id TEXT,
     runtime TEXT NOT NULL DEFAULT 'exec',
+    runtime_generation INTEGER,
     input_tokens INTEGER NOT NULL DEFAULT 0,
     cached_input_tokens INTEGER NOT NULL DEFAULT 0,
     uncached_input_tokens INTEGER NOT NULL DEFAULT 0,
@@ -265,6 +266,7 @@ CLUSTER_JOB_MIGRATION_COLUMNS = {
     "agent_id": "TEXT",
     "turn_id": "TEXT",
     "runtime": "TEXT NOT NULL DEFAULT 'exec'",
+    "runtime_generation": "INTEGER",
     "input_tokens": "INTEGER NOT NULL DEFAULT 0",
     "cached_input_tokens": "INTEGER NOT NULL DEFAULT 0",
     "uncached_input_tokens": "INTEGER NOT NULL DEFAULT 0",

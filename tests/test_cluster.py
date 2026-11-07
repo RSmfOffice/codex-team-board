@@ -120,12 +120,15 @@ class StubAppServerRuntime:
         self._thread_sequence = 0
         self._turn_sequence = 0
         self._healthy = False
+        self._generation = 0
         self._lock = threading.Lock()
 
     def start(self) -> dict:
         self.start_calls += 1
         if self.start_calls <= self.fail_start:
             raise RuntimeError("startup failed")
+        if not self._healthy:
+            self._generation += 1
         self._healthy = True
         return self.health()
 
@@ -133,6 +136,7 @@ class StubAppServerRuntime:
         self.restart_calls += 1
         if self.restart_calls <= self.fail_restart:
             raise RuntimeError("restart failed")
+        self._generation += 1
         self._healthy = True
         return self.health()
 
@@ -140,7 +144,11 @@ class StubAppServerRuntime:
         self.stop_calls += 1
 
     def health(self) -> dict:
-        return {"healthy": self._healthy, "running": self._healthy}
+        return {
+            "healthy": self._healthy,
+            "running": self._healthy,
+            "generation": self._generation,
+        }
 
     def start_thread(
         self,
@@ -211,6 +219,12 @@ class FakeExecProcess:
         self.stdout = io.StringIO()
 
     def poll(self) -> None:
+        return None
+
+    def __enter__(self) -> FakeExecProcess:
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
         return None
 
 
@@ -1820,9 +1834,15 @@ class ClusterSchedulerTests(unittest.TestCase):
             self.assertEqual(second["runtime"], "exec")
             self.assertEqual(jobs[first["job_id"]]["status"], "running")
             self.assertEqual(jobs[first["job_id"]]["runtime"], "app_server")
+            self.assertEqual(jobs[first["job_id"]]["runtime_generation"], 1)
             self.assertEqual(jobs[second["job_id"]]["status"], "running")
+            self.assertIsNone(jobs[second["job_id"]]["runtime_generation"])
             self.assertEqual(runtime.restart_calls, 0)
             self.assertIn(first["job_id"], manager.app_turns)
+            self.assertEqual(
+                manager.app_turns[first["job_id"]]["runtime_generation"],
+                1,
+            )
             self.assertNotIn(second["job_id"], manager.app_turns)
             self.assertIn(
                 "process remained healthy",
@@ -1832,6 +1852,12 @@ class ClusterSchedulerTests(unittest.TestCase):
                 "diagnostic marker",
                 jobs[second["job_id"]]["error"],
             )
+            lost_events = [
+                event
+                for event in manager.get_goal(goal["goal_id"])["events"]
+                if event["event_type"] == "app_server_turn_lost"
+            ]
+            self.assertEqual(lost_events, [])
 
     def test_disconnect_restart_loses_and_recovers_other_turns(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1883,9 +1909,16 @@ class ClusterSchedulerTests(unittest.TestCase):
             self.assertEqual(runtime.restart_calls, 1)
             self.assertEqual(runtime.turn_attempts, 4)
             self.assertEqual(runtime.resume_threads, [current["thread_id"]])
+            self.assertEqual(jobs[worker_other["job_id"]]["runtime_generation"], 1)
+            self.assertEqual(jobs[lead_other["job_id"]]["runtime_generation"], 1)
+            self.assertEqual(jobs[current["job_id"]]["runtime_generation"], 2)
             self.assertNotIn(worker_other["job_id"], manager.app_turns)
             self.assertNotIn(lead_other["job_id"], manager.app_turns)
             self.assertIn(current["job_id"], manager.app_turns)
+            self.assertEqual(
+                manager.app_turns[current["job_id"]]["runtime_generation"],
+                2,
+            )
             lost_jobs = {
                 event["data"]["job_id"]
                 for event in result["events"]
@@ -1905,6 +1938,109 @@ class ClusterSchedulerTests(unittest.TestCase):
                 worker_other["job_id"],
             )
             self.assertIn("unhealthy App Server", recovered[-1]["reason"])
+
+    def test_generation_switch_reconciles_old_jobs_before_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            repo = _repo(base, "generation-switch")
+            runtime = StubAppServerRuntime()
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime=runtime,
+                runtime_mode="app_server",
+                lead_cooldown_seconds=0,
+            )
+            goal, tasks = self._goal_with_ready_tasks(
+                manager,
+                team,
+                repo,
+                3,
+            )
+            old_worker = manager._dispatch_worker(
+                manager.get_goal(goal["goal_id"]),
+                team.get_task(tasks[0]["task_id"]),
+            )
+            team.claim_task(tasks[0]["task_id"], actor="generation-old")
+            old_lead = manager._dispatch_lead(
+                manager.get_goal(goal["goal_id"]),
+                team.list_tasks(repo, goal_id=goal["goal_id"]),
+            )
+            self.assertEqual(runtime.restart(), {
+                "healthy": True,
+                "running": True,
+                "generation": 2,
+            })
+            current = manager._dispatch_worker(
+                manager.get_goal(goal["goal_id"]),
+                team.get_task(tasks[1]["task_id"]),
+            )
+
+            manager._reconcile_jobs()
+
+            result = manager.get_goal(goal["goal_id"])
+            jobs = {job["job_id"]: job for job in result["jobs"]}
+            self.assertEqual(
+                jobs[old_worker["job_id"]]["status"],
+                "lost",
+            )
+            self.assertEqual(
+                jobs[old_lead["job_id"]]["status"],
+                "lost",
+            )
+            self.assertEqual(
+                jobs[current["job_id"]]["status"],
+                "running",
+            )
+            self.assertEqual(
+                jobs[old_worker["job_id"]]["runtime_generation"],
+                1,
+            )
+            self.assertEqual(
+                jobs[old_lead["job_id"]]["runtime_generation"],
+                1,
+            )
+            self.assertEqual(
+                jobs[current["job_id"]]["runtime_generation"],
+                2,
+            )
+            self.assertIn(
+                "generation changed from 1 to 2",
+                jobs[old_worker["job_id"]]["error"],
+            )
+            self.assertEqual(
+                team.get_task(tasks[0]["task_id"])["status"],
+                "ready",
+            )
+            self.assertIsNone(result["lead_thread_id"])
+            self.assertEqual(result["lead_failures"], 1)
+            self.assertIn(current["job_id"], manager.app_turns)
+            lost_events = [
+                event["data"]
+                for event in result["events"]
+                if event["event_type"] == "app_server_turn_lost"
+            ]
+            self.assertEqual(
+                {event["job_id"] for event in lost_events},
+                {old_worker["job_id"], old_lead["job_id"]},
+            )
+            self.assertTrue(
+                all(
+                    event["runtime_generation"] == 1
+                    and event["current_runtime_generation"] == 2
+                    for event in lost_events
+                )
+            )
+            recovered = [
+                event["data"]
+                for event in result["events"]
+                if event["event_type"] == "worker_recovered"
+                and event["data"].get("job_id") == old_worker["job_id"]
+            ]
+            self.assertEqual(len(recovered), 1)
+            self.assertIn("generation changed", recovered[0]["reason"])
 
     def test_initialization_failure_persists_redacted_stderr(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

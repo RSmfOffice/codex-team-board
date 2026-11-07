@@ -269,7 +269,7 @@ class TeamFlowTests(unittest.TestCase):
         self.assertIn("claimed", event_types)
         self.assertIn("submitted", event_types)
         self.assertIn("reviewed", event_types)
-        self.assertEqual(schema_version, 9)
+        self.assertEqual(schema_version, 10)
         history = self.team.get_task_events(done["task_id"])
         self.assertIn("worktree_created", [item["event_type"] for item in history["events"]])
 
