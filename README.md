@@ -590,16 +590,16 @@ ready/review/blocked ──取消──→ canceled
 
 `teamd` 可以同时调度不同 Git 项目中的目标，但以下容量和隔离规则仍然生效：
 
-- 全局 Jobs 容量默认是 `4`。它统计所有项目中状态为 `starting` 或 `running`
-  的 Lead 和 Worker，因此 Lead 也占用全局槽位。
-- 每个 goal 的 Worker 容量默认是 `3`。Lead 不占每 goal 的 Worker 配额，但仍占
-  一个全局 Jobs 槽位；全局容量始终是更外层的上限。
+- 每个 active goal 的 Worker 容量默认是 `3`；Lead 独立存在，不占 Worker 槽位。
+  两个 active goal 默认拥有 6 个可并行 Worker 槽位。
+- 另有一个默认 `16` 的系统进程安全阀，统计所有项目中 `starting` 或 `running`
+  的 Lead 和 Worker。它是防止整机过载的外层保护，不是正常的 per-session 配额。
 - 同一项目仍只允许一个 `planning` 或 `active` goal。需要并行多个集群时，应为
   不同项目分别创建目标。
 - 调度器优先选择最久未启动任务的 goal，再比较该 goal 当前活动 job 数和 goal ID；
   goal 内则按任务 priority、创建时间选择 Worker。这是持续填充全局槽位的公平
   轮转，不保证每个 goal 获得固定槽位数。
-- 全局容量已满且某个 goal 仍有可派发 Worker 时，会记录
+- 系统安全阀已满且某个 goal 仍有可派发 Worker 时，会记录
   `fairness_deferred` 事件，数据包含 `reason: "global capacity full"`、
   `ready_tasks` 和 `capacity`。相同 goal、相同原因的事件最多每 60 秒记录一次；
   该事件只是排队审计信号，不会改变任务状态。
