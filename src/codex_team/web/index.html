@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Codex Team Board</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <div class="eyebrow">CODEX LOCAL ORCHESTRATION</div>
+      <h1>Team Board</h1>
+    </div>
+    <div class="top-actions">
+      <select id="project-select" aria-label="项目筛选">
+        <option value="">所有活动项目</option>
+      </select>
+      <label class="archive-toggle">
+        <input id="show-archived" type="checkbox">
+        显示已归档
+      </label>
+      <button id="archive-target" class="secondary-button" type="button" disabled>
+        归档当前项目
+      </button>
+      <div id="health" class="health">连接中</div>
+    </div>
+  </header>
+
+  <section id="cluster-overview" class="cluster-overview"></section>
+  <section class="summary" id="summary"></section>
+
+  <main class="board" id="board">
+    <section class="lane" data-status="ready">
+      <div class="lane-header"><h2>Ready</h2><span id="count-ready">0</span></div>
+      <div class="cards" id="cards-ready"></div>
+    </section>
+    <section class="lane" data-status="running">
+      <div class="lane-header"><h2>Running</h2><span id="count-running">0</span></div>
+      <div class="cards" id="cards-running"></div>
+    </section>
+    <section class="lane" data-status="review">
+      <div class="lane-header"><h2>Review</h2><span id="count-review">0</span></div>
+      <div class="cards" id="cards-review"></div>
+    </section>
+    <section class="lane" data-status="blocked">
+      <div class="lane-header"><h2>Blocked</h2><span id="count-blocked">0</span></div>
+      <div class="cards" id="cards-blocked"></div>
+    </section>
+    <section class="lane" data-status="done">
+      <div class="lane-header"><h2>Done</h2><span id="count-done">0</span></div>
+      <div class="cards" id="cards-done"></div>
+    </section>
+  </main>
+
+  <aside id="detail" class="detail hidden" aria-live="polite">
+    <button id="detail-close" class="detail-close" aria-label="关闭">×</button>
+    <div id="detail-body"></div>
+  </aside>
+
+  <section class="messages-panel">
+    <div class="lane-header"><h2>Team messages</h2><span id="message-count">0</span></div>
+    <div id="messages" class="messages"></div>
+  </section>
+
+  <script src="/app.js"></script>
+</body>
+</html>

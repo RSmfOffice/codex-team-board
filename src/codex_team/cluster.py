@@ -1,0 +1,1152 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+from .config import Settings
+from .db import connect, connect_readonly, utc_now
+from .processes import pid_is_running
+from .service import TeamError, TeamService
+from .worktrees import WorktreeManager
+
+TERMINAL_GOAL_STATUSES = frozenset({"completed", "failed"})
+ACTIVE_JOB_STATUSES = frozenset({"starting", "running"})
+TERMINAL_TASK_STATUSES = frozenset({"done", "canceled"})
+WORKER_TIMEOUT_SECONDS = 30 * 60
+LEAD_TIMEOUT_SECONDS = 20 * 60
+_CLAIM_TOKEN_RE = re.compile(
+    r'(?P<prefix>(?:\\?"claim_token\\?"\s*:\s*\\?"))(?P<token>[^"\\]+)(?P<suffix>\\?")'
+)
+
+
+class ClusterError(TeamError):
+    pass
+
+
+class ClusterManager:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        team: TeamService | None = None,
+        worktrees: WorktreeManager | None = None,
+        agent_command: list[str] | None = None,
+        max_workers: int = 3,
+        lead_cooldown_seconds: float = 8.0,
+    ) -> None:
+        self.settings = settings
+        self.team = team or TeamService(settings)
+        self.worktrees = worktrees or WorktreeManager(self.team)
+        self.agent_command = agent_command or _default_codex_command()
+        self.max_workers = max(1, min(int(max_workers), 8))
+        self.lead_cooldown_seconds = max(0.0, float(lead_cooldown_seconds))
+        self.processes: dict[str, subprocess.Popen[str]] = {}
+        self.log_threads: dict[str, threading.Thread] = {}
+        self.settings.ensure()
+        (self.settings.logs_dir / "cluster").mkdir(parents=True, exist_ok=True)
+
+    def create_goal(
+        self,
+        repo: str | Path,
+        *,
+        objective: str,
+        autonomy: str = "auto",
+        max_worker_attempts: int = 3,
+        max_lead_attempts: int = 5,
+    ) -> dict[str, Any]:
+        objective = objective.strip()
+        if not objective:
+            raise ClusterError("objective must not be empty")
+        if autonomy not in {"auto", "supervised"}:
+            raise ClusterError("autonomy must be auto or supervised")
+        project = self.team.init_project(repo)
+        goal_id = self._new_id("G")
+        now = utc_now()
+        with self.team.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            active = connection.execute(
+                """
+                SELECT goal_id FROM cluster_goals
+                WHERE project_id = ? AND status IN ('planning', 'active')
+                """,
+                (project["project_id"],),
+            ).fetchone()
+            if active:
+                raise ClusterError(f"project already has active goal: {active['goal_id']}")
+            connection.execute(
+                """
+                INSERT INTO cluster_goals(
+                    goal_id, project_id, objective, status, autonomy,
+                    max_worker_attempts, max_lead_attempts, created_at, updated_at
+                ) VALUES (?, ?, ?, 'planning', ?, ?, ?, ?, ?)
+                """,
+                (
+                    goal_id,
+                    project["project_id"],
+                    objective,
+                    autonomy,
+                    max(1, min(int(max_worker_attempts), 10)),
+                    max(1, min(int(max_lead_attempts), 20)),
+                    now,
+                    now,
+                ),
+            )
+            self._event(connection, goal_id, "goal_created", "teamd", {"objective": objective})
+        return self.get_goal(goal_id)
+
+    def get_goal(self, goal_id: str) -> dict[str, Any]:
+        with self.team.connection(write=False) as connection:
+            row = connection.execute(
+                """
+                SELECT g.*, p.name AS project_name, p.root_path
+                FROM cluster_goals g JOIN projects p ON p.project_id = g.project_id
+                WHERE g.goal_id = ?
+                """,
+                (goal_id,),
+            ).fetchone()
+            if row is None:
+                raise ClusterError(f"cluster goal not found: {goal_id}")
+            result = dict(row)
+            result["jobs"] = [
+                dict(item)
+                for item in connection.execute(
+                    """
+                    SELECT * FROM cluster_jobs
+                    WHERE goal_id = ? ORDER BY started_at DESC LIMIT 30
+                    """,
+                    (goal_id,),
+                ).fetchall()
+            ]
+            result["events"] = self._goal_events(connection, goal_id, limit=50)
+            result["tasks"] = self.team.list_tasks(
+                result["root_path"],
+                goal_id=goal_id,
+                include_done=True,
+            )
+            return result
+
+    def list_goals(self, statuses: list[str] | None = None) -> list[dict[str, Any]]:
+        with self.team.connection(write=False) as connection:
+            if statuses:
+                placeholders = ",".join("?" for _ in statuses)
+                rows = connection.execute(
+                    f"""
+                    SELECT g.*, p.name AS project_name, p.root_path
+                    FROM cluster_goals g JOIN projects p ON p.project_id = g.project_id
+                    WHERE g.status IN ({placeholders})
+                    ORDER BY g.updated_at DESC
+                    """,
+                    statuses,
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT g.*, p.name AS project_name, p.root_path
+                    FROM cluster_goals g JOIN projects p ON p.project_id = g.project_id
+                    ORDER BY g.updated_at DESC
+                    """
+                ).fetchall()
+            return [dict(row) for row in rows]
+
+    def set_goal_status(self, goal_id: str, status: str, *, reason: str = "") -> dict[str, Any]:
+        if status not in {"planning", "active", "paused", "completed", "failed"}:
+            raise ClusterError("invalid goal status")
+        completed_at = utc_now() if status in TERMINAL_GOAL_STATUSES else None
+        with self.team.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM cluster_goals WHERE goal_id = ?",
+                (goal_id,),
+            ).fetchone()
+            if row is None:
+                raise ClusterError(f"cluster goal not found: {goal_id}")
+            connection.execute(
+                """
+                UPDATE cluster_goals
+                SET status = ?, updated_at = ?, completed_at = ?, last_error = ?
+                WHERE goal_id = ?
+                """,
+                (status, utc_now(), completed_at, reason, goal_id),
+            )
+            self._event(
+                connection,
+                goal_id,
+                "goal_status",
+                "lead",
+                {"status": status, "reason": reason},
+            )
+        return self.get_goal(goal_id)
+
+    def tick(self) -> dict[str, Any]:
+        self._reconcile_jobs()
+        goals = self.list_goals(["planning", "active"])
+        scheduled: list[dict[str, Any]] = []
+        for goal in goals:
+            summary = self._tick_goal(goal)
+            if summary:
+                scheduled.extend(summary)
+        return {"tick_at": utc_now(), "scheduled": scheduled, "goals": len(goals)}
+
+    def _tick_goal(self, goal: dict[str, Any]) -> list[dict[str, Any]]:
+        goal_id = goal["goal_id"]
+        root = Path(goal["root_path"])
+        tasks = self.team.list_tasks(root, goal_id=goal_id, include_done=True)
+        active_workers = self._active_worker_jobs(goal_id)
+        if tasks and all(item["status"] in TERMINAL_TASK_STATUSES for item in tasks):
+            self.set_goal_status(goal_id, "completed", reason="all tasks completed")
+            return []
+        if (
+            goal["autonomy"] == "supervised"
+            and any(item["status"] == "review" for item in tasks)
+        ):
+            self.set_goal_status(
+                goal_id,
+                "paused",
+                reason="waiting for human review in supervised mode",
+            )
+            return []
+
+        for task in tasks:
+            if task["status"] == "running" and not active_workers.get(task["task_id"]):
+                if task.get("lease_expired"):
+                    self._recover_task(
+                        task["task_id"],
+                        goal_id,
+                        reason="worker lease expired without an active job",
+                    )
+
+        scheduled: list[dict[str, Any]] = []
+        slots = self.max_workers - len(self._active_worker_jobs(goal_id))
+        if slots > 0:
+            candidates = [
+                task
+                for task in tasks
+                if task["status"] == "ready"
+                and not task.get("blocked_by")
+                and task["task_id"] not in self._active_worker_jobs(goal_id)
+                and self._retry_allowed(task["task_id"], goal)
+            ]
+            candidates.sort(key=lambda item: (int(item["priority"]), item["created_at"]))
+            for task in candidates[:slots]:
+                try:
+                    scheduled.append(self._dispatch_worker(goal, task))
+                except Exception as exc:
+                    self.team.block_task(
+                        task["task_id"],
+                        actor="teamd",
+                        reason=f"automatic dispatch failed: {exc}",
+                    )
+                    with self.team.connection() as connection:
+                        self._event(
+                            connection,
+                            goal_id,
+                            "dispatch_failed",
+                            "teamd",
+                            {"task_id": task["task_id"], "error": str(exc)},
+                        )
+                    continue
+
+        tasks = self.team.list_tasks(root, goal_id=goal_id, include_done=True)
+        active_workers = self._active_worker_jobs(goal_id)
+        active_lead = self._active_lead_job(goal_id)
+        needs_lead = (
+            not tasks
+            or any(item["status"] in {"review", "blocked"} for item in tasks)
+        )
+        if (
+            needs_lead
+            and not active_workers
+            and not active_lead
+            and not self._lead_cooldown_active(goal_id)
+        ):
+            try:
+                scheduled.append(self._dispatch_lead(goal, tasks))
+            except Exception as exc:
+                with self.team.connection() as connection:
+                    connection.execute(
+                        """
+                        UPDATE cluster_goals
+                        SET status = 'failed', last_error = ?, updated_at = ?
+                        WHERE goal_id = ?
+                        """,
+                        (f"lead dispatch failed: {exc}", utc_now(), goal_id),
+                    )
+                    self._event(
+                        connection,
+                        goal_id,
+                        "lead_dispatch_failed",
+                        "teamd",
+                        {"error": str(exc)},
+                    )
+        return scheduled
+
+    def _dispatch_worker(self, goal: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
+        role = str(task["owner_role"])
+        if role not in self.team.ROLE_FILES:
+            raise ClusterError(f"unsupported worker role: {role}")
+        if task["kind"] == "write":
+            current = self.team.get_task(task["task_id"])
+            if not current.get("worktree_path"):
+                self.worktrees.create(
+                    task["task_id"],
+                    repo=goal["root_path"],
+                    actor="teamd",
+                )
+                task = self.team.get_task(task["task_id"])
+            if not task.get("worktree_path"):
+                raise ClusterError("write task has no worktree")
+            cwd = Path(task["worktree_path"])
+        else:
+            cwd = Path(goal["root_path"])
+        role_data = self.team.role_prompt(role, goal["root_path"])
+        actor = f"auto-{role}-{task['task_id'].lower()}"
+        prompt = f"""{role_data["prompt"]}
+
+# Automated assignment
+
+- Goal ID: `{goal["goal_id"]}`
+- Task ID: `{task["task_id"]}`
+- Repository: `{goal["root_path"]}`
+- Worktree: `{task.get("worktree_path") or "(none)"}`
+- Actor name: `{actor}`
+
+Use the `codexTeamBoard` MCP tools. Do not spawn subagents or another team.
+First call `team_claim_task` for this task with actor `{actor}`.
+Work only on this task. Keep the claim token private. If your context approaches
+its limit, commit safe progress, call `team_block_task` with the reason
+`worker-context-near-limit`, and stop. Before exiting, either call
+`team_submit_task` with commit SHA, result, changed files, risks, tests and
+review focus, or call `team_block_task` with a precise blocker.
+"""
+        return self._start_job(
+            goal,
+            task_id=task["task_id"],
+            kind="worker",
+            role=role,
+            cwd=cwd,
+            prompt=prompt,
+            sandbox_mode=(
+                "danger-full-access"
+                if task["kind"] == "write"
+                else "workspace-write"
+            ),
+        )
+
+    def _dispatch_lead(
+        self,
+        goal: dict[str, Any],
+        tasks: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if int(goal["lead_ticks"]) >= 20:
+            self.set_goal_status(goal["goal_id"], "failed", reason="lead tick limit exceeded")
+            raise ClusterError("lead tick limit exceeded")
+        board = {
+            "goal": {
+                "goal_id": goal["goal_id"],
+                "objective": goal["objective"],
+                "autonomy": goal["autonomy"],
+            },
+            "tasks": tasks,
+        }
+        prompt = f"""You are the managed Lead for an automated Codex work cluster.
+Do not spawn subagents; the deterministic teamd dispatcher will launch Workers.
+You may use shell tools and codexTeamBoard MCP tools.
+
+Goal:
+{goal["objective"]}
+
+Current board:
+```json
+{json.dumps(board, ensure_ascii=False, indent=2)}
+```
+
+Rules:
+1. If there are no tasks, decompose the goal into small, non-overlapping tasks with
+   `goal_id = "{goal["goal_id"]}"`, acceptance criteria, dependencies, and owner roles.
+   Use kind write for code changes and team_worker; use read for team_explorer.
+2. Ensure `AGENTS.md` and `.codex` team files are committed before write worktrees.
+3. For review tasks, inspect the diff and `team_get_task_events`, run tests, merge the
+   task branch into its recorded target branch, then call `team_review_task` with the
+   real merge_commit. Do not approve failed or dirty work.
+4. For blocked tasks, resolve the blocker with a concrete action; unblock, cancel, or
+   create a replacement task. Never loop without progress.
+5. In supervised mode, do not merge or mark review tasks done; report that human review
+   is required and stop.
+6. Do not mark a task done without a real merge commit and passing integration tests.
+7. Return a concise progress summary and the next concrete board state.
+"""
+        thread_id = goal.get("lead_thread_id")
+        return self._start_job(
+            goal,
+            task_id=None,
+            kind="lead",
+            role="lead",
+            cwd=Path(goal["root_path"]),
+            prompt=prompt,
+            resume_thread_id=thread_id,
+            sandbox_mode=(
+                "danger-full-access"
+                if goal["autonomy"] == "auto"
+                else "workspace-write"
+            ),
+        )
+
+    def _start_job(
+        self,
+        goal: dict[str, Any],
+        *,
+        task_id: str | None,
+        kind: str,
+        role: str,
+        cwd: Path,
+        prompt: str,
+        resume_thread_id: str | None = None,
+        sandbox_mode: str = "workspace-write",
+    ) -> dict[str, Any]:
+        if kind not in {"lead", "worker"}:
+            raise ClusterError("invalid cluster job kind")
+        if sandbox_mode not in {
+            "read-only",
+            "workspace-write",
+            "danger-full-access",
+        }:
+            raise ClusterError(f"invalid sandbox mode: {sandbox_mode}")
+        job_id = self._new_id("J")
+        goal_dir = self.settings.logs_dir / "cluster" / goal["goal_id"]
+        goal_dir.mkdir(parents=True, exist_ok=True)
+        log_path = goal_dir / f"{job_id}.jsonl"
+        output_path = goal_dir / f"{job_id}.last.md"
+        attempt = self._next_attempt(goal["goal_id"], task_id, kind)
+        with self.team.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO cluster_jobs(
+                    job_id, goal_id, task_id, kind, role, status,
+                    attempt, log_path, output_path, started_at
+                ) VALUES (?, ?, ?, ?, ?, 'starting', ?, ?, ?, ?)
+                """,
+                (
+                    job_id,
+                    goal["goal_id"],
+                    task_id,
+                    kind,
+                    role,
+                    attempt,
+                    str(log_path),
+                    str(output_path),
+                    utc_now(),
+                ),
+            )
+            self._event(
+                connection,
+                goal["goal_id"],
+                "job_started",
+                "teamd",
+                {
+                    "job_id": job_id,
+                    "task_id": task_id,
+                    "kind": kind,
+                    "role": role,
+                    "attempt": attempt,
+                    "resume_thread_id": resume_thread_id,
+                    "sandbox_mode": sandbox_mode,
+                },
+            )
+        command = self._build_command(
+            cwd,
+            output_path,
+            resume_thread_id=resume_thread_id,
+            sandbox_mode=sandbox_mode,
+        )
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "CODEX_TEAM_GOAL_ID": goal["goal_id"],
+                "CODEX_TEAM_JOB_ID": job_id,
+                "CODEX_TEAM_TASK_ID": task_id or "",
+                "CODEX_TEAM_ROLE": role,
+                "CODEX_TEAM_REPO_ROOT": goal["root_path"],
+                "PYTHONUTF8": "1",
+            }
+        )
+        creationflags = (
+            getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        )
+        try:
+            with log_path.open("a", encoding="utf-8") as log_stream:
+                log_stream.write(
+                    f"# command={json.dumps(command, ensure_ascii=False)}\n"
+                )
+            process = subprocess.Popen(
+                command,
+                cwd=str(cwd),
+                env=environment,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=creationflags,
+                close_fds=True,
+            )
+            if process.stdout is None:
+                raise ClusterError(f"could not capture {kind} output")
+            pump = threading.Thread(
+                target=self._pump_log,
+                args=(process.stdout, log_path),
+                name=f"cluster-log-{job_id}",
+                daemon=True,
+            )
+            pump.start()
+            self.log_threads[job_id] = pump
+            if process.stdin:
+                process.stdin.write(prompt)
+                process.stdin.close()
+        except Exception as exc:
+            with self.team.connection() as connection:
+                connection.execute(
+                    """
+                    UPDATE cluster_jobs
+                    SET status = 'failed', finished_at = ?, error = ?
+                    WHERE job_id = ?
+                    """,
+                    (utc_now(), str(exc), job_id),
+                )
+                self._event(
+                    connection,
+                    goal["goal_id"],
+                    "job_start_failed",
+                    "teamd",
+                    {"job_id": job_id, "error": str(exc)},
+                )
+            raise ClusterError(f"could not start {kind} process: {exc}") from exc
+        self.processes[job_id] = process
+        with self.team.connection() as connection:
+            connection.execute(
+                """
+                UPDATE cluster_jobs
+                SET status = 'running', pid = ?, thread_id = ?
+                WHERE job_id = ?
+                """,
+                (process.pid, resume_thread_id, job_id),
+            )
+            connection.execute(
+                """
+                UPDATE cluster_goals
+                SET status = CASE WHEN status = 'planning' THEN 'active' ELSE status END,
+                    updated_at = ?
+                WHERE goal_id = ?
+                """,
+                (utc_now(), goal["goal_id"]),
+            )
+        return {
+            "job_id": job_id,
+            "goal_id": goal["goal_id"],
+            "task_id": task_id,
+            "kind": kind,
+            "role": role,
+            "pid": process.pid,
+            "attempt": attempt,
+            "log_path": str(log_path),
+        }
+
+    @staticmethod
+    def _pump_log(stream: Any, log_path: Path) -> None:
+        try:
+            with log_path.open("a", encoding="utf-8") as log_stream:
+                for line in stream:
+                    log_stream.write(_redact_sensitive_log(line))
+                    log_stream.flush()
+        finally:
+            stream.close()
+
+    def _build_command(
+        self,
+        cwd: Path,
+        output_path: Path,
+        *,
+        resume_thread_id: str | None,
+        sandbox_mode: str,
+    ) -> list[str]:
+        common = ["--json", "--disable", "multi_agent", "-o", str(output_path)]
+        if resume_thread_id:
+            return [
+                *self.agent_command,
+                "exec",
+                "resume",
+                resume_thread_id,
+                *common,
+                "-c",
+                f'sandbox_mode="{sandbox_mode}"',
+                "-",
+            ]
+        return [
+            *self.agent_command,
+            "exec",
+            "--skip-git-repo-check",
+            "--sandbox",
+            sandbox_mode,
+            "-C",
+            str(cwd),
+            *common,
+            "-",
+        ]
+
+    def _reconcile_jobs(self) -> None:
+        with self.team.connection(write=False) as connection:
+            rows = connection.execute(
+                """
+                SELECT j.*, g.objective, g.autonomy, g.max_worker_attempts,
+                       g.max_lead_attempts, g.lead_thread_id, g.lead_failures,
+                       g.lead_ticks, p.root_path
+                FROM cluster_jobs j
+                JOIN cluster_goals g ON g.goal_id = j.goal_id
+                JOIN projects p ON p.project_id = g.project_id
+                WHERE j.status IN ('starting', 'running')
+                ORDER BY j.started_at
+                """
+            ).fetchall()
+        for row in rows:
+            job = dict(row)
+            process = self.processes.get(job["job_id"])
+            if self._job_timed_out(job):
+                if process is not None and process.poll() is None:
+                    subprocess.run(
+                        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                self._finish_job(job, -9, forced_error="job timeout")
+                continue
+            exit_code = process.poll() if process is not None else None
+            if process is not None and exit_code is None:
+                continue
+            if process is None and job.get("pid") and pid_is_running(int(job["pid"])):
+                continue
+            self._finish_job(job, exit_code)
+
+    def _finish_job(
+        self,
+        job: dict[str, Any],
+        exit_code: int | None,
+        *,
+        forced_error: str = "",
+    ) -> None:
+        pump = self.log_threads.pop(job["job_id"], None)
+        if pump is not None:
+            pump.join(timeout=5)
+        for path_key in ("log_path", "output_path"):
+            path_value = job.get(path_key)
+            if path_value:
+                _redact_sensitive_file(Path(path_value))
+        parsed = _parse_codex_log(Path(job["log_path"]))
+        thread_id = job.get("thread_id") or parsed.get("thread_id")
+        process_ok = (
+            not forced_error
+            and (
+                exit_code == 0
+                if exit_code is not None
+                else bool(parsed.get("completed"))
+            )
+        )
+        process_error = forced_error or parsed.get("error", "")
+        if job["kind"] == "worker":
+            task = self.team.get_task(job["task_id"])
+            worker_ok = task["status"] in {"review", "done", "blocked"}
+            status = "completed" if process_ok and worker_ok else "failed"
+            error = ""
+            if not worker_ok:
+                error = "worker exited without submitting or blocking its task"
+            elif task["status"] == "blocked" and process_error:
+                error = process_error
+            with self.team.connection() as connection:
+                connection.execute(
+                    """
+                    UPDATE cluster_jobs
+                    SET status = ?, thread_id = ?, finished_at = ?, exit_code = ?, error = ?
+                    WHERE job_id = ?
+                    """,
+                    (status, thread_id, utc_now(), exit_code, error, job["job_id"]),
+                )
+                self._event(
+                    connection,
+                    job["goal_id"],
+                    "worker_finished",
+                    "teamd",
+                    {
+                        "job_id": job["job_id"],
+                        "task_id": job["task_id"],
+                        "status": status,
+                        "exit_code": exit_code,
+                        "thread_id": thread_id,
+                        "error": error or process_error,
+                    },
+                )
+            self.processes.pop(job["job_id"], None)
+            if not worker_ok or not process_ok:
+                self._handle_worker_failure(job, error or process_error or "worker failure")
+            return
+
+        status = "completed" if process_ok else "failed"
+        error = "" if process_ok else process_error or (
+            f"lead process exited with code {exit_code}" if exit_code is not None else "lead process lost"
+        )
+        with self.team.connection() as connection:
+            connection.execute(
+                """
+                UPDATE cluster_jobs
+                SET status = ?, thread_id = ?, finished_at = ?, exit_code = ?, error = ?
+                WHERE job_id = ?
+                """,
+                (status, thread_id, utc_now(), exit_code, error, job["job_id"]),
+            )
+            if process_ok:
+                connection.execute(
+                    """
+                    UPDATE cluster_goals
+                    SET lead_thread_id = COALESCE(?, lead_thread_id),
+                        lead_ticks = lead_ticks + 1,
+                        lead_failures = 0,
+                        last_error = '',
+                        updated_at = ?
+                    WHERE goal_id = ?
+                    """,
+                    (thread_id, utc_now(), job["goal_id"]),
+                )
+            else:
+                failures = int(job.get("lead_failures") or 0) + 1
+                reset_thread = failures >= 2
+                connection.execute(
+                    """
+                    UPDATE cluster_goals
+                    SET lead_thread_id = CASE
+                            WHEN ? THEN NULL
+                            ELSE COALESCE(lead_thread_id, ?)
+                        END,
+                        lead_generation = lead_generation + CASE WHEN ? THEN 1 ELSE 0 END,
+                        lead_failures = ?, last_error = ?, updated_at = ?
+                    WHERE goal_id = ?
+                    """,
+                    (
+                        int(reset_thread),
+                        thread_id,
+                        int(reset_thread),
+                        failures,
+                        error,
+                        utc_now(),
+                        job["goal_id"],
+                    ),
+                )
+                if failures >= int(job.get("max_lead_attempts") or 5):
+                    connection.execute(
+                        """
+                        UPDATE cluster_goals
+                        SET status = 'failed', completed_at = ?, updated_at = ?
+                        WHERE goal_id = ?
+                        """,
+                        (utc_now(), utc_now(), job["goal_id"]),
+                    )
+            self._event(
+                connection,
+                job["goal_id"],
+                "lead_finished",
+                "teamd",
+                {
+                    "job_id": job["job_id"],
+                    "status": status,
+                    "exit_code": exit_code,
+                    "thread_id": thread_id,
+                    "error": error,
+                },
+            )
+        self.processes.pop(job["job_id"], None)
+
+    @staticmethod
+    def _job_timed_out(job: dict[str, Any]) -> bool:
+        started = _parse_iso(job.get("started_at"))
+        if started is None:
+            return True
+        timeout = (
+            LEAD_TIMEOUT_SECONDS
+            if job.get("kind") == "lead"
+            else WORKER_TIMEOUT_SECONDS
+        )
+        return (datetime.now(UTC) - started).total_seconds() > timeout
+
+    def _handle_worker_failure(self, job: dict[str, Any], reason: str) -> None:
+        task = self.team.get_task(job["task_id"])
+        if task["status"] in {"review", "done"}:
+            return
+        if task["status"] == "blocked":
+            return
+        if int(job["attempt"]) >= int(job.get("max_worker_attempts") or 3):
+            self.team.block_task(
+                task["task_id"],
+                actor="teamd",
+                reason=f"automatic worker retries exhausted: {reason}",
+            )
+            return
+        self._recover_task(
+            task["task_id"],
+            job["goal_id"],
+            reason=reason,
+            job_id=job["job_id"],
+            attempt=int(job["attempt"]),
+        )
+
+    def _recover_task(
+        self,
+        task_id: str,
+        goal_id: str,
+        *,
+        reason: str,
+        job_id: str | None = None,
+        attempt: int = 0,
+    ) -> None:
+        task = self.team.get_task(task_id)
+        if task["status"] in TERMINAL_TASK_STATUSES or task["status"] == "review":
+            return
+        with self.team.connection() as connection:
+            connection.execute(
+                """
+                UPDATE tasks
+                SET status = 'ready', claimed_by = NULL, claim_token = NULL,
+                    lease_until = NULL, blocker = ?, updated_at = ?,
+                    version = version + 1
+                WHERE task_id = ?
+                """,
+                (reason, utc_now(), task_id),
+            )
+            self._event(
+                connection,
+                goal_id,
+                "worker_recovered",
+                "teamd",
+                {
+                    "task_id": task_id,
+                    "job_id": job_id,
+                    "attempt": attempt,
+                    "reason": reason,
+                },
+            )
+
+    def _active_worker_jobs(self, goal_id: str) -> dict[str, dict[str, Any]]:
+        with self.team.connection(write=False) as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM cluster_jobs
+                WHERE goal_id = ? AND kind = 'worker'
+                  AND status IN ('starting', 'running')
+                """,
+                (goal_id,),
+            ).fetchall()
+        return {str(row["task_id"]): dict(row) for row in rows}
+
+    def _active_lead_job(self, goal_id: str) -> dict[str, Any] | None:
+        with self.team.connection(write=False) as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM cluster_jobs
+                WHERE goal_id = ? AND kind = 'lead'
+                  AND status IN ('starting', 'running')
+                ORDER BY started_at DESC LIMIT 1
+                """,
+                (goal_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def _lead_cooldown_active(self, goal_id: str) -> bool:
+        with self.team.connection(write=False) as connection:
+            row = connection.execute(
+                """
+                SELECT finished_at FROM cluster_jobs
+                WHERE goal_id = ? AND kind = 'lead' AND finished_at IS NOT NULL
+                ORDER BY finished_at DESC LIMIT 1
+                """,
+                (goal_id,),
+            ).fetchone()
+        if not row:
+            return False
+        finished = _parse_iso(row["finished_at"])
+        return bool(
+            finished
+            and (datetime.now(UTC) - finished).total_seconds()
+            < self.lead_cooldown_seconds
+        )
+
+    def _retry_allowed(self, task_id: str, goal: dict[str, Any]) -> bool:
+        with self.team.connection(write=False) as connection:
+            row = connection.execute(
+                """
+                SELECT attempt, finished_at FROM cluster_jobs
+                WHERE task_id = ? AND kind = 'worker'
+                ORDER BY attempt DESC, started_at DESC LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+        if not row or int(row["attempt"]) < int(goal["max_worker_attempts"]):
+            return True
+        return False
+
+    def _next_attempt(self, goal_id: str, task_id: str | None, kind: str) -> int:
+        with self.team.connection(write=False) as connection:
+            if task_id:
+                row = connection.execute(
+                    """
+                    SELECT COALESCE(MAX(attempt), 0) + 1 AS next_attempt
+                    FROM cluster_jobs WHERE task_id = ? AND kind = 'worker'
+                    """,
+                    (task_id,),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    """
+                    SELECT COALESCE(MAX(attempt), 0) + 1 AS next_attempt
+                    FROM cluster_jobs WHERE goal_id = ? AND kind = 'lead'
+                    """,
+                    (goal_id,),
+                ).fetchone()
+        return int(row["next_attempt"])
+
+    @staticmethod
+    def _new_id(prefix: str) -> str:
+        return (
+            datetime.now(UTC).strftime(f"{prefix}-%Y%m%d-")
+            + secrets.token_hex(3).upper()
+        )
+
+    @staticmethod
+    def _event(
+        connection: Any,
+        goal_id: str,
+        event_type: str,
+        actor: str,
+        data: dict[str, Any],
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO cluster_events(goal_id, event_type, actor, data_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                goal_id,
+                event_type,
+                actor,
+                json.dumps(data, ensure_ascii=False, sort_keys=True),
+                utc_now(),
+            ),
+        )
+
+    @staticmethod
+    def _goal_events(
+        connection: Any,
+        goal_id: str,
+        *,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        rows = connection.execute(
+            """
+            SELECT event_id, event_type, actor, data_json, created_at
+            FROM cluster_events WHERE goal_id = ?
+            ORDER BY event_id DESC LIMIT ?
+            """,
+            (goal_id, max(1, min(limit, 500))),
+        ).fetchall()
+        result = []
+        for row in reversed(rows):
+            item = dict(row)
+            try:
+                item["data"] = json.loads(item.pop("data_json"))
+            except (TypeError, ValueError):
+                item["data"] = {}
+                item.pop("data_json", None)
+            result.append(item)
+        return result
+
+
+def _default_codex_command() -> list[str]:
+    configured = os.environ.get("CODEX_TEAM_CODEX_COMMAND", "").strip()
+    if configured:
+        return [configured]
+    executable = shutil.which("codex.exe") or shutil.which("codex")
+    if not executable:
+        known = Path.home() / "AppData/Local/Programs/OpenAI/Codex/bin/codex.exe"
+        executable = str(known) if known.is_file() else "codex"
+    return [str(executable)]
+
+
+def _redact_sensitive_log(text: str) -> str:
+    return _CLAIM_TOKEN_RE.sub(
+        lambda match: (
+            match.group("prefix")
+            + "[REDACTED]"
+            + match.group("suffix")
+        ),
+        text,
+    )
+
+
+def _redact_sensitive_file(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        original = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    redacted = _redact_sensitive_log(original)
+    if redacted == original:
+        return False
+    temporary = path.with_name(path.name + ".redacted.tmp")
+    temporary.write_text(redacted, encoding="utf-8")
+    temporary.replace(path)
+    return True
+
+
+def _parse_codex_log(path: Path) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "thread_id": None,
+        "completed": False,
+        "error": "",
+    }
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                if not line.startswith("{"):
+                    continue
+                try:
+                    item = json.loads(line)
+                except ValueError:
+                    continue
+                event_type = item.get("type")
+                if event_type == "thread.started":
+                    result["thread_id"] = item.get("thread_id")
+                elif event_type == "turn.completed":
+                    result["completed"] = True
+                elif event_type in {"turn.failed", "error"}:
+                    error = item.get("error") or item.get("message")
+                    if isinstance(error, dict):
+                        error = error.get("message") or json.dumps(error, ensure_ascii=False)
+                    result["error"] = str(error or event_type)
+    except OSError:
+        result["error"] = "log unreadable"
+    return result
+
+
+def _parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def daemon_paths(settings: Settings) -> tuple[Path, Path, Path]:
+    base = settings.logs_dir
+    return (
+        base / "clusterd.lock",
+        base / "clusterd.json",
+        base / "clusterd.log",
+    )
+
+
+def daemon_status(settings: Settings) -> dict[str, Any]:
+    lock_path, state_path, log_path = daemon_paths(settings)
+    pid = 0
+    try:
+        pid = int(json.loads(lock_path.read_text(encoding="utf-8")).get("pid", 0))
+    except (OSError, ValueError, TypeError):
+        pass
+    state: dict[str, Any] = {}
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        pass
+    return {
+        "running": bool(pid and pid_is_running(pid)),
+        "pid": pid or None,
+        "lock_path": str(lock_path),
+        "state_path": str(state_path),
+        "log_path": str(log_path),
+        "state": state,
+    }
+
+
+def ensure_daemon(settings: Settings) -> dict[str, Any]:
+    current = daemon_status(settings)
+    if current["running"]:
+        return current
+    lock_path, state_path, log_path = daemon_paths(settings)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    package_root = settings.project_root / "src"
+    environment = os.environ.copy()
+    previous_pythonpath = environment.get("PYTHONPATH", "")
+    environment["PYTHONPATH"] = (
+        str(package_root)
+        if not previous_pythonpath
+        else os.pathsep.join([str(package_root), previous_pythonpath])
+    )
+    environment["PYTHONUTF8"] = "1"
+    creationflags = (
+        getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    )
+    with log_path.open("a", encoding="utf-8") as stream:
+        stream.write(f"\n[{utc_now()}] starting cluster daemon\n")
+        stream.flush()
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-u",
+                "-m",
+                "codex_team.clusterd",
+                "--interval",
+                "5",
+            ],
+            cwd=str(settings.project_root),
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=stream,
+            stderr=subprocess.STDOUT,
+            creationflags=creationflags,
+            close_fds=True,
+        )
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        current = daemon_status(settings)
+        if current["running"]:
+            return current
+        if process.poll() is not None:
+            break
+        time.sleep(0.1)
+    raise ClusterError(f"cluster daemon failed to start; see {log_path}")
+
+
+def stop_daemon(settings: Settings) -> dict[str, Any]:
+    current = daemon_status(settings)
+    pid = int(current.get("pid") or 0)
+    if pid and pid_is_running(pid):
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    lock_path, _, _ = daemon_paths(settings)
+    try:
+        lock_path.unlink()
+    except FileNotFoundError:
+        pass
+    return {"ok": True, "stopped_pid": pid or None}

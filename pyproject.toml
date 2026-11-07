@@ -1,0 +1,18 @@
+[project]
+name = "codex-team-board"
+version = "0.2.0"
+description = "Local task graph, worktree coordinator, MCP server, and dashboard for Codex teams"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = []
+authors = [
+    { name = "RSmfOffice" },
+]
+
+[project.urls]
+Homepage = "https://github.com/RSmfOffice/codex-team-board"
+Releases = "https://github.com/RSmfOffice/codex-team-board/releases"
+
+[project.scripts]
+teamctl = "codex_team.cli:main"

@@ -1,0 +1,706 @@
+from __future__ import annotations
+
+import json
+import logging
+import sys
+from typing import Any
+
+from . import __version__
+from .config import Settings
+from .cluster import ClusterManager, daemon_status as cluster_daemon_status, ensure_daemon
+from .service import TeamError, TeamService
+from .worktrees import WorktreeManager
+
+LOGGER = logging.getLogger("codex_team.mcp")
+PROTOCOL_VERSION = "2025-06-18"
+INSTRUCTIONS = (
+    "This MCP server is the shared task and worktree source of truth for a Codex team. "
+    "For an initialized team project, call team_status or team_list_tasks before planning; "
+    "reuse existing tasks when possible. The lead creates tasks, creates a worktree for every "
+    "write task, assigns a role, and "
+    "is the only reviewer allowed to mark tasks done. Workers must claim a task, keep its "
+    "claim_token private, send heartbeats, and submit to review with commit and test evidence. "
+    "Never edit outside an assigned worktree."
+)
+
+
+def _tool_definitions() -> list[dict[str, Any]]:
+    repo = {
+        "type": "string",
+        "description": "Absolute or relative path to the target Git repository.",
+    }
+    task_id = {"type": "string", "description": "Task ID such as T-20261107-ABC123."}
+
+    return [
+        {
+            "name": "team_init_project",
+            "description": (
+                "Register a Git repository and install Codex team roles plus the managed "
+                "AGENTS.md collaboration policy. Existing files are preserved."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo_root": repo,
+                    "max_threads": {"type": "integer", "minimum": 1, "maximum": 8, "default": 4},
+                },
+                "required": ["repo_root"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "team_status",
+            "description": "Show task counts and active projects, optionally scoped to one repository.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"repo_root": repo},
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "team_list_roles",
+            "description": "List the built-in team role prompt packs.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "team_role_prompt",
+            "description": (
+                "Return a role prompt to prepend to a native Codex subagent spawn prompt. "
+                "Use this when the installed Codex version cannot auto-load role TOML files."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "role": {
+                        "type": "string",
+                        "enum": ["team_explorer", "team_worker", "team_reviewer"],
+                    },
+                    "repo_root": {
+                        "type": "string",
+                        "description": "Optional repository whose .codex/team-roles customization takes precedence.",
+                    },
+                },
+                "required": ["role"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "team_create_task",
+            "description": (
+                "Create a task in the shared task graph. Write tasks cannot be claimed until "
+                "a worktree has been created. Only the lead should create or assign tasks."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo_root": repo,
+                    "title": {"type": "string", "minLength": 1},
+                    "description": {"type": "string"},
+                    "acceptance": {"type": "string"},
+                    "kind": {"type": "string", "enum": ["read", "write", "review", "ops"]},
+                    "owner_role": {"type": "string", "minLength": 1},
+                    "goal_id": {
+                        "type": "string",
+                        "description": "Optional automated cluster goal ID.",
+                    },
+                    "actor": {"type": "string", "default": "lead"},
+                    "priority": {"type": "integer", "minimum": 0, "maximum": 3, "default": 2},
+                    "depends_on": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "default": [],
+                    },
+                },
+                "required": [
+                    "repo_root",
+                    "title",
+                    "description",
+                    "acceptance",
+                    "kind",
+                    "owner_role",
+                ],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "team_list_tasks",
+            "description": "List tasks, blockers, leases, worktrees, and current status.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo_root": repo,
+                    "statuses": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["backlog", "ready", "running", "review", "blocked", "done", "canceled"],
+                        },
+                    },
+                    "owner_role": {"type": "string"},
+                    "goal_id": {"type": "string"},
+                    "include_done": {"type": "boolean", "default": True},
+                    "include_archived": {"type": "boolean", "default": False},
+                },
+                "required": ["repo_root"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "team_get_task",
+            "description": "Read one task with dependencies, dependents, lease state, and worktree.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"task_id": task_id},
+                "required": ["task_id"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "team_get_task_events",
+            "description": "Read the append-only task audit trail, including claim, progress, submit, and review events.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": task_id,
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100},
+                },
+                "required": ["task_id"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "team_create_worktree",
+            "description": (
+                "Create an isolated Git worktree and branch for a write task before any worker "
+                "claims it. The main checkout must be clean and on a named branch."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": task_id,
+                    "repo_root": repo,
+                    "actor": {"type": "string", "default": "lead"},
+                    "base_ref": {"type": "string", "default": "HEAD"},
+                    "worktree_path": {"type": "string"},
+                },
+                "required": ["task_id", "repo_root"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "team_list_worktrees",
+            "description": "List Git worktrees registered in the repository.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"repo_root": repo},
+                "required": ["repo_root"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "team_claim_task",
+            "description": (
+                "Atomically claim a ready task and obtain a claim_token. A write task requires "
+                "an existing worktree. Keep the token private and use it for all updates."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": task_id,
+                    "actor": {"type": "string", "minLength": 1},
+                    "lease_minutes": {"type": "integer", "minimum": 5, "maximum": 240, "default": 30},
+                },
+                "required": ["task_id", "actor"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "team_heartbeat",
+            "description": "Renew the lease for a running task.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": task_id,
+                    "actor": {"type": "string"},
+                    "claim_token": {"type": "string"},
+                    "lease_minutes": {"type": "integer", "minimum": 5, "maximum": 240, "default": 30},
+                },
+                "required": ["task_id", "actor", "claim_token"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "team_update_task",
+            "description": "Record worker progress, result progress, or test evidence for a claimed task.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": task_id,
+                    "actor": {"type": "string"},
+                    "claim_token": {"type": "string"},
+                    "note": {"type": "string"},
+                    "result": {"type": "string"},
+                    "tests": {"type": "string"},
+                    "commit_sha": {
+                        "type": "string",
+                        "description": "Required for write tasks; the committed worktree HEAD SHA.",
+                    },
+                },
+                "required": ["task_id", "actor", "claim_token", "note"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "team_submit_task",
+            "description": (
+                "Move a running task to review. result must summarize behavior, changed "
+                "files, risks, and unresolved review questions; tests must contain exact commands and results."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": task_id,
+                    "actor": {"type": "string"},
+                    "claim_token": {"type": "string"},
+                    "result": {
+                        "type": "string",
+                        "description": "Behavior summary, changed files, risks, and review focus.",
+                    },
+                    "tests": {
+                        "type": "string",
+                        "description": "Exact commands and outcomes, including failures or skipped checks.",
+                    },
+                    "commit_sha": {
+                        "type": "string",
+                        "description": "Required for write tasks; the committed worktree HEAD SHA.",
+                    },
+                },
+                "required": ["task_id", "actor", "claim_token", "result", "tests"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "team_block_task",
+            "description": "Mark a task blocked and record the exact reason.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": task_id,
+                    "actor": {"type": "string"},
+                    "reason": {"type": "string", "minLength": 1},
+                    "claim_token": {"type": "string"},
+                },
+                "required": ["task_id", "actor", "reason"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "team_unblock_task",
+            "description": "Return a blocked task to ready after the blocker is resolved.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"task_id": task_id, "actor": {"type": "string"}},
+                "required": ["task_id", "actor"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "team_review_task",
+            "description": (
+                "Lead-only final review. Approve moves a reviewed task to done; reject returns "
+                "it to ready. A write task requires a clean worktree and a merge commit "
+                "reachable from the target branch recorded when its worktree was created."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": task_id,
+                    "actor": {"type": "string", "enum": ["lead", "main", "human"]},
+                    "approve": {"type": "boolean"},
+                    "notes": {"type": "string"},
+                    "merge_commit": {
+                        "type": "string",
+                        "description": "Required when approving a write task; record the commit merged into the main branch.",
+                    },
+                },
+                "required": ["task_id", "actor", "approve", "notes"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "team_add_message",
+            "description": "Send a team message, optionally attached to a task.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo_root": repo,
+                    "sender": {"type": "string"},
+                    "body": {"type": "string", "minLength": 1},
+                    "recipient": {"type": "string"},
+                    "task_id": {"type": "string"},
+                },
+                "required": ["repo_root", "sender", "body"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "team_list_messages",
+            "description": "Read recent team messages, optionally for one task.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo_root": repo,
+                    "task_id": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50},
+                },
+                "required": ["repo_root"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "team_cluster_start",
+            "description": (
+                "Create a persistent automated cluster goal and start the background scheduler. "
+                "The managed Lead will plan/review; deterministic workers execute goal tasks."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo_root": repo,
+                    "objective": {"type": "string", "minLength": 1},
+                    "autonomy": {
+                        "type": "string",
+                        "enum": ["auto", "supervised"],
+                        "default": "auto",
+                    },
+                    "max_worker_attempts": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 10,
+                        "default": 3,
+                    },
+                    "max_lead_attempts": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20,
+                        "default": 5,
+                    },
+                },
+                "required": ["repo_root", "objective"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "team_cluster_status",
+            "description": "Read cluster goals, Lead/Worker runs, retries, errors, and daemon status.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "goal_id": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "team_cluster_control",
+            "description": "Pause, resume, or cancel an automated cluster goal.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "goal_id": {"type": "string"},
+                    "action": {"type": "string", "enum": ["pause", "resume", "cancel"]},
+                },
+                "required": ["goal_id", "action"],
+                "additionalProperties": False,
+            },
+        },
+    ]
+
+
+class TeamMcpServer:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self.team = TeamService(settings)
+        self.worktrees = WorktreeManager(self.team)
+        self.cluster = ClusterManager(
+            settings,
+            team=self.team,
+            worktrees=self.worktrees,
+        )
+
+    def initialize(self, params: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "protocolVersion": str(params.get("protocolVersion") or PROTOCOL_VERSION),
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": "codex-team-board", "version": __version__},
+            "instructions": INSTRUCTIONS,
+        }
+
+    def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        if name == "team_init_project":
+            max_threads = arguments.get("max_threads")
+            return self.team.init_project(
+                arguments["repo_root"],
+                max_threads=int(max_threads) if max_threads is not None else None,
+            )
+        if name == "team_status":
+            repo = arguments.get("repo_root")
+            if repo:
+                return self.team.board_snapshot(repo)
+            return self.team.dashboard_snapshot()
+        if name == "team_list_roles":
+            return {"roles": self.team.list_roles()}
+        if name == "team_role_prompt":
+            return self.team.role_prompt(
+                arguments["role"],
+                arguments.get("repo_root"),
+            )
+        if name == "team_create_task":
+            return self.team.create_task(
+                arguments["repo_root"],
+                title=arguments["title"],
+                description=arguments.get("description", ""),
+                acceptance=arguments.get("acceptance", ""),
+                kind=arguments["kind"],
+                owner_role=arguments["owner_role"],
+                actor=arguments.get("actor", "lead"),
+                priority=int(arguments.get("priority", 2)),
+                depends_on=list(arguments.get("depends_on", [])),
+                goal_id=arguments.get("goal_id"),
+            )
+        if name == "team_list_tasks":
+            return {
+                "tasks": self.team.list_tasks(
+                    arguments["repo_root"],
+                    statuses=arguments.get("statuses"),
+                    owner_role=arguments.get("owner_role"),
+                    goal_id=arguments.get("goal_id"),
+                    include_done=bool(arguments.get("include_done", True)),
+                    include_archived=bool(arguments.get("include_archived", False)),
+                )
+            }
+        if name == "team_get_task":
+            return self.team.get_task(arguments["task_id"])
+        if name == "team_get_task_events":
+            return self.team.get_task_events(
+                arguments["task_id"],
+                limit=int(arguments.get("limit", 100)),
+            )
+        if name == "team_create_worktree":
+            return self.worktrees.create(
+                arguments["task_id"],
+                repo=arguments["repo_root"],
+                actor=arguments.get("actor", "lead"),
+                base_ref=arguments.get("base_ref", "HEAD"),
+                worktree_path=arguments.get("worktree_path"),
+            )
+        if name == "team_list_worktrees":
+            return {"worktrees": self.worktrees.list(arguments["repo_root"])}
+        if name == "team_claim_task":
+            return self.team.claim_task(
+                arguments["task_id"],
+                actor=arguments["actor"],
+                lease_minutes=int(arguments.get("lease_minutes", 30)),
+            )
+        if name == "team_heartbeat":
+            return self.team.heartbeat(
+                arguments["task_id"],
+                actor=arguments["actor"],
+                claim_token=arguments["claim_token"],
+                lease_minutes=int(arguments.get("lease_minutes", 30)),
+            )
+        if name == "team_update_task":
+            return self.team.update_task(
+                arguments["task_id"],
+                actor=arguments["actor"],
+                claim_token=arguments["claim_token"],
+                note=arguments["note"],
+                result=arguments.get("result"),
+                tests=arguments.get("tests"),
+            )
+        if name == "team_submit_task":
+            return self.team.submit_task(
+                arguments["task_id"],
+                actor=arguments["actor"],
+                claim_token=arguments["claim_token"],
+                result=arguments["result"],
+                tests=arguments["tests"],
+                commit_sha=arguments.get("commit_sha", ""),
+            )
+        if name == "team_block_task":
+            return self.team.block_task(
+                arguments["task_id"],
+                actor=arguments["actor"],
+                reason=arguments["reason"],
+                claim_token=arguments.get("claim_token"),
+            )
+        if name == "team_unblock_task":
+            return self.team.unblock_task(
+                arguments["task_id"],
+                actor=arguments["actor"],
+            )
+        if name == "team_review_task":
+            return self.team.review_task(
+                arguments["task_id"],
+                actor=arguments["actor"],
+                approve=bool(arguments["approve"]),
+                notes=arguments["notes"],
+                merge_commit=arguments.get("merge_commit", ""),
+            )
+        if name == "team_add_message":
+            return self.team.add_message(
+                arguments["repo_root"],
+                sender=arguments["sender"],
+                body=arguments["body"],
+                recipient=arguments.get("recipient"),
+                task_id=arguments.get("task_id"),
+            )
+        if name == "team_list_messages":
+            return {
+                "messages": self.team.list_messages(
+                    arguments["repo_root"],
+                    task_id=arguments.get("task_id"),
+                    limit=int(arguments.get("limit", 50)),
+                )
+            }
+        if name == "team_cluster_start":
+            goal = self.cluster.create_goal(
+                arguments["repo_root"],
+                objective=arguments["objective"],
+                autonomy=arguments.get("autonomy", "auto"),
+                max_worker_attempts=int(arguments.get("max_worker_attempts", 3)),
+                max_lead_attempts=int(arguments.get("max_lead_attempts", 5)),
+            )
+            return {
+                "goal": self.cluster.get_goal(goal["goal_id"]),
+                "daemon": ensure_daemon(self.settings),
+            }
+        if name == "team_cluster_status":
+            goal_id = arguments.get("goal_id")
+            return {
+                "daemon": cluster_daemon_status(self.settings),
+                "goals": (
+                    [self.cluster.get_goal(goal_id)]
+                    if goal_id
+                    else self.cluster.list_goals()
+                ),
+            }
+        if name == "team_cluster_control":
+            action = arguments["action"]
+            status = {"pause": "paused", "resume": "active", "cancel": "failed"}[action]
+            goal = self.cluster.set_goal_status(
+                arguments["goal_id"],
+                status,
+                reason=f"{action} requested through MCP",
+            )
+            return {
+                "goal": goal,
+                "daemon": ensure_daemon(self.settings) if action == "resume" else cluster_daemon_status(self.settings),
+            }
+        raise TeamError(f"unknown tool: {name}")
+
+
+def _tool_result(value: Any, *, is_error: bool = False) -> dict[str, Any]:
+    if value is None:
+        text = "OK"
+    elif isinstance(value, str):
+        text = value
+    else:
+        text = json.dumps(value, ensure_ascii=False, indent=2)
+    return {
+        "content": [{"type": "text", "text": text}],
+        "structuredContent": value if isinstance(value, dict) else None,
+        "isError": is_error,
+    }
+
+
+def _read_message(stream: Any) -> dict[str, Any] | None:
+    while True:
+        line = stream.readline()
+        if not line:
+            return None
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.lower().startswith(b"content-length:"):
+            length = int(stripped.split(b":", 1)[1].strip())
+            while True:
+                header = stream.readline()
+                if not header or not header.strip():
+                    break
+            return json.loads(stream.read(length).decode("utf-8"))
+        return json.loads(stripped.decode("utf-8"))
+
+
+def _write_message(message: dict[str, Any]) -> None:
+    sys.stdout.write(json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+def _process(server: TeamMcpServer, message: dict[str, Any]) -> dict[str, Any] | None:
+    message_id = message.get("id")
+    method = message.get("method")
+    params = message.get("params") if isinstance(message.get("params"), dict) else {}
+    if message_id is None:
+        return None
+    try:
+        if method == "initialize":
+            result = server.initialize(params)
+        elif method == "ping":
+            result = {}
+        elif method == "tools/list":
+            result = {"tools": _tool_definitions()}
+        elif method == "tools/call":
+            name = str(params.get("name") or "")
+            arguments = params.get("arguments") or {}
+            if not isinstance(arguments, dict):
+                raise TeamError("tool arguments must be an object")
+            result = _tool_result(server.call_tool(name, arguments))
+        elif method in {"resources/list", "prompts/list"}:
+            result = {"resources": []} if method == "resources/list" else {"prompts": []}
+        elif method == "logging/setLevel":
+            result = {}
+        else:
+            raise TeamError(f"method not found: {method}")
+        return {"jsonrpc": "2.0", "id": message_id, "result": result}
+    except Exception as exc:
+        LOGGER.exception("MCP request failed: %s", method)
+        if method == "tools/call":
+            return {
+                "jsonrpc": "2.0",
+                "id": message_id,
+                "result": _tool_result(f"Tool error: {exc}", is_error=True),
+            }
+        return {
+            "jsonrpc": "2.0",
+            "id": message_id,
+            "error": {"code": -32603, "message": str(exc)},
+        }
+
+
+def main() -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="strict")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        stream=sys.stderr,
+    )
+    server = TeamMcpServer(Settings.load())
+    while True:
+        try:
+            message = _read_message(sys.stdin.buffer)
+        except (ValueError, json.JSONDecodeError) as exc:
+            LOGGER.error("invalid MCP message: %s", exc)
+            continue
+        if message is None:
+            return 0
+        response = _process(server, message)
+        if response is not None:
+            _write_message(response)
