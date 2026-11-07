@@ -106,6 +106,11 @@ def build_parser() -> argparse.ArgumentParser:
     unblock.add_argument("task_id")
     unblock.add_argument("--actor", default="lead")
 
+    cancel = task_sub.add_parser("cancel")
+    cancel.add_argument("task_id")
+    cancel.add_argument("--actor", default="lead")
+    cancel.add_argument("--reason", required=True)
+
     review = task_sub.add_parser("review")
     review.add_argument("task_id")
     review.add_argument("--actor", required=True, choices=["lead", "main", "human"])
@@ -287,6 +292,14 @@ def main(argv: list[str] | None = None) -> int:
                     team.unblock_task(
                         _task_id(args.task_id),
                         actor=args.actor,
+                    )
+                )
+            elif args.task_command == "cancel":
+                _print(
+                    team.cancel_task(
+                        _task_id(args.task_id),
+                        actor=args.actor,
+                        reason=args.reason,
                     )
                 )
             elif args.task_command == "review":

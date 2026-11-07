@@ -7,6 +7,10 @@ param(
 $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $env:PYTHONPATH = Join-Path $projectRoot "src"
+$env:PYTHONIOENCODING = "utf-8"
+$env:PYTHONUTF8 = "1"
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $pythonRoot = Join-Path $env:LOCALAPPDATA "Python"
 $python = Get-ChildItem -LiteralPath $pythonRoot -Filter "python.exe" `
     -Recurse -ErrorAction SilentlyContinue |
@@ -32,12 +36,8 @@ New-Item -ItemType Directory -Path $globalAgents -Force | Out-Null
 foreach ($name in @("team-explorer.toml", "team-worker.toml", "team-reviewer.toml")) {
     $source = Join-Path $projectRoot "templates\agents\$name"
     $target = Join-Path $globalAgents $name
-    if (-not (Test-Path -LiteralPath $target)) {
-        Copy-Item -LiteralPath $source -Destination $target
-        Write-Output "Installed role: $target"
-    } else {
-        Write-Output "Preserved role: $target"
-    }
+    Copy-Item -LiteralPath $source -Destination $target -Force
+    Write-Output "Installed managed role: $target"
 }
 
 $promptRoles = Join-Path $env:USERPROFILE ".codex\team-roles"
@@ -45,12 +45,8 @@ New-Item -ItemType Directory -Path $promptRoles -Force | Out-Null
 foreach ($name in @("team-explorer.md", "team-worker.md", "team-reviewer.md")) {
     $source = Join-Path $projectRoot "templates\roles\$name"
     $target = Join-Path $promptRoles $name
-    if (-not (Test-Path -LiteralPath $target)) {
-        Copy-Item -LiteralPath $source -Destination $target
-        Write-Output "Installed role prompt: $target"
-    } else {
-        Write-Output "Preserved role prompt: $target"
-    }
+    Copy-Item -LiteralPath $source -Destination $target -Force
+    Write-Output "Installed managed role prompt: $target"
 }
 
 $codex = Get-Command codex.exe -ErrorAction Stop

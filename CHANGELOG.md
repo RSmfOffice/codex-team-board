@@ -2,6 +2,18 @@
 
 本项目遵循语义化版本。
 
+## [0.2.1] - 2026-11-07
+
+### Added
+
+- 失效任务取消工具、ready 等待认领预警和活动 Agent job 可视化。
+- 角色模板强制 claim/submit 闭环、Reviewer 新 thread 规则和跨模块契约要求。
+
+### Fixed
+
+- Windows 初始化把 managed 文件改写为 CRLF，制造整文件伪 diff。
+- `team_create_task.priority` 增加明确的 `0..3` 范围和方向说明。
+
 ## [0.2.0] - 2026-11-07
 
 ### Added

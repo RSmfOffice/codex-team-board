@@ -189,6 +189,8 @@ select {
 .chip.blocked { color: var(--amber); border-color: rgba(244,191,101,.35); }
 .chip.owner { color: var(--violet); border-color: rgba(185,156,255,.35); }
 .chip.archived { color: var(--amber); border-color: rgba(244,191,101,.35); }
+.chip.warning { color: var(--amber); border-color: rgba(244,191,101,.45); }
+.chip.critical { color: var(--red); border-color: rgba(255,114,134,.5); }
 
 .messages-panel {
   margin: 0 24px 24px;

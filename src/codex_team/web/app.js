@@ -23,6 +23,13 @@ function timeText(value) {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString("zh-CN");
 }
 
+function ageText(seconds) {
+  if (!seconds) return "刚刚";
+  if (seconds < 60) return `${seconds} 秒`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} 分钟`;
+  return `${Math.floor(seconds / 3600)} 小时`;
+}
+
 function syncTopbarHeight() {
   const topbar = document.querySelector(".topbar");
   document.documentElement.style.setProperty(
@@ -88,6 +95,12 @@ function renderCard(task) {
   const archived = task.archived_at
     ? '<span class="chip archived">已归档</span>'
     : "";
+  const assigned = task.active_job
+    ? `<span class="chip owner">已派发 ${escapeHtml(task.active_job.role)}</span>`
+    : "";
+  const claimWait = task.status === "ready" && task.claim_wait_seconds
+    ? `<span class="chip ${escapeHtml(task.claim_wait_state)}">等待认领 ${escapeHtml(ageText(task.claim_wait_seconds))}</span>`
+    : "";
   return `
     <article class="card" data-task-id="${escapeHtml(task.task_id)}">
       <div class="card-top">
@@ -99,7 +112,7 @@ function renderCard(task) {
         <span class="chip owner">${escapeHtml(task.owner_role)}</span>
         <span class="chip">P${escapeHtml(task.priority)}</span>
         <span class="chip">${escapeHtml(task.project_name || "")}</span>
-        ${blocker}${lease}${archived}
+        ${blocker}${lease}${assigned}${claimWait}${archived}
       </div>
     </article>`;
 }
@@ -206,6 +219,11 @@ function showDetail(taskId) {
     : "无";
   const body = document.getElementById("detail-body");
   const events = (eventsByTask.get(taskId) || []).slice(-12).reverse();
+  const runtime = task.active_job
+    ? `${task.active_job.kind}:${task.active_job.role} · ${task.active_job.status} · PID ${task.active_job.pid || "—"}`
+    : task.status === "ready"
+      ? `等待认领 ${ageText(task.claim_wait_seconds)}`
+      : "—";
   const timeline = events.length
     ? events.map((event) => `
         <div class="timeline-row">
@@ -222,6 +240,7 @@ function showDetail(taskId) {
       <dt>类型</dt><dd>${escapeHtml(task.kind)}</dd>
       <dt>负责角色</dt><dd>${escapeHtml(task.owner_role)}</dd>
       <dt>领取者</dt><dd>${escapeHtml(task.claimed_by || "—")}</dd>
+      <dt>运行状态</dt><dd>${escapeHtml(runtime)}</dd>
       <dt>依赖阻塞</dt><dd>${escapeHtml(dependencies)}</dd>
       <dt>分支</dt><dd>${escapeHtml(task.branch || "—")}</dd>
       <dt>目标分支</dt><dd>${escapeHtml(task.target_branch || "—")}</dd>

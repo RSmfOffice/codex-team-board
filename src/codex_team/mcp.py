@@ -108,7 +108,16 @@ def _tool_definitions() -> list[dict[str, Any]]:
                         "description": "Optional automated cluster goal ID.",
                     },
                     "actor": {"type": "string", "default": "lead"},
-                    "priority": {"type": "integer", "minimum": 0, "maximum": 3, "default": 2},
+                    "priority": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 3,
+                        "default": 2,
+                        "description": (
+                            "Scheduling priority. 0 is highest and 3 is lowest; "
+                            "values outside 0..3 are rejected."
+                        ),
+                    },
                     "depends_on": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -305,6 +314,22 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "type": "object",
                 "properties": {"task_id": task_id, "actor": {"type": "string"}},
                 "required": ["task_id", "actor"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "team_cancel_task",
+            "description": (
+                "Cancel a stale or superseded non-running task while preserving its event history."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": task_id,
+                    "actor": {"type": "string"},
+                    "reason": {"type": "string", "minLength": 1},
+                },
+                "required": ["task_id", "actor", "reason"],
                 "additionalProperties": False,
             },
         },
@@ -542,6 +567,12 @@ class TeamMcpServer:
             return self.team.unblock_task(
                 arguments["task_id"],
                 actor=arguments["actor"],
+            )
+        if name == "team_cancel_task":
+            return self.team.cancel_task(
+                arguments["task_id"],
+                actor=arguments["actor"],
+                reason=arguments["reason"],
             )
         if name == "team_review_task":
             return self.team.review_task(

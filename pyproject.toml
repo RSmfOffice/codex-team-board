@@ -1,6 +1,6 @@
 [project]
 name = "codex-team-board"
-version = "0.2.0"
+version = "0.2.1"
 description = "Local task graph, worktree coordinator, MCP server, and dashboard for Codex teams"
 readme = "README.md"
 license = { text = "MIT" }

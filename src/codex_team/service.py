@@ -288,14 +288,16 @@ class TeamService:
         ):
             source = template_dir / template_name
             target = roles_dir / target_name
-            if not target.exists():
-                target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+            expected = source.read_bytes()
+            if not target.exists() or target.read_bytes() != expected:
+                target.write_bytes(expected)
                 created_roles.append(str(target))
         for template_name in self.ROLE_FILES.values():
             source = prompt_template_dir / template_name
             target = prompt_roles_dir / template_name
-            if not target.exists():
-                target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+            expected = source.read_bytes()
+            if not target.exists() or target.read_bytes() != expected:
+                target.write_bytes(expected)
                 created_roles.append(str(target))
 
         agents_path = root / "AGENTS.md"
@@ -307,21 +309,22 @@ class TeamService:
             block,
         )
         if updated != existing:
-            agents_path.write_text(updated.rstrip() + "\n", encoding="utf-8")
+            agents_path.write_bytes((updated.rstrip() + "\n").encode("utf-8"))
 
-        marker_path.write_text(
-            json.dumps(
-                {
-                    "project_id": project["project_id"],
-                    "project_name": project["name"],
-                    "root_path": project["root_path"],
-                    "max_threads": max_threads,
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
-            + "\n",
-            encoding="utf-8",
+        marker_path.write_bytes(
+            (
+                json.dumps(
+                    {
+                        "project_id": project["project_id"],
+                        "project_name": project["name"],
+                        "root_path": project["root_path"],
+                        "max_threads": max_threads,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n"
+            ).encode("utf-8")
         )
         return {
             **project,
@@ -775,6 +778,40 @@ class TeamService:
                 task.pop("claim_token", None)
                 task["blocked_by"] = blocked_by.get(task["task_id"], [])
                 task["lease_expired"] = self._lease_expired(task.get("lease_until"))
+            active_jobs_by_task = {
+                job["task_id"]: {
+                    "job_id": job["job_id"],
+                    "kind": job["kind"],
+                    "role": job["role"],
+                    "status": job["status"],
+                    "pid": job.get("pid"),
+                    "attempt": job.get("attempt"),
+                    "started_at": job.get("started_at"),
+                }
+                for job in cluster_jobs
+                if job.get("task_id")
+                and job.get("status") in {"starting", "running"}
+            }
+            now_utc = datetime.now(UTC)
+            for task in tasks:
+                task["active_job"] = active_jobs_by_task.get(task["task_id"])
+                wait_seconds = 0
+                if task["status"] == "ready":
+                    try:
+                        created = datetime.fromisoformat(
+                            str(task["created_at"]).replace("Z", "+00:00")
+                        )
+                        wait_seconds = max(0, int((now_utc - created).total_seconds()))
+                    except (TypeError, ValueError):
+                        wait_seconds = 0
+                task["claim_wait_seconds"] = wait_seconds
+                task["claim_wait_state"] = (
+                    "critical"
+                    if wait_seconds >= 300
+                    else "warning"
+                    if wait_seconds >= 60
+                    else "normal"
+                )
             messages = [dict(row) for row in reversed(message_rows)]
             if project_id:
                 event_rows = connection.execute(
@@ -1027,6 +1064,60 @@ class TeamService:
                 (utc_now(), task_id),
             )
             self._event(connection, task_id, "unblocked", actor, {})
+        return self.get_task(task_id)
+
+    def cancel_task(
+        self,
+        task_id: str,
+        *,
+        actor: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        reason = reason.strip()
+        if not reason:
+            raise TeamError("cancel reason is required")
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            task = connection.execute(
+                "SELECT * FROM tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if task is None:
+                raise TeamError(f"task not found: {task_id}")
+            if task["status"] in TERMINAL_STATUSES:
+                raise TeamError(f"task is already terminal: {task['status']}")
+            if task["status"] == "running":
+                raise TeamError("running tasks must be submitted or blocked before cancellation")
+            active_job = connection.execute(
+                """
+                SELECT job_id FROM cluster_jobs
+                WHERE task_id = ? AND status IN ('starting', 'running')
+                LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+            if active_job:
+                raise TeamError(
+                    f"cannot cancel task with active job: {active_job['job_id']}"
+                )
+            now = utc_now()
+            connection.execute(
+                """
+                UPDATE tasks
+                SET status = 'canceled', blocker = ?, claimed_by = NULL,
+                    claim_token = NULL, lease_until = NULL, completed_at = ?,
+                    updated_at = ?, version = version + 1
+                WHERE task_id = ?
+                """,
+                (f"canceled: {reason}", now, now, task_id),
+            )
+            self._event(
+                connection,
+                task_id,
+                "canceled",
+                actor,
+                {"reason": reason},
+            )
         return self.get_task(task_id)
 
     def submit_task(
@@ -1391,6 +1482,11 @@ def _agents_block(project_id: str, max_threads: int) -> str:
   集成测试、合并和标记 `done`。子 Agent 不得自行批准任务。
 - 处理已标记团队项目时，Lead 必须先调用 `team_list_tasks` 检查现有任务、依赖和
   Review 状态；能恢复已有任务时不得重复创建。
+- 子 Agent 返回后，Lead 必须调用 `team_get_task` / `team_get_task_events` 验证
+  `claimed_by`、`claimed` 和 `submitted`（或 `blocked`）事件。没有状态落板的
+  Agent 回复不视为交付，必须重试或标记失败。
+- 已完成的子 Agent thread 不得用 follow-up 开启另一个任务；新材料和新审查必须
+  创建新 thread。60 秒未 claim 应提醒，5 分钟无 heartbeat 应标记异常。
 - 只读探索使用 `team_explorer`，写入使用 `team_worker`，独立审查使用
   `team_reviewer`。当前 Codex 版本不能自动加载角色 TOML 时，先调用
   `team_role_prompt(repo_root=...)`，把返回的角色 Prompt 作为子 Agent 的 spawn prompt。
@@ -1404,6 +1500,8 @@ def _agents_block(project_id: str, max_threads: int) -> str:
   时附上 commit、变更文件、行为摘要、测试命令与结果、风险和待决问题。
 - Worker 只能把任务提交到 `review`，不能直接改为 `done`。只有 Lead 或人工
   验收者可以调用 `team_review_task`。
+- 两个以上模块共享状态时，必须先声明字段名、单位、合法区间、枚举、更新者和
+  消费方，并至少有一条真实生产者到真实消费者的一体化测试。
 - 主 Agent 合并前必须检查 diff、依赖、测试和任务审阅记录；合并后运行集成测试，
   再关闭任务。
 - 接手或验收任务前使用 `team_get_task_events` 检查认领、进度、提交和 Review

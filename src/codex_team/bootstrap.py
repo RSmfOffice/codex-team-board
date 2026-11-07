@@ -55,7 +55,7 @@ def _configure_mcp(path: Path, project_root: Path) -> bool:
         lines[end:end] = additions
     updated = "".join(lines)
     if updated != text:
-        path.write_text(updated, encoding="utf-8")
+        path.write_bytes(updated.encode("utf-8"))
         return True
     return False
 
@@ -71,6 +71,10 @@ def _agents_block(project_root: Path) -> str:
 - 主 Agent 是唯一 Lead，负责创建任务、worktree、最终 Review、合并和关闭任务。
 - 处理团队项目时先调用 `team_list_tasks` 检查现有任务、依赖和 Review 状态；
   能恢复已有任务时不得重复创建。
+- 子 Agent 返回后必须检查 `team_get_task` 和 `team_get_task_events`；没有 claim
+  和 submit/block 事件的回复不能视为完成。
+- 已完成子 Agent 不得复用为另一个任务的 follow-up；新材料和新审查必须创建新
+  thread。60 秒未 claim 提醒，5 分钟无 heartbeat 标记异常。
 - 当前 Codex 不能自动加载角色 TOML 时，调用 `team_role_prompt` 并传入
   `repo_root`，把返回的 Prompt 作为原生子 Agent 的 spawn prompt。
 - 默认最多同时运行 4 个 agent thread。只并行文件范围互不重叠的任务。
@@ -83,6 +87,8 @@ def _agents_block(project_root: Path) -> str:
   SHA、测试命令与结果、变更文件、风险和待决问题。
 - Worker 无权标记 `done`。Lead 必须在真实合并并运行集成测试后提供
   `merge_commit`，再调用 `team_review_task`。
+- 多模块共享字段必须声明单位、区间、枚举、更新者和消费方，并验证真实生产者到
+  真实消费者的一体化路径。
 - 接手或验收任务前使用 `team_get_task_events` 检查认领、进度、提交和 Review
   事件，不能只看最终状态。
 - 用户要求自动持续推进时，使用 `team_cluster_start` 创建集群目标。由常驻
@@ -113,7 +119,7 @@ def _install_agents_block(path: Path, block: str) -> bool:
         updated = block + "\n"
     if updated != existing:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(updated, encoding="utf-8")
+        path.write_bytes(updated.encode("utf-8"))
         return True
     return False
 

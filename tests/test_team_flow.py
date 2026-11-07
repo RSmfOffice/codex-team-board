@@ -228,6 +228,7 @@ class TeamFlowTests(unittest.TestCase):
         configured = self.team.init_project(self.repo, max_threads=2)
         git(self.repo, "add", "AGENTS.md", ".codex/team-project.json")
         git(self.repo, "commit", "-m", "set project thread limit")
+        worker_prompt.write_bytes(b"stale managed role\r\n")
         self.team.init_project(self.repo)
         after = agents_path.read_text(encoding="utf-8")
         marker = json.loads(
@@ -236,6 +237,8 @@ class TeamFlowTests(unittest.TestCase):
         self.assertEqual(configured["max_threads"], 2)
         self.assertEqual(marker["max_threads"], 2)
         self.assertEqual(git(self.repo, "status", "--porcelain"), "")
+        self.assertNotIn(b"\r\n", worker_prompt.read_bytes())
+        self.assertNotIn(b"\r\n", agents_path.read_bytes())
         self.assertEqual(after.count("CODEX_TEAM_BOARD:START"), 1)
         self.assertEqual(after.count("CODEX_TEAM_BOARD:END"), 1)
         self.assertIn("推荐最大并发线程数：2", after)
@@ -317,6 +320,41 @@ class TeamFlowTests(unittest.TestCase):
         with self.assertRaisesRegex(TeamError, "running task"):
             self.team.set_project_archived(project["project_id"], True)
 
+    def test_cancel_stale_task_preserves_audit_and_rejects_running(self) -> None:
+        stale = self.team.create_task(
+            self.repo,
+            title="Stale reviewer",
+            description="Superseded task.",
+            acceptance="cancelled with reason",
+            kind="review",
+            owner_role="team_reviewer",
+        )
+        cancelled = self.team.cancel_task(
+            stale["task_id"],
+            actor="lead",
+            reason="superseded by a fresh reviewer task",
+        )
+        self.assertEqual(cancelled["status"], "canceled")
+        self.assertIn("superseded", cancelled["blocker"])
+        history = self.team.get_task_events(stale["task_id"])
+        self.assertIn("canceled", [event["event_type"] for event in history["events"]])
+
+        running = self.team.create_task(
+            self.repo,
+            title="Running cancellation",
+            description="Must block before cancellation.",
+            acceptance="cancel rejected",
+            kind="read",
+            owner_role="team_explorer",
+        )
+        self.team.claim_task(running["task_id"], actor="explorer")
+        with self.assertRaisesRegex(TeamError, "must be submitted or blocked"):
+            self.team.cancel_task(
+                running["task_id"],
+                actor="lead",
+                reason="stale",
+            )
+
     def test_task_archive_hides_restores_and_blocks_claim(self) -> None:
         task = self.team.create_task(
             self.repo,
@@ -397,6 +435,12 @@ class TeamFlowTests(unittest.TestCase):
                 data = json.loads(response.read().decode("utf-8"))
             self.assertEqual(len(data["tasks"]), 1)
             self.assertEqual(data["tasks"][0]["title"], "Dashboard task")
+            self.assertIsNone(data["tasks"][0]["active_job"])
+            self.assertIsInstance(data["tasks"][0]["claim_wait_seconds"], int)
+            self.assertIn(
+                data["tasks"][0]["claim_wait_state"],
+                {"normal", "warning", "critical"},
+            )
             self.assertEqual(len(data["events"]), 1)
             self.assertEqual(data["events"][0]["event_type"], "created")
 
@@ -481,7 +525,38 @@ class TeamFlowTests(unittest.TestCase):
         )
         self.assertEqual(saved["project_name"], self.repo.name)
 
+    def test_dashboard_flags_old_ready_task_for_claim_followup(self) -> None:
+        task = self.team.create_task(
+            self.repo,
+            title="Old ready task",
+            description="Shows claim delay.",
+            acceptance="dashboard flags delay",
+            kind="review",
+            owner_role="team_reviewer",
+        )
+        with self.team.connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET created_at = ? WHERE task_id = ?",
+                ("2000-01-01T00:00:00Z", task["task_id"]),
+            )
+        saved = next(
+            item
+            for item in self.team.dashboard_snapshot()["tasks"]
+            if item["task_id"] == task["task_id"]
+        )
+        self.assertEqual(saved["claim_wait_state"], "critical")
+        self.assertGreaterEqual(saved["claim_wait_seconds"], 300)
+
     def test_mcp_handoff_flow(self) -> None:
+        create_tool = next(
+            item
+            for item in _tool_definitions()
+            if item["name"] == "team_create_task"
+        )
+        priority_schema = create_tool["inputSchema"]["properties"]["priority"]
+        self.assertEqual(priority_schema["minimum"], 0)
+        self.assertEqual(priority_schema["maximum"], 3)
+        self.assertIn("0 is highest", priority_schema["description"])
         submit_tool = next(
             item
             for item in _tool_definitions()
@@ -540,6 +615,27 @@ class TeamFlowTests(unittest.TestCase):
             {"task_id": task["task_id"]},
         )
         self.assertIn("claimed", [event["event_type"] for event in history["events"]])
+
+        stale = mcp.call_tool(
+            "team_create_task",
+            {
+                "repo_root": str(self.repo),
+                "title": "MCP stale task",
+                "description": "Cancelled through MCP.",
+                "acceptance": "cancelled",
+                "kind": "review",
+                "owner_role": "team_reviewer",
+            },
+        )
+        canceled = mcp.call_tool(
+            "team_cancel_task",
+            {
+                "task_id": stale["task_id"],
+                "actor": "lead",
+                "reason": "superseded",
+            },
+        )
+        self.assertEqual(canceled["status"], "canceled")
 
     def test_concurrent_claim_has_one_winner_and_expired_lease_can_move(self) -> None:
         task = self.team.create_task(

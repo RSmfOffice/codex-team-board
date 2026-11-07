@@ -316,6 +316,7 @@ Running、Review、Blocked、Done 泳道，以及依赖、租约、分支、work
 - `team_submit_task`
 - `team_block_task`
 - `team_unblock_task`
+- `team_cancel_task`
 - `team_review_task`
 - `team_add_message`
 - `team_list_messages`
@@ -325,6 +326,7 @@ Running、Review、Blocked、Done 泳道，以及依赖、租约、分支、work
 ```text
 ready → running → review → done
    ↘ blocked ↗        ↘ ready（拒绝）
+ready/review/blocked ──取消──→ canceled
 ```
 
 - 有未完成依赖时不能 claim。
@@ -333,6 +335,20 @@ ready → running → review → done
 - `write` 任务没有 worktree 时不能 claim。
 - Worker 不能将任务直接标记 `done`。
 - 只有 `lead`、`main` 或 `human` 可以终审。
+- 非 Running 的失效任务可以由 Lead 取消；取消原因和事件永久保留。
+
+## 集群可靠性约束
+
+- `team_create_task.priority` 范围固定为 `0..3`，其中 `0` 最高、`3` 最低。
+- 子 Agent 的第一个团队动作必须是 claim；结束时必须 submit 或 block。
+- Lead 在子 Agent 返回后检查 `team_get_task_events`；没有 claim 和
+  submit/block 事件的回答不能视为完成。
+- 已完成 Agent 不复用为下一任务；新材料和新审查创建新 thread。
+- 任务 ready 后 60 秒未 claim 显示黄色提醒，5 分钟显示红色异常。
+- 跨模块共享字段必须声明名称、单位、合法区间、枚举、更新者和消费方，并验证
+  真实生产者到真实消费者的一体化路径。
+- 团队角色模板在初始化时同步到项目；managed 文件固定使用 UTF-8/LF，避免
+  Windows checkout 因 CRLF 产生整文件伪 diff。
 
 ## 自动 Agent 集群
 
