@@ -57,6 +57,16 @@ expectText(app, "data.cluster_summary", "app.js");
 expectText(app, "goal?.health", "app.js");
 expectText(app, "goal?.next_action", "app.js");
 expectText(app, 'allLabel: "选择目标项目"', "app.js");
+expectPattern(
+  app,
+  /function\s+syncProjectSelection\s*\(/,
+  "cluster project selector sync",
+);
+expectText(
+  app,
+  'document.getElementById("cluster-project-select").addEventListener("change"',
+  "cluster project selector change handler",
+);
 expectText(css, ".cluster-card.attention", "style.css");
 expectText(css, ".cluster-actions", "style.css");
 expectText(css, ".cluster-card.heartbeat-warning", "style.css");
@@ -383,6 +393,8 @@ assert.match(clusterHtmlBefore, /data-control-action="archive"/);
 assert.match(clusterHtmlBefore, /data-control-action="restore"/);
 assert.match(clusterHtmlBefore, /data-archived="true"/);
 assert.match(clusterHtmlBefore, /已归档/);
+assert.match(clusterHtmlBefore, /目标已结束/);
+assert.match(clusterHtmlBefore, /无需调度/);
 assert.equal(
   hooks.renderBoard(secondBoard),
   false,
@@ -540,6 +552,15 @@ assert.equal(
   "legacy last_error state should still surface attention",
 );
 assert.equal(
+  hooks.goalHeartbeatInfo({
+    status: "failed",
+    active_job_count: 0,
+    heartbeat_state: "idle",
+  }).label,
+  "目标已结束",
+  "terminal goals must not be presented as heartbeat failures",
+);
+assert.equal(
   hooks.goalHealth({
     status: "paused",
     last_error: "pause requested through dashboard",
@@ -551,6 +572,11 @@ assert.equal(
   hooks.nextActionText({ status: "paused" }),
   "可恢复目标继续推进",
   "paused goals should expose a fallback next action",
+);
+assert.equal(
+  hooks.goalQueueReason({ status: "completed", queue_reason: "none" }).label,
+  "无需调度",
+  "terminal goals should not be presented as queued",
 );
 assert.deepEqual(
   [1, 2, 3, 4, 5, 6, 7].map((failures) => hooks.backoffDelay(failures)),

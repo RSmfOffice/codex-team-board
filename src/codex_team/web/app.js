@@ -76,6 +76,16 @@ function nonNegativeNumber(value, fallback = 0) {
 function goalHeartbeatInfo(goal) {
   const state = String(goal?.heartbeat_state || "idle").toLowerCase();
   const known = heartbeatStates[state];
+  if (
+    terminalGoalStatuses.has(String(goal?.status || ""))
+    && nonNegativeNumber(goal?.active_job_count) === 0
+  ) {
+    return {
+      state: "idle",
+      label: "目标已结束",
+      tone: "idle",
+    };
+  }
   return {
     state,
     label: known?.label || `心跳状态 ${state}`,
@@ -85,6 +95,15 @@ function goalHeartbeatInfo(goal) {
 
 function goalQueueReason(goal) {
   const state = String(goal?.queue_reason || "none").toLowerCase();
+  if (
+    terminalGoalStatuses.has(String(goal?.status || ""))
+    && state === "none"
+  ) {
+    return {
+      state,
+      label: "无需调度",
+    };
+  }
   return {
     state,
     label: queueReasonLabels[state] || `排队状态 ${state}`,
@@ -191,7 +210,7 @@ async function loadProjects(signal) {
     {
       allLabel: "选择目标项目",
       preferredValue:
-        document.getElementById("cluster-project-select").value || selectedProject,
+        selectedProject || document.getElementById("cluster-project-select").value,
       fallbackToSingleProject: true,
     },
   );
@@ -216,6 +235,20 @@ function updateArchiveButton() {
     ? "恢复当前项目"
     : "归档当前项目";
   button.classList.toggle("restore", Boolean(project?.archived_at));
+}
+
+function syncProjectSelection(projectId, { refresh = true } = {}) {
+  selectedProject = projectsById.has(projectId) ? projectId : "";
+  const topSelect = document.getElementById("project-select");
+  const clusterSelect = document.getElementById("cluster-project-select");
+  if (topSelect && topSelect.value !== selectedProject) {
+    topSelect.value = selectedProject;
+  }
+  if (clusterSelect && clusterSelect.value !== selectedProject) {
+    clusterSelect.value = selectedProject;
+  }
+  closeDetail();
+  if (refresh) void requestImmediateRefresh();
 }
 
 function renderCard(task) {
@@ -986,9 +1019,10 @@ function initializeDashboard() {
     handleCreateCluster,
   );
   document.getElementById("project-select").addEventListener("change", (event) => {
-    closeDetail();
-    selectedProject = event.target.value;
-    void requestImmediateRefresh();
+    syncProjectSelection(event.target.value);
+  });
+  document.getElementById("cluster-project-select").addEventListener("change", (event) => {
+    syncProjectSelection(event.target.value);
   });
   document.getElementById("show-archived").addEventListener("change", (event) => {
     closeDetail();
