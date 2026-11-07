@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -33,9 +34,10 @@ METRIC_NAMES = (
 @dataclass(frozen=True)
 class Observation:
     variant: str
-    metrics: dict[str, float]
+    metrics: dict[str, float | None]
     first_turn_latency_ms: float | None
     task_success: bool
+    last_usage_present: bool
 
 
 def load_observations(
@@ -78,20 +80,23 @@ def load_observations(
     ]
 
 
-def _number(value: Any) -> float:
-    if isinstance(value, bool):
-        return float(value)
+def _number(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
     try:
-        return float(value or 0)
+        number = float(value)
     except (TypeError, ValueError):
-        return 0.0
+        return None
+    if not math.isfinite(number) or number < 0:
+        return None
+    return number
 
 
 def _first(mapping: Mapping[str, Any], *names: str) -> Any:
     for name in names:
         if name in mapping:
             return mapping[name]
-    return 0
+    return None
 
 
 def normalize_observation(
@@ -106,51 +111,84 @@ def normalize_observation(
 
     usage = record.get("usage")
     usage = usage if isinstance(usage, Mapping) else {}
-    total = usage.get("total")
-    total = total if isinstance(total, Mapping) else usage
-    last = usage.get("last")
-    last = last if isinstance(last, Mapping) else usage
+    nested_usage = "total" in usage or "last" in usage
+    total_value = usage.get("total")
+    total = (
+        total_value
+        if isinstance(total_value, Mapping)
+        else (usage if usage and not nested_usage else {})
+    )
+    last_value = usage.get("last")
+    last = last_value if isinstance(last_value, Mapping) else {}
+
+    def metric(
+        flat_name: str,
+        source: Mapping[str, Any],
+        *names: str,
+    ) -> float | None:
+        if flat_name in record:
+            flat_value = _number(record[flat_name])
+            if flat_value is not None:
+                return flat_value
+        return _number(_first(source, *names))
+
     metrics = {
-        "last_input_tokens": _number(
-            _first(last, "input", "inputTokens", "input_tokens")
+        "last_input_tokens": metric(
+            "last_input_tokens", last, "input", "inputTokens", "input_tokens"
         ),
-        "last_cached_input_tokens": _number(
-            _first(last, "cached", "cachedInputTokens", "cached_input_tokens")
+        "last_cached_input_tokens": metric(
+            "last_cached_input_tokens",
+            last,
+            "cached",
+            "cachedInputTokens",
+            "cached_input_tokens",
         ),
-        "last_uncached_input_tokens": _number(
-            _first(last, "uncached", "uncachedInputTokens", "uncached_input_tokens")
+        "last_uncached_input_tokens": metric(
+            "last_uncached_input_tokens",
+            last,
+            "uncached",
+            "uncachedInputTokens",
+            "uncached_input_tokens",
         ),
-        "last_output_tokens": _number(
-            _first(last, "output", "outputTokens", "output_tokens")
+        "last_output_tokens": metric(
+            "last_output_tokens", last, "output", "outputTokens", "output_tokens"
         ),
-        "last_context_tokens": _number(
-            _first(last, "context", "contextTokens", "context_tokens")
+        "last_context_tokens": metric(
+            "last_context_tokens", last, "context", "contextTokens", "context_tokens"
         ),
-        "total_input_tokens": _number(
-            _first(total, "input", "inputTokens", "input_tokens")
+        "total_input_tokens": metric(
+            "total_input_tokens", total, "input", "inputTokens", "input_tokens"
         ),
-        "total_cached_input_tokens": _number(
-            _first(total, "cached", "cachedInputTokens", "cached_input_tokens")
+        "total_cached_input_tokens": metric(
+            "total_cached_input_tokens",
+            total,
+            "cached",
+            "cachedInputTokens",
+            "cached_input_tokens",
         ),
-        "total_uncached_input_tokens": _number(
-            _first(total, "uncached", "uncachedInputTokens", "uncached_input_tokens")
+        "total_uncached_input_tokens": metric(
+            "total_uncached_input_tokens",
+            total,
+            "uncached",
+            "uncachedInputTokens",
+            "uncached_input_tokens",
         ),
-        "total_output_tokens": _number(
-            _first(total, "output", "outputTokens", "output_tokens")
+        "total_output_tokens": metric(
+            "total_output_tokens", total, "output", "outputTokens", "output_tokens"
         ),
-        "total_context_tokens": _number(
-            _first(total, "context", "contextTokens", "context_tokens")
+        "total_context_tokens": metric(
+            "total_context_tokens", total, "context", "contextTokens", "context_tokens"
         ),
     }
-    for name in METRIC_NAMES:
-        flat = record.get(name)
-        if flat is not None:
-            metrics[name] = _number(flat)
     for prefix in ("last_", "total_"):
         input_name = f"{prefix}input_tokens"
         cached_name = f"{prefix}cached_input_tokens"
         uncached_name = f"{prefix}uncached_input_tokens"
-        if cached_name not in record and uncached_name not in record:
+        if (
+            metrics[uncached_name] is None
+            and metrics[input_name] is not None
+            and metrics[cached_name] is not None
+        ):
             metrics[uncached_name] = max(
                 0.0,
                 metrics[input_name] - metrics[cached_name],
@@ -159,10 +197,13 @@ def normalize_observation(
     latency_value = record.get("first_turn_latency_ms")
     if latency_value is None:
         seconds = record.get("first_turn_latency_seconds")
-        latency = _number(seconds) * 1000 if seconds is not None else None
+        latency_number = _number(seconds)
+        latency = latency_number * 1000 if latency_number is not None else None
     else:
         latency = _number(latency_value)
-    success_value = record.get("task_success", record.get("success", True))
+    if "task_success" not in record or record["task_success"] is None:
+        raise ValueError(f"{variant} record is missing required task_success")
+    success_value = record["task_success"]
     if isinstance(success_value, str):
         success = success_value.strip().lower() in {"1", "true", "yes", "passed", "ok"}
     else:
@@ -172,6 +213,7 @@ def normalize_observation(
         metrics=metrics,
         first_turn_latency_ms=latency,
         task_success=success,
+        last_usage_present=metrics["last_uncached_input_tokens"] is not None,
     )
 
 
@@ -186,8 +228,14 @@ def summarize(
         successful = [item for item in items if item.task_success]
         metrics = {
             name: (
-                median([item.metrics[name] for item in successful])
-                if successful
+                median(
+                    [
+                        value
+                        for item in successful
+                        if (value := item.metrics[name]) is not None
+                    ]
+                )
+                if any(item.metrics[name] is not None for item in successful)
                 else None
             )
             for name in METRIC_NAMES
@@ -197,8 +245,16 @@ def summarize(
             for item in successful
             if item.first_turn_latency_ms is not None
         ]
-        total_input = metrics["total_input_tokens"] or 0
-        total_cached = metrics["total_cached_input_tokens"] or 0
+        last_cache_rates = [
+            min(item.metrics["last_cached_input_tokens"], item.metrics["last_input_tokens"])
+            / item.metrics["last_input_tokens"]
+            for item in successful
+            if item.metrics["last_input_tokens"] not in {None, 0}
+            and item.metrics["last_cached_input_tokens"] is not None
+        ]
+        last_usage_sample_count = sum(
+            1 for item in successful if item.last_usage_present
+        )
         result[variant] = {
             **metrics,
             **{
@@ -212,6 +268,10 @@ def summarize(
             "sample_count": len(items),
             "successful_sample_count": len(successful),
             "first_turn_latency_sample_count": len(latencies),
+            "last_usage_sample_count": last_usage_sample_count,
+            "last_usage_complete": bool(
+                successful and last_usage_sample_count == len(successful)
+            ),
             "first_turn_latency_ms": median(latencies) if latencies else None,
             "median_first_turn_latency_ms": (
                 median(latencies) if latencies else None
@@ -222,7 +282,7 @@ def summarize(
                 else None
             ),
             "cache_hit_rate": (
-                total_cached / total_input if total_input > 0 else None
+                median(last_cache_rates) if last_cache_rates else None
             ),
         }
     return result
@@ -263,6 +323,12 @@ def compare(fresh: Mapping[str, Any], reuse: Mapping[str, Any]) -> dict[str, Any
         and reuse_success is not None
         and float(reuse_success) >= float(fresh_success)
     )
+    last_usage_gate = bool(
+        fresh.get("last_usage_complete")
+        and reuse.get("last_usage_complete")
+        and fresh_uncached is not None
+        and reuse_uncached is not None
+    )
     return {
         "primary_metric": "median last_uncached_input_tokens of successful tasks",
         "uncached_input_change": uncached_change,
@@ -282,7 +348,12 @@ def compare(fresh: Mapping[str, Any], reuse: Mapping[str, Any]) -> dict[str, Any
         "uncached_gate": uncached_gate,
         "latency_gate": latency_gate,
         "success_gate": success_gate,
-        "meets_gate": bool((uncached_gate or latency_gate) and success_gate),
+        "last_usage_gate": last_usage_gate,
+        "meets_gate": bool(
+            last_usage_gate
+            and (uncached_gate or latency_gate)
+            and success_gate
+        ),
     }
 
 
@@ -361,6 +432,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             f"- Diagnostic total uncached input change: {_format_number(comparison['total_uncached_input_change_diagnostic'], percent=True)}",
             f"- First-turn latency change: {_format_number(comparison['first_turn_latency_change'], percent=True)}",
             f"- Success rate change: {_format_number(comparison['success_rate_change'], percent=True)}",
+            f"- Complete successful-task last usage: {'yes' if comparison['last_usage_gate'] else 'no'}",
             f"- Result: {'PASS' if comparison['meets_gate'] else 'FAIL'}",
             "",
         ]
@@ -391,12 +463,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--markdown", type=Path, help="Write the Markdown report here.")
     args = parser.parse_args(argv)
     observations: list[Observation] = []
-    if args.input:
-        observations.extend(load_observations(args.input))
-    if args.fresh:
-        observations.extend(load_observations(args.fresh, default_variant="fresh"))
-    if args.reuse:
-        observations.extend(load_observations(args.reuse, default_variant="reuse"))
+    try:
+        if args.input:
+            observations.extend(load_observations(args.input))
+        if args.fresh:
+            observations.extend(load_observations(args.fresh, default_variant="fresh"))
+        if args.reuse:
+            observations.extend(load_observations(args.reuse, default_variant="reuse"))
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
     if not observations:
         parser.error("provide --input and/or both --fresh and --reuse")
     if not args.input and (not args.fresh or not args.reuse):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
@@ -91,12 +92,21 @@ class StubAppServerRuntime:
         *,
         fail_start: int = 0,
         fail_restart: int = 0,
+        fail_resume: int = 0,
+        fail_start_thread: int = 0,
+        fail_turn: int = 0,
     ) -> None:
         self.fail_start = fail_start
         self.fail_restart = fail_restart
+        self.fail_resume = fail_resume
+        self.fail_start_thread = fail_start_thread
+        self.fail_turn = fail_turn
         self.start_calls = 0
         self.restart_calls = 0
         self.stop_calls = 0
+        self.resume_attempts = 0
+        self.start_thread_attempts = 0
+        self.turn_attempts = 0
         self.start_threads: list[tuple[str, str | None]] = []
         self.resume_threads: list[str] = []
         self.turns: list[dict[str, object]] = []
@@ -134,12 +144,18 @@ class StubAppServerRuntime:
         service_name: str | None = None,
     ) -> str:
         with self._lock:
+            self.start_thread_attempts += 1
+            if self.start_thread_attempts <= self.fail_start_thread:
+                raise RuntimeError("thread/start failed")
             self._thread_sequence += 1
             thread_id = f"stub-thread-{self._thread_sequence}"
             self.start_threads.append((str(cwd), developer_instructions))
             return thread_id
 
     def resume_thread(self, thread_id: str, exclude_turns: bool = True) -> str:
+        self.resume_attempts += 1
+        if self.resume_attempts <= self.fail_resume:
+            raise RuntimeError("modelProviderMismatch during thread/resume")
         self.resume_threads.append(thread_id)
         return thread_id
 
@@ -153,6 +169,9 @@ class StubAppServerRuntime:
         effort: str | None = None,
     ) -> dict[str, str]:
         with self._lock:
+            self.turn_attempts += 1
+            if self.turn_attempts <= self.fail_turn:
+                raise RuntimeError("turn/start failed")
             self._turn_sequence += 1
             turn_id = f"stub-turn-{self._turn_sequence}"
             self.turns.append(
@@ -1423,7 +1442,308 @@ class ClusterSchedulerTests(unittest.TestCase):
                 if event["event_type"] == "agent_context_reset"
             ]
             self.assertEqual(len(resets), 2)
+            self.assertEqual(
+                [event["data"]["retry_allowed"] for event in resets],
+                [True, False],
+            )
+            self.assertEqual(
+                {
+                    event["data"]["retry_scope"]
+                    for event in resets
+                },
+                {f"worker:{task['task_id']}"},
+            )
+            self.assertIn(
+                "agent_context_retry_exhausted",
+                [event["event_type"] for event in goal_result["events"]],
+            )
             self.assertEqual(len(runtime.start_threads), 2)
+
+    def test_lead_legacy_thread_cannot_bypass_agent_pool_compatibility(self) -> None:
+        cases = (
+            ("model", {"model": "other-model"}),
+            ("provider", {"model_provider": "other-provider"}),
+            ("workstream", {"workstream_key": "other-workstream"}),
+            ("status", {"status": "failed"}),
+            ("reset", {"reset_requested": True}),
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "CODEX_TEAM_MODEL": "current-model",
+                "CODEX_TEAM_MODEL_PROVIDER": "current-provider",
+            },
+        ):
+            for case_name, options in cases:
+                with self.subTest(case=case_name), tempfile.TemporaryDirectory() as temporary:
+                    base = Path(temporary)
+                    settings = _settings(base)
+                    team = TeamService(settings)
+                    repo = _repo(base, f"legacy-{case_name}")
+                    project = team.init_project(repo)
+                    runtime = StubAppServerRuntime()
+                    manager = ClusterManager(
+                        settings,
+                        team=team,
+                        runtime=runtime,
+                        runtime_mode="app_server",
+                    )
+                    goal = manager.create_goal(
+                        repo,
+                        objective=f"Legacy compatibility {case_name}",
+                        workstream_key="legacy-workstream",
+                    )
+                    pool = AgentPool(settings)
+                    agent = pool.register_thread(
+                        project["project_id"],
+                        "lead",
+                        str(options.get("workstream_key", "legacy-workstream")),
+                        f"legacy-{case_name}-thread",
+                        str(options.get("model", "current-model")),
+                        str(options.get("model_provider", "current-provider")),
+                        f"legacy {case_name} lead",
+                    )
+                    if options.get("status") == "failed":
+                        pool.mark_failed(agent["agent_id"], "status mismatch")
+                    if options.get("reset_requested"):
+                        pool.request_reset(
+                            agent["agent_id"],
+                            "reset mismatch",
+                            "test",
+                        )
+                    with team.connection() as connection:
+                        connection.execute(
+                            """
+                            UPDATE cluster_goals
+                            SET lead_thread_id = ?, updated_at = ?
+                            WHERE goal_id = ?
+                            """,
+                            (agent["thread_id"], utc_now(), goal["goal_id"]),
+                        )
+
+                    dispatched = manager._dispatch_lead(
+                        manager.get_goal(goal["goal_id"]),
+                        [],
+                    )
+
+                    self.assertEqual(runtime.resume_threads, [])
+                    self.assertEqual(dispatched["thread_id"], "stub-thread-1")
+                    self.assertEqual(len(runtime.start_threads), 1)
+
+    def test_selected_lead_resume_failure_marks_old_agent_and_starts_fresh_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            repo = _repo(base, "resume-fresh")
+            project = team.init_project(repo)
+            runtime = StubAppServerRuntime(fail_resume=1)
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime=runtime,
+                runtime_mode="app_server",
+            )
+            goal = manager.create_goal(
+                repo,
+                objective="Resume then replace",
+                workstream_key="resume-workstream",
+            )
+            pool = AgentPool(settings)
+            old_agent = pool.register_thread(
+                project["project_id"],
+                "lead",
+                "resume-workstream",
+                "stale-thread",
+                manager.model,
+                manager.model_provider,
+                "stale lead",
+            )
+            with team.connection() as connection:
+                connection.execute(
+                    """
+                    UPDATE cluster_goals
+                    SET lead_thread_id = ?, updated_at = ?
+                    WHERE goal_id = ?
+                    """,
+                    (old_agent["thread_id"], utc_now(), goal["goal_id"]),
+                )
+
+            dispatched = manager._dispatch_lead(
+                manager.get_goal(goal["goal_id"]),
+                [],
+            )
+
+            self.assertEqual(runtime.resume_attempts, 1)
+            self.assertEqual(len(runtime.start_threads), 1)
+            self.assertNotEqual(dispatched["thread_id"], old_agent["thread_id"])
+            failed = next(
+                agent
+                for agent in pool.list_agents(project["project_id"])
+                if agent["agent_id"] == old_agent["agent_id"]
+            )
+            self.assertEqual(failed["status"], "failed")
+            self.assertIsNotNone(failed["reset_requested_at"])
+            self.assertIn(old_agent["thread_id"], runtime.unsubscribed)
+            job = next(
+                item
+                for item in manager.get_goal(goal["goal_id"])["jobs"]
+                if item["job_id"] == dispatched["job_id"]
+            )
+            self.assertEqual(job["thread_id"], dispatched["thread_id"])
+            log = Path(job["log_path"]).read_text(encoding="utf-8")
+            self.assertIn("agent_thread_resume_failed", log)
+
+    def test_lead_context_overflow_retries_once_then_fails_goal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            repo = _repo(base, "lead-context-overflow")
+            runtime = StubAppServerRuntime()
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime=runtime,
+                runtime_mode="app_server",
+                lead_cooldown_seconds=0,
+            )
+            goal = manager.create_goal(repo, objective="Lead overflow")
+
+            first = manager._dispatch_lead(manager.get_goal(goal["goal_id"]), [])
+            manager.app_turns[first["job_id"]]["context_window_exceeded"] = True
+            manager.app_turns[first["job_id"]]["status"] = "failed"
+            manager.app_turns[first["job_id"]]["error"] = {
+                "codexErrorInfo": "contextWindowExceeded",
+                "message": "contextWindowExceeded",
+            }
+            manager._reconcile_jobs()
+            first_goal = manager.get_goal(goal["goal_id"])
+            self.assertEqual(first_goal["status"], "active")
+            self.assertIsNone(first_goal["lead_thread_id"])
+
+            second = manager._dispatch_lead(first_goal, [])
+            manager.app_turns[second["job_id"]]["context_window_exceeded"] = True
+            manager.app_turns[second["job_id"]]["status"] = "failed"
+            manager.app_turns[second["job_id"]]["error"] = {
+                "codexErrorInfo": "contextWindowExceeded",
+                "message": "contextWindowExceeded",
+            }
+            manager._reconcile_jobs()
+            manager.tick()
+
+            result = manager.get_goal(goal["goal_id"])
+            self.assertEqual(result["status"], "failed")
+            self.assertIn("one automatic fresh-thread retry", result["last_error"])
+            self.assertEqual(len(runtime.start_threads), 2)
+            reset_events = [
+                event
+                for event in result["events"]
+                if event["event_type"] == "agent_context_reset"
+            ]
+            self.assertEqual(len(reset_events), 2)
+            self.assertEqual(reset_events[0]["data"]["retry_scope"], f"lead:{goal['goal_id']}")
+            self.assertEqual(
+                [event["data"]["retry_allowed"] for event in reset_events],
+                [True, False],
+            )
+            self.assertIn(
+                "agent_context_retry_exhausted",
+                [event["event_type"] for event in result["events"]],
+            )
+
+    def test_app_server_start_failure_falls_back_to_exec_in_same_job(self) -> None:
+        class FakeProcess:
+            pid = 424242
+
+            def __init__(self) -> None:
+                self.stdin = io.StringIO()
+                self.stdout = io.StringIO()
+
+            def poll(self) -> None:
+                return None
+
+        for case_name, runtime in (
+            ("thread", StubAppServerRuntime(fail_start_thread=2)),
+            ("turn", StubAppServerRuntime(fail_turn=2)),
+        ):
+            with self.subTest(case=case_name), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary)
+                settings = _settings(base)
+                team = TeamService(settings)
+                repo = _repo(base, f"fallback-{case_name}")
+                project = team.init_project(repo)
+                manager = ClusterManager(
+                    settings,
+                    team=team,
+                    runtime=runtime,
+                    runtime_mode="app_server",
+                )
+                goal = manager.create_goal(
+                    repo,
+                    objective=f"Fallback {case_name}",
+                )
+                task = team.create_task(
+                    repo,
+                    title=f"Fallback {case_name}",
+                    description="App Server startup failure must fall back.",
+                    acceptance="The same job runs with exec.",
+                    kind="read",
+                    owner_role="team_explorer",
+                    goal_id=goal["goal_id"],
+                )
+                process = FakeProcess()
+                current_goal = manager.get_goal(goal["goal_id"])
+                current_task = team.get_task(task["task_id"])
+                real_popen = subprocess.Popen
+
+                def popen(command, *args, **kwargs):
+                    if command and command[0] == "git":
+                        return real_popen(command, *args, **kwargs)
+                    return process
+
+                with patch(
+                    "codex_team.cluster.subprocess.Popen",
+                    side_effect=popen,
+                ):
+                    dispatched = manager._dispatch_worker(
+                        current_goal,
+                        current_task,
+                    )
+
+                job = next(
+                    item
+                    for item in manager.get_goal(goal["goal_id"])["jobs"]
+                    if item["job_id"] == dispatched["job_id"]
+                )
+                self.assertEqual(dispatched["runtime"], "exec")
+                self.assertEqual(job["runtime"], "exec")
+                self.assertEqual(job["status"], "running")
+                self.assertEqual(job["pid"], FakeProcess.pid)
+                self.assertIsNone(job["thread_id"])
+                self.assertIsNone(job["agent_id"])
+                self.assertEqual(team.get_task(task["task_id"])["status"], "ready")
+                fallback_events = [
+                    event["data"]
+                    for event in manager.get_goal(goal["goal_id"])["events"]
+                    if event["event_type"] == "agent_runtime_fallback"
+                    and event["data"].get("job_id") == dispatched["job_id"]
+                ]
+                self.assertEqual(len(fallback_events), 1)
+                self.assertEqual(fallback_events[0]["scope"], "same_job")
+                self.assertEqual(fallback_events[0]["fallback_runtime"], "exec")
+                log = Path(job["log_path"]).read_text(encoding="utf-8")
+                self.assertIn("agent_runtime_fallback", log)
+                self.assertIn("# command=", log)
+                if case_name == "thread":
+                    self.assertEqual(runtime.start_thread_attempts, 2)
+                    self.assertEqual(runtime.restart_calls, 1)
+                else:
+                    self.assertEqual(runtime.turn_attempts, 2)
+                    self.assertEqual(runtime.restart_calls, 1)
+                    failed = AgentPool(settings).list_agents(project["project_id"])[0]
+                    self.assertEqual(failed["status"], "failed")
+                    self.assertIsNotNone(failed["reset_requested_at"])
 
     def test_related_goals_reuse_lead_thread_by_workstream(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2061,6 +2381,196 @@ class ClusterSchedulerTests(unittest.TestCase):
             self.assertIn("Median total_input_tokens (diagnostic)", markdown)
             self.assertIn("Sample count", markdown)
             self.assertIn("Result: PASS", markdown)
+
+    def test_agent_cache_benchmark_requires_success_and_last_usage(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1]
+            / "scripts"
+            / "agent-cache-benchmark.py"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            fresh = base / "fresh.jsonl"
+            reuse = base / "reuse.jsonl"
+            missing_success = base / "missing-success.jsonl"
+            fresh.write_text(
+                json.dumps(
+                    {
+                        "first_turn_latency_ms": 1000,
+                        "task_success": True,
+                        "last_uncached_input_tokens": 100,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            reuse.write_text(
+                json.dumps(
+                    {
+                        "first_turn_latency_ms": 800,
+                        "task_success": True,
+                        "last_uncached_input_tokens": 80,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            missing_success.write_text(
+                json.dumps(
+                    {
+                        "first_turn_latency_ms": 1000,
+                        "last_uncached_input_tokens": 100,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            rejected = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "--fresh",
+                    str(missing_success),
+                    "--reuse",
+                    str(reuse),
+                ],
+                cwd=Path(__file__).resolve().parents[1],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("task_success", rejected.stderr)
+
+            no_last = base / "no-last.jsonl"
+            no_last.write_text(
+                "\n".join(
+                    json.dumps(record)
+                    for record in (
+                        {
+                            "first_turn_latency_ms": 1000,
+                            "task_success": True,
+                            "total_input_tokens": 1000,
+                            "total_cached_input_tokens": 500,
+                            "total_uncached_input_tokens": 500,
+                        },
+                        {
+                            "first_turn_latency_ms": 100,
+                            "task_success": True,
+                            "total_input_tokens": 2000,
+                            "total_cached_input_tokens": 1500,
+                            "total_uncached_input_tokens": 500,
+                        },
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            report_path = base / "no-last.json"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "--fresh",
+                    str(no_last),
+                    "--reuse",
+                    str(no_last),
+                    "--json",
+                    str(report_path),
+                ],
+                cwd=Path(__file__).resolve().parents[1],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertFalse(report["comparison"]["last_usage_gate"])
+            self.assertFalse(report["comparison"]["meets_gate"])
+            self.assertFalse(report["variants"]["fresh"]["last_usage_complete"])
+            self.assertIsNone(
+                report["variants"]["fresh"]["median_last_uncached_input_tokens"]
+            )
+            self.assertIsNone(report["variants"]["fresh"]["cache_hit_rate"])
+
+            nested = base / "nested.jsonl"
+            nested.write_text(
+                "\n".join(
+                    json.dumps(record)
+                    for record in (
+                        {
+                            "first_turn_latency_ms": 1000,
+                            "task_success": True,
+                            "usage": {
+                                "total": {
+                                    "input": 1000,
+                                    "cached": 900,
+                                    "uncached": 100,
+                                },
+                                "last": {
+                                    "input": 100,
+                                    "cached": 20,
+                                    "uncached": 80,
+                                },
+                            },
+                        },
+                        {
+                            "first_turn_latency_ms": 1000,
+                            "task_success": True,
+                            "usage": {
+                                "total": {
+                                    "input": 1000,
+                                    "cached": 100,
+                                    "uncached": 900,
+                                },
+                                "last": {
+                                    "input": 100,
+                                    "cached": 40,
+                                    "uncached": 60,
+                                },
+                            },
+                        },
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            nested_report_path = base / "nested.json"
+            nested_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "--fresh",
+                    str(nested),
+                    "--reuse",
+                    str(nested),
+                    "--json",
+                    str(nested_report_path),
+                ],
+                cwd=Path(__file__).resolve().parents[1],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            self.assertEqual(nested_result.returncode, 0, nested_result.stderr)
+            nested_report = json.loads(
+                nested_report_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                nested_report["variants"]["fresh"]["median_last_uncached_input_tokens"],
+                70,
+            )
+            self.assertAlmostEqual(
+                nested_report["variants"]["fresh"]["cache_hit_rate"],
+                0.3,
+            )
 
 
 if __name__ == "__main__":
