@@ -413,6 +413,48 @@ const firstBoard = {
       last_used_at: "2026-11-07T09:55:00Z",
       reset_requested_at: null,
     },
+    {
+      agent_id: "A-SUPERSEDED",
+      display_name: "Superseded Explorer",
+      status: "superseded",
+      role: "team_explorer",
+      workstream_key: "retired",
+      thread_id: "thread-agent-superseded",
+      current_goal_id: null,
+      current_task_id: null,
+      model: "test-model",
+      model_provider: "test-provider",
+      context_tokens: 0,
+      last_cached_input_tokens: 0,
+      last_uncached_input_tokens: 0,
+      total_cached_input_tokens: 0,
+      total_uncached_input_tokens: 0,
+      cache_hit_rate: 0,
+      turn_count: 1,
+      reset_requested_at: null,
+      archived_at: null,
+    },
+    {
+      agent_id: "A-ARCHIVED",
+      display_name: "Archived Reviewer",
+      status: "stored",
+      role: "team_reviewer",
+      workstream_key: "archived",
+      thread_id: "thread-agent-archived",
+      current_goal_id: null,
+      current_task_id: null,
+      model: "test-model",
+      model_provider: "test-provider",
+      context_tokens: 0,
+      last_cached_input_tokens: 0,
+      last_uncached_input_tokens: 0,
+      total_cached_input_tokens: 0,
+      total_uncached_input_tokens: 0,
+      cache_hit_rate: 0,
+      turn_count: 1,
+      reset_requested_at: null,
+      archived_at: "2026-11-07T09:00:00Z",
+    },
   ],
   cluster_agent_events: [
     {
@@ -517,7 +559,7 @@ assert.match(clusterHtmlBefore, /data-archived="true"/);
 assert.match(clusterHtmlBefore, /已归档/);
 assert.match(clusterHtmlBefore, /目标已结束/);
 assert.match(clusterHtmlBefore, /无需调度/);
-assert.equal(fakeElements.get("agent-thread-count").textContent, 2);
+assert.equal(fakeElements.get("agent-thread-count").textContent, 4);
 assert.match(agentThreadHtml, /Diagnostic Worker/);
 assert.match(agentThreadHtml, /thread thread-agent-busy/);
 assert.match(agentThreadHtml, /context/);
@@ -530,6 +572,9 @@ assert.match(agentThreadHtml, /忙碌中不可重置/);
 assert.match(agentThreadHtml, /请求重置/);
 assert.match(agentThreadHtml, /data-control-action="reset-agent"/);
 assert.match(agentThreadHtml, /最近事件 reset_requested/);
+assert.match(agentThreadHtml, /已被替换不可重置/);
+assert.match(agentThreadHtml, /已归档不可重置/);
+assert.match(agentThreadHtml, /data-agent-archived="true"/);
 assert.doesNotMatch(agentThreadHtml, /conversation|transcript/i);
 assert.match(taskCardHtml, /thread thread-task-1/);
 assert.match(taskCardHtml, /turn turn-3/);

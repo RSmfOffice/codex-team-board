@@ -641,16 +641,18 @@ class AgentPool:
         agent_id = self._require_text(agent_id, "agent_id")
         reason = self._require_text(reason, "reason")
         actor = self._require_text(actor, "actor")
+        if len(reason) > 2000:
+            raise AgentPoolError("reset reason must not exceed 2000 characters")
         now = utc_now()
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             agent = self._row(connection, agent_id)
-            if agent["status"] == "busy":
+            if agent["archived_at"] is not None:
+                raise AgentPoolError("archived agents cannot be reset")
+            if agent["status"] in {"starting", "busy"}:
                 raise AgentPoolError("busy agents cannot be reset")
             if agent["status"] == "superseded":
                 raise AgentPoolError("superseded agents cannot be reset")
-            if agent["archived_at"] is not None:
-                raise AgentPoolError("archived agents cannot be reset")
             connection.execute(
                 """
                 UPDATE cluster_agents
@@ -665,7 +667,7 @@ class AgentPool:
                 agent_id,
                 "reset_requested",
                 actor,
-                {"reason": reason},
+                {"reason": reason, "requested_at": now},
                 created_at=now,
             )
             return self._agent_dict(self._row(connection, agent_id))

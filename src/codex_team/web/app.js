@@ -798,11 +798,19 @@ function renderAgentThreads(agents, events = []) {
       : latestEvent
         ? `最近事件 ${latestEvent.event_type}`
         : "尚未请求重置";
-    const resetDisabled = status === "busy";
+    const resetBlockedReason = agent.archived_at
+      ? "已归档不可重置"
+      : ["busy", "starting"].includes(status)
+        ? "忙碌中不可重置"
+        : status === "superseded"
+          ? "已被替换不可重置"
+          : "";
+    const resetDisabled = Boolean(resetBlockedReason);
     return `
       <article class="agent-thread-card ${escapeHtml(status)}"
                data-agent-id="${escapeHtml(agent.agent_id)}"
-               data-agent-status="${escapeHtml(status)}">
+               data-agent-status="${escapeHtml(status)}"
+               data-agent-archived="${agent.archived_at ? "true" : "false"}">
         <div class="agent-thread-head">
           <strong>${escapeHtml(agent.display_name || agent.agent_id)}</strong>
           <span class="agent-status ${escapeHtml(status)}">${escapeHtml(statusLabel)}</span>
@@ -831,8 +839,9 @@ function renderAgentThreads(agents, events = []) {
                   data-control-action="reset-agent"
                   data-agent-id="${escapeHtml(agent.agent_id)}"
                   data-agent-status="${escapeHtml(status)}"
+                  data-agent-archived="${agent.archived_at ? "true" : "false"}"
                   ${resetDisabled ? "disabled" : ""}>
-            ${resetDisabled ? "忙碌中不可重置" : "请求重置"}
+            ${resetDisabled ? resetBlockedReason : "请求重置"}
           </button>
         </div>
       </article>`;
@@ -1186,7 +1195,11 @@ async function handleClusterControl(button) {
 async function handleAgentReset(button) {
   const agentId = button.dataset.agentId;
   const status = String(button.dataset.agentStatus || "").toLowerCase();
-  if (!agentId || status === "busy") return;
+  if (
+    !agentId
+    || ["busy", "starting", "superseded"].includes(status)
+    || button.dataset.agentArchived === "true"
+  ) return;
   if (!window.confirm(`请求重置 Agent Thread ${agentId}？此操作只写入重置请求。`)) {
     return;
   }

@@ -313,16 +313,19 @@ class DashboardClusterControlTests(unittest.TestCase):
     def test_reset_agent_rejects_busy_and_records_idle_request(self) -> None:
         now = "2026-11-07T11:30:00Z"
         with self.team.connection() as connection:
-            for agent_id, status in (
-                ("A-BUSY", "busy"),
-                ("A-IDLE", "idle"),
+            for agent_id, status, archived_at in (
+                ("A-BUSY", "busy", None),
+                ("A-IDLE", "idle", None),
+                ("A-SUPERSEDED", "superseded", None),
+                ("A-ARCHIVED", "stored", now),
             ):
                 connection.execute(
                     """
                     INSERT INTO cluster_agents(
                         agent_id, project_id, role, workstream_key,
-                        display_name, thread_id, status, created_at, updated_at
-                    ) VALUES (?, ?, 'team_worker', 'reset-test', ?, ?, ?, ?, ?)
+                        display_name, thread_id, status, archived_at,
+                        created_at, updated_at
+                    ) VALUES (?, ?, 'team_worker', 'reset-test', ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         agent_id,
@@ -330,6 +333,7 @@ class DashboardClusterControlTests(unittest.TestCase):
                         f"Agent {agent_id}",
                         f"thread-{agent_id.lower()}",
                         status,
+                        archived_at,
                         now,
                         now,
                     ),
@@ -353,9 +357,21 @@ class DashboardClusterControlTests(unittest.TestCase):
                 "/api/agents/reset",
                 {"agent_id": "A-IDLE", "reason": "manual diagnostics reset"},
             )
+            status_superseded, superseded = self.post(
+                "/api/agents/reset",
+                {"agent_id": "A-SUPERSEDED", "reason": "must be rejected"},
+            )
+            status_archived, archived = self.post(
+                "/api/agents/reset",
+                {"agent_id": "A-ARCHIVED", "reason": "must be rejected"},
+            )
 
         self.assertEqual(status, 409)
         self.assertIn("busy", busy["error"])
+        self.assertEqual(status_superseded, 409)
+        self.assertIn("superseded", superseded["error"])
+        self.assertEqual(status_archived, 409)
+        self.assertIn("archived", archived["error"])
         self.assertEqual(status_ok, 200)
         self.assertEqual(reset["agent"]["agent_id"], "A-IDLE")
         self.assertEqual(reset["agent"]["status"], "idle")
@@ -373,7 +389,9 @@ class DashboardClusterControlTests(unittest.TestCase):
                 for row in connection.execute(
                     """
                     SELECT * FROM cluster_agents
-                    WHERE agent_id IN ('A-BUSY', 'A-IDLE')
+                    WHERE agent_id IN (
+                        'A-BUSY', 'A-IDLE', 'A-SUPERSEDED', 'A-ARCHIVED'
+                    )
                     """
                 )
             }
@@ -386,6 +404,8 @@ class DashboardClusterControlTests(unittest.TestCase):
             ).fetchall()
         self.assertIsNone(agents["A-BUSY"]["reset_requested_at"])
         self.assertEqual(agents["A-BUSY"]["reset_reason"], "")
+        self.assertIsNone(agents["A-SUPERSEDED"]["reset_requested_at"])
+        self.assertIsNone(agents["A-ARCHIVED"]["reset_requested_at"])
         self.assertIsNotNone(agents["A-IDLE"]["reset_requested_at"])
         self.assertEqual(
             agents["A-IDLE"]["reset_reason"],

@@ -19,7 +19,7 @@ from codex_team.cluster import (
     _redact_sensitive_log,
 )
 from codex_team.agent_pool import AgentPool
-from codex_team.app_server import AppServerRuntime
+from codex_team.app_server import AppServerEvents, AppServerRuntime
 from codex_team.cli import build_parser
 from codex_team.config import Settings
 from codex_team.db import utc_now
@@ -1006,6 +1006,8 @@ class ClusterSchedulerTests(unittest.TestCase):
                 startup_timeout=2.0,
                 env={
                     "PYTHONUNBUFFERED": "1",
+                    "PYTHONIOENCODING": "utf-8",
+                    "PYTHONUTF8": "1",
                     "FAKE_APP_SERVER_TRACE": str(trace_path),
                 },
             )
@@ -1063,11 +1065,11 @@ class ClusterSchedulerTests(unittest.TestCase):
                 if item["job_id"] == first["job_id"]
             )
             self.assertEqual(first_job["status"], "completed")
-            self.assertEqual(first_job["input_tokens"], 120)
-            self.assertEqual(first_job["cached_input_tokens"], 20)
-            self.assertEqual(first_job["uncached_input_tokens"], 100)
-            self.assertEqual(first_job["first_input_tokens"], 120)
-            self.assertEqual(first_job["context_tokens"], 75)
+            self.assertEqual(first_job["input_tokens"], 50)
+            self.assertEqual(first_job["cached_input_tokens"], 5)
+            self.assertEqual(first_job["uncached_input_tokens"], 45)
+            self.assertEqual(first_job["first_input_tokens"], 50)
+            self.assertEqual(first_job["context_tokens"], 60)
             self.assertEqual(first_job["model_context_window"], 200)
 
             second = manager._dispatch_worker(
@@ -1096,9 +1098,13 @@ class ClusterSchedulerTests(unittest.TestCase):
             self.assertEqual(len(resumes), 1)
             self.assertEqual(len(turns), 2)
             instructions = starts[0]["params"]["developerInstructions"]
+            self.assertIn(goal["project_id"], instructions)
+            self.assertIn("feature-cache", instructions)
+            self.assertIn("team_worker", instructions)
             self.assertNotIn(goal["goal_id"], instructions)
             self.assertNotIn(tasks[0]["task_id"], instructions)
             self.assertNotIn(str(Path(settings.logs_dir)), instructions)
+            self.assertNotRegex(instructions, r"\d{4}-\d{2}-\d{2}T\d{2}:")
             self.assertIn(
                 goal["goal_id"],
                 turns[0]["params"]["input"][0]["text"],
@@ -1121,8 +1127,8 @@ class ClusterSchedulerTests(unittest.TestCase):
             )
             agent = manager.list_agents(str(goal["project_id"]))[0]
             self.assertEqual(agent["thread_id"], first["thread_id"])
-            self.assertEqual(agent["last_input_tokens"], 120)
-            self.assertEqual(agent["last_uncached_input_tokens"], 100)
+            self.assertEqual(agent["last_input_tokens"], 50)
+            self.assertEqual(agent["last_uncached_input_tokens"], 45)
 
     def test_app_server_reused_job_output_usage_is_cumulative_delta(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1247,6 +1253,28 @@ class ClusterSchedulerTests(unittest.TestCase):
             agent = manager.list_agents(project["project_id"])[0]
             self.assertEqual(agent["total_input_tokens"], 180)
             self.assertEqual(agent["total_cached_input_tokens"], 80)
+            nested_fallback = manager._app_job_usage(
+                {
+                    "job_id": "J-NEXT",
+                    "agent_id": agent["agent_id"],
+                },
+                {
+                    "usage": {
+                        "total": {
+                            "input": 260,
+                            "cached": 115,
+                            "output": 120,
+                            "context": 70,
+                        },
+                        "last": None,
+                        "modelContextWindow": 200,
+                    }
+                },
+            )
+            self.assertEqual(nested_fallback["input_tokens"], 80)
+            self.assertEqual(nested_fallback["cached_input_tokens"], 35)
+            self.assertEqual(nested_fallback["uncached_input_tokens"], 45)
+            self.assertEqual(nested_fallback["output_tokens"], 30)
             clamped = manager._app_job_usage(
                 dict(second_job),
                 {
@@ -1266,10 +1294,36 @@ class ClusterSchedulerTests(unittest.TestCase):
     def test_installed_codex_app_server_thread_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary)
+            completed = threading.Event()
+
+            class LifecycleEvents(AppServerEvents):
+                def __init__(self) -> None:
+                    self.turn_statuses: list[str] = []
+                    self.token_usage: list[dict] = []
+
+                def on_turn_completed(
+                    self,
+                    thread_id: str,
+                    turn_id: str,
+                    turn: dict,
+                ) -> None:
+                    self.turn_statuses.append(str(turn.get("status")))
+                    completed.set()
+
+                def on_token_usage_updated(
+                    self,
+                    thread_id: str,
+                    turn_id: str,
+                    usage: dict,
+                ) -> None:
+                    self.token_usage.append(dict(usage))
+
+            events = LifecycleEvents()
             runtime = AppServerRuntime(
                 request_timeout=20.0,
                 startup_timeout=20.0,
                 stop_timeout=5.0,
+                event_handler=events,
             )
             self.addCleanup(runtime.stop)
             started = runtime.start()
@@ -1279,6 +1333,25 @@ class ClusterSchedulerTests(unittest.TestCase):
                 developer_instructions="Stable integration test instructions.",
                 service_name="codex-team-integration-test",
             )
+            self.assertIn(thread_id, runtime.list_loaded_threads())
+            turn = runtime.start_turn(
+                thread_id,
+                "Reply with exactly OK. Do not inspect files.",
+                cwd=workspace,
+                sandbox_mode="read-only",
+            )
+            _wait_for(completed.is_set, timeout=90.0)
+            self.assertIn("completed", events.turn_statuses)
+            self.assertTrue(events.token_usage)
+            self.assertTrue(
+                all(
+                    {"total", "last", "modelContextWindow"} <= set(usage)
+                    for usage in events.token_usage
+                )
+            )
+            self.assertEqual(runtime.unsubscribe_thread(thread_id), "unsubscribed")
+            resumed = runtime.resume_thread(thread_id)
+            self.assertEqual(resumed, thread_id)
             self.assertIn(thread_id, runtime.list_loaded_threads())
             self.assertEqual(runtime.unsubscribe_thread(thread_id), "unsubscribed")
 
@@ -1856,39 +1929,67 @@ class ClusterSchedulerTests(unittest.TestCase):
             fresh_path = base / "fresh.jsonl"
             reuse_path = base / "reuse.jsonl"
             fresh_path.write_text(
-                json.dumps(
-                    {
-                        "first_turn_latency_ms": 1000,
-                        "task_success": True,
-                        "total_uncached_input_tokens": 1000,
-                        "total_input_tokens": 1400,
-                        "total_cached_input_tokens": 400,
-                        "last_input_tokens": 500,
-                        "last_cached_input_tokens": 100,
-                        "last_uncached_input_tokens": 400,
-                        "last_output_tokens": 20,
-                        "last_context_tokens": 700,
-                    },
-                    sort_keys=True,
+                "\n".join(
+                    json.dumps(item, sort_keys=True)
+                    for item in (
+                        {
+                            "first_turn_latency_ms": 1000,
+                            "task_success": True,
+                            "total_uncached_input_tokens": 1000,
+                            "last_uncached_input_tokens": 400,
+                        },
+                        {
+                            "first_turn_latency_ms": 900,
+                            "task_success": True,
+                            "total_uncached_input_tokens": 1200,
+                            "last_uncached_input_tokens": 200,
+                        },
+                        {
+                            "first_turn_latency_ms": 1100,
+                            "task_success": True,
+                            "total_uncached_input_tokens": 1400,
+                            "last_uncached_input_tokens": 600,
+                        },
+                        {
+                            "first_turn_latency_ms": 1,
+                            "task_success": False,
+                            "total_uncached_input_tokens": 1,
+                            "last_uncached_input_tokens": 1,
+                        },
+                    )
                 )
                 + "\n",
                 encoding="utf-8",
             )
             reuse_path.write_text(
-                json.dumps(
-                    {
-                        "first_turn_latency_ms": 900,
-                        "task_success": True,
-                        "total_uncached_input_tokens": 800,
-                        "total_input_tokens": 1400,
-                        "total_cached_input_tokens": 600,
-                        "last_input_tokens": 500,
-                        "last_cached_input_tokens": 250,
-                        "last_uncached_input_tokens": 250,
-                        "last_output_tokens": 20,
-                        "last_context_tokens": 700,
-                    },
-                    sort_keys=True,
+                "\n".join(
+                    json.dumps(item, sort_keys=True)
+                    for item in (
+                        {
+                            "first_turn_latency_ms": 900,
+                            "task_success": True,
+                            "total_uncached_input_tokens": 2000,
+                            "last_uncached_input_tokens": 250,
+                        },
+                        {
+                            "first_turn_latency_ms": 1000,
+                            "task_success": True,
+                            "total_uncached_input_tokens": 3000,
+                            "last_uncached_input_tokens": 350,
+                        },
+                        {
+                            "first_turn_latency_ms": 800,
+                            "task_success": True,
+                            "total_uncached_input_tokens": 4000,
+                            "last_uncached_input_tokens": 150,
+                        },
+                        {
+                            "first_turn_latency_ms": 1,
+                            "task_success": False,
+                            "total_uncached_input_tokens": 1,
+                            "last_uncached_input_tokens": 1,
+                        },
+                    )
                 )
                 + "\n",
                 encoding="utf-8",
@@ -1922,12 +2023,43 @@ class ClusterSchedulerTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             report = json.loads(json_output.read_text(encoding="utf-8"))
             self.assertTrue(report["comparison"]["meets_gate"])
+            self.assertEqual(
+                report["variants"]["fresh"]["sample_count"],
+                4,
+            )
+            self.assertEqual(
+                report["variants"]["fresh"]["successful_sample_count"],
+                3,
+            )
+            self.assertEqual(
+                report["variants"]["fresh"]["median"][
+                    "last_uncached_input_tokens"
+                ],
+                400,
+            )
+            self.assertEqual(
+                report["variants"]["reuse"]["median"][
+                    "last_uncached_input_tokens"
+                ],
+                250,
+            )
             self.assertAlmostEqual(
                 report["comparison"]["uncached_input_change"],
-                -0.2,
+                -0.375,
+            )
+            self.assertAlmostEqual(
+                report["comparison"][
+                    "total_uncached_input_change_diagnostic"
+                ],
+                1.5,
             )
             markdown = markdown_output.read_text(encoding="utf-8")
-            self.assertIn("uncached input falls by at least 10%", markdown)
+            self.assertIn(
+                "median `last_uncached_input_tokens` falls by at least 10%",
+                markdown,
+            )
+            self.assertIn("Median total_input_tokens (diagnostic)", markdown)
+            self.assertIn("Sample count", markdown)
             self.assertIn("Result: PASS", markdown)
 
 

@@ -346,6 +346,33 @@ class AgentPoolTests(unittest.TestCase):
             ["registered", "reset_requested", "reset_applied"],
         )
         self.assertEqual(events[1]["actor"], "human")
+        self.assertIn("requested_at", events[1]["data"])
+
+    def test_reset_rejects_superseded_and_archived_agents(self) -> None:
+        superseded = self.register(thread_id="superseded-thread")
+        archived = self.register(
+            thread_id="archived-thread",
+            workstream_key="archived",
+        )
+        self.pool.mark_superseded(
+            superseded["agent_id"],
+            "replaced by a fresh thread",
+            "human",
+        )
+        with self.assertRaisesRegex(AgentPoolError, "superseded"):
+            self.pool.request_reset(
+                superseded["agent_id"],
+                "must be rejected",
+                "human",
+            )
+
+        self.pool.archive_project("P1", True)
+        with self.assertRaisesRegex(AgentPoolError, "archived"):
+            self.pool.request_reset(
+                archived["agent_id"],
+                "must be rejected",
+                "human",
+            )
 
     def test_failed_agent_with_reset_need_is_recovered(self) -> None:
         agent = self.register(thread_id="failed-thread")

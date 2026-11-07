@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator
 
+from .agent_pool import AgentPool, AgentPoolError
 from .config import Settings
 from .db import connect, connect_readonly, utc_now
 from .scheduling import (
@@ -40,8 +41,14 @@ class TeamService:
         "team_reviewer": "team-reviewer.md",
     }
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        agent_pool: AgentPool | None = None,
+    ) -> None:
         self.settings = settings
+        self.agent_pool = agent_pool or AgentPool(settings)
 
     @contextmanager
     def connection(self, *, write: bool = True) -> Iterator[sqlite3.Connection]:
@@ -179,50 +186,14 @@ class TeamService:
             normalized_reason = "manual reset requested through dashboard"
         if len(normalized_reason) > 2000:
             raise TeamError("reset reason must not exceed 2000 characters")
-        now = utc_now()
-        with self.connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            agent = connection.execute(
-                "SELECT * FROM cluster_agents WHERE agent_id = ?",
-                (normalized_id,),
-            ).fetchone()
-            if agent is None:
-                raise TeamError(f"agent not found: {normalized_id}")
-            if agent["status"] == "busy":
-                raise TeamError(f"agent is busy; reset is unavailable: {normalized_id}")
-            connection.execute(
-                """
-                UPDATE cluster_agents
-                SET reset_requested_at = ?, reset_reason = ?, updated_at = ?
-                WHERE agent_id = ?
-                """,
-                (now, normalized_reason, now, normalized_id),
+        try:
+            return self.agent_pool.request_reset(
+                normalized_id,
+                normalized_reason,
+                normalized_actor,
             )
-            connection.execute(
-                """
-                INSERT INTO cluster_agent_events(
-                    agent_id, event_type, actor, data_json, created_at
-                ) VALUES (?, 'reset_requested', ?, ?, ?)
-                """,
-                (
-                    normalized_id,
-                    normalized_actor,
-                    json.dumps(
-                        {
-                            "reason": normalized_reason,
-                            "requested_at": now,
-                        },
-                        ensure_ascii=False,
-                        sort_keys=True,
-                    ),
-                    now,
-                ),
-            )
-            updated = connection.execute(
-                "SELECT * FROM cluster_agents WHERE agent_id = ?",
-                (normalized_id,),
-            ).fetchone()
-        return dict(updated)
+        except AgentPoolError as exc:
+            raise TeamError(str(exc)) from exc
 
     def list_projects(self, *, include_archived: bool = False) -> list[dict[str, Any]]:
         with self.connection(write=False) as connection:

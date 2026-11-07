@@ -25,6 +25,7 @@ __all__ = [
     "AppServerRuntime",
     "AppServerStartupError",
     "AppServerTimeoutError",
+    "TokenBreakdown",
     "TokenUsage",
     "map_token_usage",
 ]
@@ -67,14 +68,21 @@ class AppServerRPCError(AppServerError):
         super().__init__(f"{method} failed ({code}): {message}")
 
 
-class TokenUsage(TypedDict):
-    """A normalized token snapshot. All counts are non-negative integers."""
+class TokenBreakdown(TypedDict):
+    """One normalized App Server usage bucket."""
 
     input: int
     cached: int
     uncached: int
     output: int
     context: int
+
+
+class TokenUsage(TypedDict):
+    """Both cumulative and current-turn App Server token snapshots."""
+
+    total: TokenBreakdown | None
+    last: TokenBreakdown | None
     modelContextWindow: int | None
 
 
@@ -186,34 +194,41 @@ def _non_negative_int(value: Any) -> int:
     return max(0, number)
 
 
-def map_token_usage(payload: Mapping[str, Any]) -> TokenUsage:
-    """Map App Server usage to the stable Team Board token contract.
+def _map_usage_bucket(value: Any) -> TokenBreakdown | None:
+    if not isinstance(value, Mapping):
+        return None
+    input_tokens = _non_negative_int(value.get("inputTokens"))
+    cached_tokens = min(
+        _non_negative_int(value.get("cachedInputTokens")),
+        input_tokens,
+    )
+    return {
+        "input": input_tokens,
+        "cached": cached_tokens,
+        "uncached": input_tokens - cached_tokens,
+        "output": _non_negative_int(value.get("outputTokens")),
+        "context": _non_negative_int(value.get("totalTokens")),
+    }
 
-    `input`, `cached`, `uncached`, and `output` are cumulative token counts from
-    `tokenUsage.total`. `context` is the current context size from
-    `tokenUsage.last.totalTokens`. `uncached` is always
-    `max(0, input - cached)`.
+
+def map_token_usage(payload: Mapping[str, Any]) -> TokenUsage:
+    """Preserve both cumulative and per-turn App Server usage.
+
+    `total` is a thread-lifetime snapshot and `last` is the current turn. A
+    missing bucket remains ``None`` so consumers can fall back to a cumulative
+    delta instead of confusing "missing" with a real zero.
     """
 
-    total = _mapping(payload.get("total"))
-    last = _mapping(payload.get("last"))
-    input_tokens = _non_negative_int(total.get("inputTokens"))
-    cached_tokens = _non_negative_int(total.get("cachedInputTokens"))
-    output_tokens = _non_negative_int(total.get("outputTokens"))
-    context_tokens = _non_negative_int(
-        last.get("totalTokens", total.get("totalTokens", 0))
-    )
+    total = _map_usage_bucket(payload.get("total"))
+    last = _map_usage_bucket(payload.get("last"))
     context_window = payload.get("modelContextWindow")
     if context_window is None:
         normalized_window = None
     else:
         normalized_window = _non_negative_int(context_window)
     return {
-        "input": input_tokens,
-        "cached": cached_tokens,
-        "uncached": max(0, input_tokens - cached_tokens),
-        "output": output_tokens,
-        "context": context_tokens,
+        "total": total,
+        "last": last,
         "modelContextWindow": normalized_window,
     }
 
