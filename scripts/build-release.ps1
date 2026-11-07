@@ -57,7 +57,7 @@ function Copy-Tree {
 New-Item -ItemType Directory -Force -Path $releaseRoot | Out-Null
 New-Item -ItemType Directory -Force -Path $bundle | Out-Null
 try {
-    foreach ($name in @("src", "scripts", "templates", "tests")) {
+    foreach ($name in @("src", "scripts", "templates", "tests", "release-notes")) {
         Copy-Tree `
             -Source (Join-Path $root $name) `
             -Destination (Join-Path $bundle $name)
