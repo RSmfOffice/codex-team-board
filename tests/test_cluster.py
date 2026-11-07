@@ -95,12 +95,16 @@ class StubAppServerRuntime:
         fail_resume: int = 0,
         fail_start_thread: int = 0,
         fail_turn: int = 0,
+        disconnect_turn_attempt: int | None = None,
+        stderr_lines: tuple[str, ...] = (),
     ) -> None:
         self.fail_start = fail_start
         self.fail_restart = fail_restart
         self.fail_resume = fail_resume
         self.fail_start_thread = fail_start_thread
         self.fail_turn = fail_turn
+        self.disconnect_turn_attempt = disconnect_turn_attempt
+        self.stderr_lines = stderr_lines
         self.start_calls = 0
         self.restart_calls = 0
         self.stop_calls = 0
@@ -115,25 +119,28 @@ class StubAppServerRuntime:
         self.event_handler: object | None = None
         self._thread_sequence = 0
         self._turn_sequence = 0
+        self._healthy = False
         self._lock = threading.Lock()
 
     def start(self) -> dict:
         self.start_calls += 1
         if self.start_calls <= self.fail_start:
             raise RuntimeError("startup failed")
+        self._healthy = True
         return self.health()
 
     def restart(self) -> dict:
         self.restart_calls += 1
         if self.restart_calls <= self.fail_restart:
             raise RuntimeError("restart failed")
+        self._healthy = True
         return self.health()
 
     def stop(self) -> None:
         self.stop_calls += 1
 
     def health(self) -> dict:
-        return {"healthy": True, "running": True}
+        return {"healthy": self._healthy, "running": self._healthy}
 
     def start_thread(
         self,
@@ -172,6 +179,9 @@ class StubAppServerRuntime:
             self.turn_attempts += 1
             if self.turn_attempts <= self.fail_turn:
                 raise RuntimeError("turn/start failed")
+            if self.turn_attempts == self.disconnect_turn_attempt:
+                self._healthy = False
+                raise RuntimeError("turn/start disconnected")
             self._turn_sequence += 1
             turn_id = f"stub-turn-{self._turn_sequence}"
             self.turns.append(
@@ -191,6 +201,17 @@ class StubAppServerRuntime:
     def unsubscribe_thread(self, thread_id: str) -> str:
         self.unsubscribed.append(thread_id)
         return "unsubscribed"
+
+
+class FakeExecProcess:
+    pid = 424243
+
+    def __init__(self) -> None:
+        self.stdin = io.StringIO()
+        self.stdout = io.StringIO()
+
+    def poll(self) -> None:
+        return None
 
 
 class ClusterSchedulerTests(unittest.TestCase):
@@ -1736,14 +1757,225 @@ class ClusterSchedulerTests(unittest.TestCase):
                 self.assertIn("agent_runtime_fallback", log)
                 self.assertIn("# command=", log)
                 if case_name == "thread":
-                    self.assertEqual(runtime.start_thread_attempts, 2)
-                    self.assertEqual(runtime.restart_calls, 1)
+                    self.assertEqual(runtime.start_thread_attempts, 1)
+                    self.assertEqual(runtime.restart_calls, 0)
                 else:
-                    self.assertEqual(runtime.turn_attempts, 2)
-                    self.assertEqual(runtime.restart_calls, 1)
+                    self.assertEqual(runtime.turn_attempts, 1)
+                    self.assertEqual(runtime.restart_calls, 0)
                     failed = AgentPool(settings).list_agents(project["project_id"])[0]
                     self.assertEqual(failed["status"], "failed")
                     self.assertIsNotNone(failed["reset_requested_at"])
+
+    def test_healthy_app_server_failure_only_falls_back_current_job(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            repo = _repo(base, "healthy-concurrent")
+            runtime = StubAppServerRuntime(
+                stderr_lines=("diagnostic marker",),
+            )
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime=runtime,
+                runtime_mode="app_server",
+            )
+            goal, tasks = self._goal_with_ready_tasks(
+                manager,
+                team,
+                repo,
+                2,
+            )
+            first = manager._dispatch_worker(
+                manager.get_goal(goal["goal_id"]),
+                team.get_task(tasks[0]["task_id"]),
+            )
+            team.claim_task(tasks[0]["task_id"], actor="concurrent-b")
+            runtime.fail_turn = runtime.turn_attempts + 1
+            current_goal = manager.get_goal(goal["goal_id"])
+            current_task = team.get_task(tasks[1]["task_id"])
+            fallback_process = FakeExecProcess()
+            real_popen = subprocess.Popen
+
+            def popen(command, *args, **kwargs):
+                if command and command[0] == "git":
+                    return real_popen(command, *args, **kwargs)
+                return fallback_process
+
+            with patch(
+                "codex_team.cluster.subprocess.Popen",
+                side_effect=popen,
+            ):
+                second = manager._dispatch_worker(
+                    current_goal,
+                    current_task,
+                )
+
+            jobs = {
+                job["job_id"]: job
+                for job in manager.get_goal(goal["goal_id"])["jobs"]
+            }
+            self.assertEqual(first["runtime"], "app_server")
+            self.assertEqual(second["runtime"], "exec")
+            self.assertEqual(jobs[first["job_id"]]["status"], "running")
+            self.assertEqual(jobs[first["job_id"]]["runtime"], "app_server")
+            self.assertEqual(jobs[second["job_id"]]["status"], "running")
+            self.assertEqual(runtime.restart_calls, 0)
+            self.assertIn(first["job_id"], manager.app_turns)
+            self.assertNotIn(second["job_id"], manager.app_turns)
+            self.assertIn(
+                "process remained healthy",
+                jobs[second["job_id"]]["error"],
+            )
+            self.assertIn(
+                "diagnostic marker",
+                jobs[second["job_id"]]["error"],
+            )
+
+    def test_disconnect_restart_loses_and_recovers_other_turns(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            repo = _repo(base, "disconnect-concurrent")
+            runtime = StubAppServerRuntime(disconnect_turn_attempt=3)
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime=runtime,
+                runtime_mode="app_server",
+                lead_cooldown_seconds=0,
+            )
+            goal, tasks = self._goal_with_ready_tasks(
+                manager,
+                team,
+                repo,
+                2,
+            )
+            worker_other = manager._dispatch_worker(
+                manager.get_goal(goal["goal_id"]),
+                team.get_task(tasks[0]["task_id"]),
+            )
+            team.claim_task(tasks[0]["task_id"], actor="concurrent-b")
+            lead_other = manager._dispatch_lead(
+                manager.get_goal(goal["goal_id"]),
+                team.list_tasks(repo, goal_id=goal["goal_id"]),
+            )
+
+            current = manager._dispatch_worker(
+                manager.get_goal(goal["goal_id"]),
+                team.get_task(tasks[1]["task_id"]),
+            )
+
+            result = manager.get_goal(goal["goal_id"])
+            jobs = {job["job_id"]: job for job in result["jobs"]}
+            self.assertEqual(current["runtime"], "app_server")
+            self.assertEqual(jobs[current["job_id"]]["status"], "running")
+            self.assertEqual(jobs[worker_other["job_id"]]["status"], "lost")
+            self.assertEqual(jobs[lead_other["job_id"]]["status"], "lost")
+            self.assertEqual(
+                team.get_task(tasks[0]["task_id"])["status"],
+                "ready",
+            )
+            self.assertIsNone(result["lead_thread_id"])
+            self.assertEqual(result["lead_failures"], 1)
+            self.assertEqual(runtime.restart_calls, 1)
+            self.assertEqual(runtime.turn_attempts, 4)
+            self.assertEqual(runtime.resume_threads, [current["thread_id"]])
+            self.assertNotIn(worker_other["job_id"], manager.app_turns)
+            self.assertNotIn(lead_other["job_id"], manager.app_turns)
+            self.assertIn(current["job_id"], manager.app_turns)
+            lost_jobs = {
+                event["data"]["job_id"]
+                for event in result["events"]
+                if event["event_type"] == "app_server_turn_lost"
+            }
+            self.assertEqual(
+                lost_jobs,
+                {worker_other["job_id"], lead_other["job_id"]},
+            )
+            recovered = [
+                event["data"]
+                for event in result["events"]
+                if event["event_type"] == "worker_recovered"
+            ]
+            self.assertEqual(
+                recovered[-1]["job_id"],
+                worker_other["job_id"],
+            )
+            self.assertIn("unhealthy App Server", recovered[-1]["reason"])
+
+    def test_initialization_failure_persists_redacted_stderr(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            repo = _repo(base, "initialization-diagnostics")
+            runtime = StubAppServerRuntime(
+                fail_start=1,
+                fail_restart=1,
+                stderr_lines=(
+                    "useful startup diagnostic",
+                    "claim_token=claim-secret-value",
+                    "OPENAI_API_KEY=api-secret-value",
+                ),
+            )
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime=runtime,
+                runtime_mode="app_server",
+            )
+            goal = manager.create_goal(repo, objective="Diagnose startup")
+            current_goal = manager.get_goal(goal["goal_id"])
+
+            with patch(
+                "codex_team.cluster.subprocess.Popen",
+                return_value=FakeExecProcess(),
+            ):
+                dispatched = manager._dispatch_lead(
+                    current_goal,
+                    [],
+                )
+
+            result = manager.get_goal(goal["goal_id"])
+            job = next(
+                item
+                for item in result["jobs"]
+                if item["job_id"] == dispatched["job_id"]
+            )
+            fallback = next(
+                event["data"]
+                for event in result["events"]
+                if event["event_type"] == "agent_runtime_fallback"
+                and event["data"].get("job_id") == job["job_id"]
+            )
+            self.assertEqual(dispatched["runtime"], "exec")
+            for value in (job["error"], fallback["error"]):
+                self.assertIn("recent stderr", value)
+                self.assertIn("useful startup diagnostic", value)
+                self.assertIn("[REDACTED]", value)
+                self.assertNotIn("claim-secret-value", value)
+                self.assertNotIn("api-secret-value", value)
+
+    def test_private_runtime_uses_logs_dir_for_stderr(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = _settings(Path(temporary))
+            manager = ClusterManager(
+                settings,
+                team=TeamService(settings),
+                runtime_mode="app_server",
+                agent_command=["codex"],
+            )
+            try:
+                self.assertIsNotNone(manager.runtime)
+                self.assertEqual(
+                    manager.runtime.stderr_log_path,
+                    settings.logs_dir / "app-server.stderr.log",
+                )
+            finally:
+                manager.close()
 
     def test_related_goals_reuse_lead_thread_by_workstream(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -348,6 +348,33 @@ class AppServerRuntimeTests(unittest.TestCase):
         self.assertEqual(raised.exception.data, {"type": "notFound"})
         self.assertTrue(runtime.health()["healthy"])
 
+    def test_stderr_log_redacts_credentials(self) -> None:
+        base = self._temporary_base()
+        secret = "claim-secret-value"
+        api_secret = "api-secret-value"
+        runtime = self._runtime(
+            base,
+            extra_env={
+                "FAKE_APP_SERVER_STDERR": (
+                    f"diagnostic marker claim_token={secret} "
+                    f"OPENAI_API_KEY={api_secret}"
+                ),
+            },
+        )
+        runtime.start()
+        log_path = base / "app-server.stderr.log"
+        wait_for(
+            lambda: log_path.exists()
+            and "diagnostic marker" in log_path.read_text(
+                encoding="utf-8",
+                errors="replace",
+            )
+        )
+        logged = log_path.read_text(encoding="utf-8", errors="replace")
+        self.assertIn("[REDACTED]", logged)
+        self.assertNotIn(secret, logged)
+        self.assertNotIn(api_secret, logged)
+
     def test_concurrent_requests_are_correlated_by_jsonrpc_id(self) -> None:
         base = self._temporary_base()
         runtime = self._runtime(base, request_timeout=1.0)

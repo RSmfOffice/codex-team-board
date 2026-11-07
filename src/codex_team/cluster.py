@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import secrets
 import shutil
 import subprocess
@@ -18,6 +17,7 @@ from .app_server import AppServerEvents, AppServerRuntime
 from .config import Settings
 from .db import connect, connect_readonly, utc_now
 from .processes import pid_is_running
+from .redaction import redact_sensitive_text
 from .scheduling import (
     DEFAULT_GLOBAL_JOB_CAPACITY,
     DEFAULT_GOAL_WORKER_CAPACITY,
@@ -47,9 +47,6 @@ LEAD_TIMEOUT_SECONDS = DEFAULT_LEAD_TIMEOUT_SECONDS
 FAIRNESS_DEFERRED_INTERVAL_SECONDS = 60
 WORKER_ACTIVITY_EVENT_TYPES = ("claimed", "heartbeat", "progress")
 RUNTIME_MODES = frozenset({"exec", "app_server"})
-_CLAIM_TOKEN_RE = re.compile(
-    r'(?P<prefix>(?:\\?"claim_token\\?"\s*:\s*\\?"))(?P<token>[^"\\]+)(?P<suffix>\\?")'
-)
 LEAD_DEVELOPER_INSTRUCTIONS = """You are the managed Lead for an automated
 Codex work cluster. Do not spawn subagents; the deterministic teamd dispatcher
 launches Workers. You may use shell tools and codexTeamBoard MCP tools.
@@ -1342,8 +1339,18 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
             "danger-full-access",
         }:
             raise ClusterError(f"invalid sandbox mode: {sandbox_mode}")
-        selected_runtime = self._select_job_runtime(goal, task_id, kind)
         job_id = self._new_id("J")
+        selected_runtime = self._select_job_runtime(
+            goal,
+            task_id,
+            kind,
+            job_id=job_id,
+        )
+        runtime_error = (
+            self._runtime_fallback_reason
+            if self.agent_runtime == "app_server" and selected_runtime == "exec"
+            else ""
+        )
         goal_dir = self.settings.logs_dir / "cluster" / goal["goal_id"]
         goal_dir.mkdir(parents=True, exist_ok=True)
         log_path = goal_dir / f"{job_id}.jsonl"
@@ -1354,8 +1361,8 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                 """
                 INSERT INTO cluster_jobs(
                     job_id, goal_id, task_id, kind, role, status,
-                    attempt, log_path, output_path, runtime, started_at
-                ) VALUES (?, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?)
+                    attempt, log_path, output_path, runtime, error, started_at
+                ) VALUES (?, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -1367,6 +1374,7 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                     str(log_path),
                     str(output_path),
                     selected_runtime,
+                    runtime_error,
                     utc_now(),
                 ),
             )
@@ -1574,6 +1582,7 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
         log_path: Path,
         runtime_error: str,
     ) -> None:
+        runtime_error = self._redact_error(runtime_error)
         with self.team.connection() as connection:
             job = connection.execute(
                 "SELECT * FROM cluster_jobs WHERE job_id = ?",
@@ -1630,10 +1639,12 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
         goal: dict[str, Any],
         task_id: str | None,
         kind: str,
+        *,
+        job_id: str | None = None,
     ) -> str:
         if self.agent_runtime != "app_server":
             return "exec"
-        reason = self._ensure_app_server_runtime()
+        reason = self._ensure_app_server_runtime(job_id)
         if not reason:
             return "app_server"
         with self.team.connection() as connection:
@@ -1645,6 +1656,8 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                 {
                     "configured_runtime": "app_server",
                     "fallback_runtime": "exec",
+                    "job_id": job_id,
+                    "scope": "same_job",
                     "task_id": task_id,
                     "kind": kind,
                     "error": reason,
@@ -1652,25 +1665,159 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
             )
         return "exec"
 
-    def _ensure_app_server_runtime(self) -> str:
+    def _ensure_app_server_runtime(self, job_id: str | None = None) -> str:
         if self._runtime_fallback_reason:
             return self._runtime_fallback_reason
         if self.runtime is None:
             self._runtime_fallback_reason = "App Server runtime is not configured"
             return self._runtime_fallback_reason
-        try:
-            self.runtime.start()
+        runtime = self.runtime
+        if self._health_is_healthy(self._runtime_health(runtime)):
             return ""
-        except Exception as first_error:
-            try:
-                self.runtime.restart()
+        # AppServerRuntime.start() repairs a previously running process. Mark
+        # turns on that process lost before it is replaced.
+        try:
+            self._lose_other_app_server_jobs(
+                current_job_id=job_id,
+                reason="App Server runtime was unavailable before restart",
+            )
+        except Exception as exc:
+            self._runtime_fallback_reason = self._redact_error(
+                f"App Server job isolation failed: {exc}"
+            )
+            return self._runtime_fallback_reason
+        first_failure_error: Exception
+        try:
+            health = runtime.start()
+            if self._health_is_healthy(health):
                 return ""
-            except Exception as second_error:
-                self._runtime_fallback_reason = (
-                    f"initialization failed: {first_error}; "
-                    f"restart failed: {second_error}"
+            first_failure_error = ClusterError(
+                "App Server start returned an unhealthy state"
+            )
+        except Exception as exc:
+            first_failure_error = exc
+        try:
+            health = self._restart_shared_app_server(
+                runtime,
+                current_job_id=job_id,
+                reason="App Server initialization failed",
+            )
+            if not self._health_is_healthy(health):
+                raise ClusterError(
+                    "App Server restart returned an unhealthy state"
                 )
-                return self._runtime_fallback_reason
+            return ""
+        except Exception as second_error:
+            self._runtime_fallback_reason = self._app_server_failure(
+                "initialization failed: "
+                f"{self._redact_error(str(first_failure_error))}; "
+                f"restart failed: {self._redact_error(str(second_error))}",
+                runtime,
+            )
+            return self._runtime_fallback_reason
+
+    @staticmethod
+    def _health_is_healthy(health: Mapping[str, Any] | Any) -> bool:
+        if not isinstance(health, Mapping):
+            return False
+        return bool(health.get("healthy", health.get("running", False)))
+
+    def _runtime_health(self, runtime: Any) -> Mapping[str, Any]:
+        try:
+            health = runtime.health()
+        except Exception:
+            return {}
+        return health if isinstance(health, Mapping) else {}
+
+    @staticmethod
+    def _redact_error(message: str) -> str:
+        return _redact_sensitive_log(str(message))
+
+    def _app_server_stderr_excerpt(
+        self,
+        runtime: Any,
+        *,
+        max_lines: int = 20,
+        max_chars: int = 4000,
+    ) -> str:
+        try:
+            lines = runtime.stderr_lines
+        except Exception:
+            return ""
+        if isinstance(lines, str):
+            lines = lines.splitlines()
+        elif callable(lines):
+            try:
+                lines = lines()
+            except Exception:
+                return ""
+        try:
+            recent = [str(line) for line in list(lines)[-max_lines:]]
+        except (TypeError, ValueError):
+            return ""
+        text = _redact_sensitive_log("\n".join(recent)).strip()
+        if len(text) > max_chars:
+            text = text[-max_chars:]
+        return text
+
+    def _app_server_failure(self, message: str, runtime: Any) -> str:
+        message = self._redact_error(message)
+        stderr = self._app_server_stderr_excerpt(runtime)
+        if not stderr:
+            return message
+        return f"{message}; recent stderr:\n{stderr}"
+
+    def _lose_other_app_server_jobs(
+        self,
+        *,
+        current_job_id: str | None,
+        reason: str,
+    ) -> None:
+        with self.team.connection(write=False) as connection:
+            rows = connection.execute(
+                """
+                SELECT j.*, g.autonomy, g.max_worker_attempts,
+                       g.max_lead_attempts
+                FROM cluster_jobs j
+                JOIN cluster_goals g ON g.goal_id = j.goal_id
+                WHERE j.runtime = 'app_server'
+                  AND j.status IN ('starting', 'running')
+                  AND j.job_id != ?
+                ORDER BY j.started_at
+                """,
+                (current_job_id or "",),
+            ).fetchall()
+        for row in rows:
+            job = dict(row)
+            self._finish_lost_app_server_job(
+                job,
+                reason=reason,
+            )
+
+    def _restart_shared_app_server(
+        self,
+        runtime: Any,
+        *,
+        current_job_id: str | None,
+        reason: str,
+    ) -> Mapping[str, Any]:
+        # The replacement process invalidates every other live turn. Persist
+        # their recovery before restart so a healthy replacement cannot hide
+        # stale jobs until their timeout.
+        self._lose_other_app_server_jobs(
+            current_job_id=current_job_id,
+            reason=reason,
+        )
+        try:
+            health = runtime.restart()
+        except Exception as exc:
+            raise ClusterError(
+                self._app_server_failure(
+                    f"restart failed: {self._redact_error(str(exc))}",
+                    runtime,
+                )
+            ) from exc
+        return health if isinstance(health, Mapping) else {}
 
     def _start_fresh_app_thread(
         self,
@@ -1678,6 +1825,7 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
         cwd: Path,
         *,
         developer_instructions: str,
+        job_id: str,
     ) -> str:
         def start() -> str:
             return runtime.start_thread(
@@ -1691,19 +1839,37 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
         try:
             return start()
         except Exception as first_error:
+            first_failure = self._app_server_failure(
+                f"thread/start failed: "
+                f"{self._redact_error(str(first_error))}",
+                runtime,
+            )
+            if self._health_is_healthy(self._runtime_health(runtime)):
+                raise _AppServerJobStartError(
+                    f"{first_failure}; process remained healthy, so the shared "
+                    "App Server was not restarted"
+                ) from first_error
             try:
-                runtime.restart()
+                self._restart_shared_app_server(
+                    runtime,
+                    current_job_id=job_id,
+                    reason="thread/start failed on an unhealthy App Server",
+                )
             except Exception as restart_error:
                 raise _AppServerJobStartError(
-                    f"thread/start failed: {first_error}; "
-                    f"restart failed: {restart_error}"
+                    f"{first_failure}; "
+                    f"restart failed: "
+                    f"{self._redact_error(str(restart_error))}"
                 ) from restart_error
             try:
                 return start()
             except Exception as second_error:
                 raise _AppServerJobStartError(
-                    f"thread/start failed: {first_error}; "
-                    f"retry after restart failed: {second_error}"
+                    self._app_server_failure(
+                        f"{first_failure}; retry after restart failed: "
+                        f"{self._redact_error(str(second_error))}",
+                        runtime,
+                    )
                 ) from second_error
 
     def _start_app_turn_with_restart(
@@ -1714,6 +1880,7 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
         *,
         cwd: Path,
         sandbox_mode: str,
+        job_id: str,
     ) -> dict[str, Any]:
         def start() -> dict[str, Any]:
             return runtime.start_turn(
@@ -1727,19 +1894,37 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
         try:
             return start()
         except Exception as first_error:
+            first_failure = self._app_server_failure(
+                f"turn/start failed: "
+                f"{self._redact_error(str(first_error))}",
+                runtime,
+            )
+            if self._health_is_healthy(self._runtime_health(runtime)):
+                raise _AppServerJobStartError(
+                    f"{first_failure}; process remained healthy, so the shared "
+                    "App Server was not restarted"
+                ) from first_error
             try:
-                runtime.restart()
+                self._restart_shared_app_server(
+                    runtime,
+                    current_job_id=job_id,
+                    reason="turn/start failed on an unhealthy App Server",
+                )
             except Exception as restart_error:
                 raise _AppServerJobStartError(
-                    f"turn/start failed: {first_error}; "
-                    f"restart failed: {restart_error}"
+                    f"{first_failure}; "
+                    f"restart failed: "
+                    f"{self._redact_error(str(restart_error))}"
                 ) from restart_error
             try:
                 restored_thread_id = runtime.resume_thread(thread_id)
             except Exception as resume_error:
                 raise _AppServerJobStartError(
-                    f"turn/start failed: {first_error}; "
-                    f"thread reload after restart failed: {resume_error}"
+                    self._app_server_failure(
+                        f"{first_failure}; thread reload after restart failed: "
+                        f"{self._redact_error(str(resume_error))}",
+                        runtime,
+                    )
                 ) from resume_error
             try:
                 return runtime.start_turn(
@@ -1751,8 +1936,11 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                 )
             except Exception as second_error:
                 raise _AppServerJobStartError(
-                    f"turn/start failed: {first_error}; "
-                    f"retry after restart failed: {second_error}"
+                    self._app_server_failure(
+                        f"{first_failure}; retry after restart failed: "
+                        f"{self._redact_error(str(second_error))}",
+                        runtime,
+                    )
                 ) from second_error
 
     def _start_app_server_job(
@@ -1800,7 +1988,37 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                 try:
                     thread_id = runtime.resume_thread(str(agent["thread_id"]))
                 except Exception as exc:
-                    reason = f"thread resume failed: {exc}"
+                    reason = self._app_server_failure(
+                        f"thread resume failed: "
+                        f"{self._redact_error(str(exc))}",
+                        runtime,
+                    )
+                    if not self._health_is_healthy(
+                        self._runtime_health(runtime)
+                    ):
+                        try:
+                            self._restart_shared_app_server(
+                                runtime,
+                                current_job_id=job_id,
+                                reason=(
+                                    "thread resume failed on an unhealthy "
+                                    "App Server"
+                                ),
+                            )
+                            reason += (
+                                "; shared App Server restarted with a fresh "
+                                "thread"
+                            )
+                        except Exception as restart_error:
+                            raise _AppServerJobStartError(
+                                f"{reason}; restart failed: "
+                                f"{self._redact_error(str(restart_error))}"
+                            ) from restart_error
+                    else:
+                        reason += (
+                            "; process remained healthy, so the shared "
+                            "App Server was not restarted"
+                        )
                     try:
                         self.agent_pool.mark_failed(
                             str(agent["agent_id"]),
@@ -1820,7 +2038,7 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                             "job_id": job_id,
                             "agent_id": agent["agent_id"],
                             "thread_id": agent["thread_id"],
-                            "error": str(exc),
+                            "error": reason,
                             "action": "fresh_thread",
                         },
                     )
@@ -1832,6 +2050,7 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                     runtime,
                     cwd,
                     developer_instructions=developer_instructions,
+                    job_id=job_id,
                 )
                 agent = self.agent_pool.register_thread(
                     str(goal["project_id"]),
@@ -1887,6 +2106,7 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                 turn_input,
                 cwd=cwd,
                 sandbox_mode=sandbox_mode,
+                job_id=job_id,
             )
         except Exception as exc:
             with self._app_state_lock:
@@ -2314,7 +2534,13 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
             return False
         return bool(health.get("healthy", health.get("running", False)))
 
-    def _finish_lost_app_server_job(self, job: dict[str, Any]) -> None:
+    def _finish_lost_app_server_job(
+        self,
+        job: dict[str, Any],
+        *,
+        reason: str = "App Server runtime restarted without the active turn",
+    ) -> None:
+        reason = self._redact_error(reason)
         with self.team.connection() as connection:
             connection.execute(
                 """
@@ -2324,7 +2550,7 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                 """,
                 (
                     utc_now(),
-                    "App Server runtime restarted without the active turn",
+                    reason,
                     job["job_id"],
                 ),
             )
@@ -2338,6 +2564,7 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                     "task_id": job.get("task_id"),
                     "thread_id": job.get("thread_id"),
                     "turn_id": job.get("turn_id"),
+                    "reason": reason,
                 },
             )
         with self._app_state_lock:
@@ -2348,10 +2575,10 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                 self.app_turn_jobs.pop(str(job["turn_id"]), None)
         self._failed_agent_for_job(
             job,
-            "App Server restart lost the active turn",
+            reason,
         )
         if job["kind"] == "worker" and job.get("task_id"):
-            self._handle_worker_failure(job, "App Server restart lost the active turn")
+            self._handle_worker_failure(job, reason)
         else:
             with self.team.connection() as connection:
                 connection.execute(
@@ -2363,7 +2590,7 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                     WHERE goal_id = ?
                     """,
                     (
-                        "App Server restart lost the active Lead turn",
+                        reason,
                         utc_now(),
                         job["goal_id"],
                     ),
@@ -3137,14 +3364,7 @@ def _default_codex_command() -> list[str]:
 
 
 def _redact_sensitive_log(text: str) -> str:
-    return _CLAIM_TOKEN_RE.sub(
-        lambda match: (
-            match.group("prefix")
-            + "[REDACTED]"
-            + match.group("suffix")
-        ),
-        text,
-    )
+    return redact_sensitive_text(text)
 
 
 def _redact_sensitive_file(path: Path) -> bool:
