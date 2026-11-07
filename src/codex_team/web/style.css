@@ -193,33 +193,60 @@ input[type="text"]:focus {
 
 .cluster-summary {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
-  gap: 8px;
+  grid-template-columns: repeat(8, minmax(0, 1fr));
+  gap: 6px;
   margin-top: 10px;
 }
 .cluster-metric {
   display: flex;
-  align-items: baseline;
-  gap: 7px;
-  padding: 7px 10px;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 7px 8px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: rgba(17, 25, 35, 0.7);
 }
 .cluster-metric strong {
+  flex: 0 0 auto;
   color: var(--text);
   font-size: 17px;
 }
-.cluster-metric span {
+.cluster-metric > .metric-copy {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-width: 0;
+  line-height: 1.25;
+}
+.cluster-metric .metric-copy > span {
   color: var(--muted);
   font-size: 9px;
   letter-spacing: 0.1em;
+}
+.cluster-metric .metric-copy small {
+  color: #6f839b;
+  font-size: 8px;
+  letter-spacing: 0;
+  overflow-wrap: anywhere;
 }
 .cluster-metric.attention {
   border-color: rgba(244, 191, 101, 0.45);
 }
 .cluster-metric.attention strong {
   color: var(--amber);
+}
+.cluster-metric.warning {
+  border-color: rgba(244, 191, 101, 0.45);
+}
+.cluster-metric.warning strong {
+  color: var(--amber);
+}
+.cluster-metric.critical {
+  border-color: rgba(255, 114, 134, 0.48);
+}
+.cluster-metric.critical strong {
+  color: var(--red);
 }
 
 .cluster-overview {
@@ -236,6 +263,7 @@ input[type="text"]:focus {
 }
 .cluster-card {
   position: relative;
+  min-width: 0;
   padding: 12px;
   border: 1px solid rgba(185,156,255,.28);
   border-radius: 9px;
@@ -245,19 +273,78 @@ input[type="text"]:focus {
   border-color: rgba(244, 191, 101, 0.58);
   box-shadow: inset 3px 0 0 rgba(244, 191, 101, 0.78);
 }
+.cluster-card.heartbeat-warning {
+  border-color: rgba(244, 191, 101, 0.58);
+}
+.cluster-card.heartbeat-critical {
+  border-color: rgba(255, 114, 134, 0.62);
+  box-shadow: inset 3px 0 0 rgba(255, 114, 134, 0.8);
+}
 .cluster-card h3 {
   margin: 5px 0 8px;
   font-size: 13px;
   line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+.chip.active-jobs-chip {
+  flex-basis: 100%;
+  overflow-wrap: anywhere;
 }
 .chip.attention-chip {
   color: var(--amber);
   border-color: rgba(244, 191, 101, 0.55);
   background: rgba(244, 191, 101, 0.08);
 }
+.cluster-diagnostics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+  margin-top: 9px;
+}
+.cluster-diagnostic {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding: 7px 8px;
+  border: 1px solid rgba(56, 74, 96, 0.8);
+  border-radius: 7px;
+  background: rgba(9, 13, 20, 0.36);
+}
+.cluster-diagnostic span {
+  color: var(--muted);
+  font-size: 9px;
+  letter-spacing: 0.08em;
+}
+.cluster-diagnostic strong {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+}
+.cluster-diagnostic small {
+  color: #8599b0;
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+.cluster-diagnostic.heartbeat-normal strong {
+  color: var(--green);
+}
+.cluster-diagnostic.heartbeat-warning {
+  border-color: rgba(244, 191, 101, 0.5);
+  background: rgba(244, 191, 101, 0.07);
+}
+.cluster-diagnostic.heartbeat-warning strong {
+  color: var(--amber);
+}
+.cluster-diagnostic.heartbeat-critical {
+  border-color: rgba(255, 114, 134, 0.55);
+  background: rgba(255, 114, 134, 0.08);
+}
+.cluster-diagnostic.heartbeat-critical strong {
+  color: var(--red);
+}
 .cluster-guidance {
   display: grid;
-  grid-template-columns: 44px minmax(0, 1fr);
+  grid-template-columns: 58px minmax(0, 1fr);
   gap: 4px 8px;
   margin-top: 10px;
   padding-top: 9px;
@@ -307,11 +394,12 @@ input[type="text"]:focus {
 
 .board {
   display: grid;
-  grid-template-columns: repeat(5, minmax(220px, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 12px;
   padding: 16px 24px 24px;
 }
 .lane {
+  min-width: 0;
   min-height: 420px;
   padding: 10px;
   border: 1px solid var(--line);
@@ -325,8 +413,9 @@ input[type="text"]:focus {
   padding: 4px 4px 12px;
 }
 .lane-header span { color: var(--muted); }
-.cards { display: flex; flex-direction: column; gap: 9px; }
+.cards { display: flex; flex-direction: column; gap: 9px; min-width: 0; }
 .card {
+  min-width: 0;
   padding: 12px;
   border: 1px solid #2b3c50;
   border-radius: 9px;
@@ -345,7 +434,7 @@ input[type="text"]:focus {
   font-size: 10px;
   text-transform: uppercase;
 }
-.card h3 { font-size: 13px; line-height: 1.35; margin-bottom: 8px; }
+.card h3 { font-size: 13px; line-height: 1.35; margin-bottom: 8px; overflow-wrap: anywhere; }
 .card-meta { display: flex; flex-wrap: wrap; gap: 5px; color: var(--muted); font-size: 11px; }
 .chip { padding: 2px 6px; border: 1px solid #304257; border-radius: 5px; }
 .chip.blocked { color: var(--amber); border-color: rgba(244,191,101,.35); }

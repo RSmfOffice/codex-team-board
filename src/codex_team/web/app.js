@@ -13,6 +13,22 @@ const attentionHealthStates = new Set([
   "unhealthy",
   "stalled",
 ]);
+const heartbeatStates = Object.freeze({
+  idle: { label: "无活动心跳", tone: "idle" },
+  normal: { label: "心跳正常", tone: "normal" },
+  warning: { label: "心跳延迟", tone: "warning" },
+  critical: { label: "心跳超时", tone: "critical" },
+});
+const queueReasonLabels = Object.freeze({
+  running: "运行中",
+  review_pending: "等待 Review",
+  blocked: "任务受阻",
+  ready: "等待调度",
+  global_capacity: "全局容量已满",
+  goal_capacity: "目标容量已满",
+  waiting_for_lead: "等待 Lead 规划",
+  none: "无排队",
+});
 
 let selectedProject = "";
 let selectedTaskId = "";
@@ -49,6 +65,37 @@ function ageText(seconds) {
   if (seconds < 60) return `${seconds} 秒`;
   if (seconds < 3600) return `${Math.floor(seconds / 60)} 分钟`;
   return `${Math.floor(seconds / 3600)} 小时`;
+}
+
+function nonNegativeNumber(value, fallback = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function goalHeartbeatInfo(goal) {
+  const state = String(goal?.heartbeat_state || "idle").toLowerCase();
+  const known = heartbeatStates[state];
+  return {
+    state,
+    label: known?.label || `心跳状态 ${state}`,
+    tone: known?.tone || "unknown",
+  };
+}
+
+function goalQueueReason(goal) {
+  const state = String(goal?.queue_reason || "none").toLowerCase();
+  return {
+    state,
+    label: queueReasonLabels[state] || `排队状态 ${state}`,
+  };
+}
+
+function waitDurationText(seconds) {
+  if (seconds === undefined || seconds === null || seconds === "") return "—";
+  const value = Number(seconds);
+  if (!Number.isFinite(value) || value < 0) return "—";
+  if (value === 0) return "0 秒";
+  return ageText(value);
 }
 
 function syncTopbarHeight() {
@@ -316,13 +363,67 @@ function buildClusterMetrics(data = {}) {
     (job) => job.kind === "worker"
       && ["starting", "running"].includes(job.status),
   ).length;
+  const globalJobs = summaryNumber(
+    summary,
+    ["global_jobs", "active_jobs"],
+    jobs.filter(
+      (job) => ["starting", "running"].includes(job.status),
+    ).length,
+  );
+  const globalCapacity = summaryNumber(summary, ["global_capacity"], 0);
+  const queuedGoals = summaryNumber(summary, ["queued_goals"], 0);
+  const heartbeatOverdue = summaryNumber(
+    summary,
+    ["heartbeat_overdue"],
+    goals.filter(
+      (goal) => ["warning", "critical"].includes(goalHeartbeatInfo(goal).state),
+    ).length,
+  );
+  const oldestHeartbeatAge = summaryNumber(
+    summary,
+    ["oldest_heartbeat_age_seconds"],
+    Math.max(
+      0,
+      ...goals.map((goal) => nonNegativeNumber(goal?.heartbeat_age_seconds)),
+    ),
+  );
+  const fairnessWaitCount = summaryNumber(
+    summary,
+    ["fairness_wait_count"],
+    goals.filter(
+      (goal) => goalQueueReason(goal).state === "global_capacity",
+    ).length,
+  );
   return [
+    {
+      key: "jobs",
+      label: "JOBS",
+      value: `${globalJobs}/${globalCapacity || "—"}`,
+      detail: "全局任务槽位",
+      tone: globalCapacity > 0 && globalJobs >= globalCapacity
+        ? "warning"
+        : "",
+    },
+    {
+      key: "queued",
+      label: "QUEUED",
+      value: queuedGoals,
+      detail: `公平等待 ${fairnessWaitCount}`,
+      tone: queuedGoals > 0 ? "warning" : "",
+    },
+    {
+      key: "heartbeat-overdue",
+      label: "HB OVERDUE",
+      value: heartbeatOverdue,
+      detail: `最老 ${ageText(oldestHeartbeatAge)}`,
+      tone: heartbeatOverdue > 0 ? "critical" : "",
+    },
     {
       key: "goals",
       label: "GOALS",
       value: summaryNumber(
         summary,
-        ["total", "total_goals", "goals", "goal_count"],
+        ["total", "total_goals", "goals_total", "goals", "goal_count"],
         goals.length,
       ),
     },
@@ -331,7 +432,7 @@ function buildClusterMetrics(data = {}) {
       label: "ACTIVE",
       value: summaryNumber(
         summary,
-        ["active", "active_goals", "active_count", "running"],
+        ["active", "active_goals", "goals_active", "active_count", "running"],
         activeGoals,
       ),
     },
@@ -340,7 +441,7 @@ function buildClusterMetrics(data = {}) {
       label: "PAUSED",
       value: summaryNumber(
         summary,
-        ["paused", "paused_goals", "paused_count"],
+        ["paused", "paused_goals", "goals_paused", "paused_count"],
         pausedGoals,
       ),
     },
@@ -358,7 +459,7 @@ function buildClusterMetrics(data = {}) {
       label: "WORKERS",
       value: summaryNumber(
         summary,
-        ["workers", "active_workers", "running_workers", "active_jobs"],
+        ["workers", "active_workers", "running_workers"],
         activeWorkers,
       ),
     },
@@ -415,10 +516,13 @@ function renderCluster(goals, jobs, data) {
   const summaryContainer = document.getElementById("cluster-summary");
   summaryContainer.innerHTML = buildClusterMetrics(data)
     .map((metric) => `
-      <div class="cluster-metric ${metric.key === "attention" && metric.value ? "attention" : ""}"
+      <div class="cluster-metric ${escapeHtml(metric.tone || (metric.key === "attention" && metric.value ? "attention" : ""))}"
            data-metric="${escapeHtml(metric.key)}">
         <strong>${escapeHtml(metric.value)}</strong>
-        <span>${escapeHtml(metric.label)}</span>
+        <span class="metric-copy">
+          <span>${escapeHtml(metric.label)}</span>
+          <small>${escapeHtml(metric.detail || "")}</small>
+        </span>
       </div>`)
     .join("");
 
@@ -440,9 +544,16 @@ function renderCluster(goals, jobs, data) {
   const cards = goals.map((goal) => {
     const health = goalHealth(goal);
     const goalJobs = activeJobs.filter((job) => job.goal_id === goal.goal_id);
+    const heartbeat = goalHeartbeatInfo(goal);
+    const queue = goalQueueReason(goal);
+    const activeJobCount = nonNegativeNumber(
+      goal.active_job_count,
+      goalJobs.length,
+    );
+    const heartbeatAge = waitDurationText(goal.heartbeat_age_seconds);
+    const estimatedWait = waitDurationText(goal.estimated_wait_seconds);
     const runText = goalJobs.length
       ? goalJobs
-        .slice(0, 3)
         .map((job) => `${job.kind}:${job.role} PID ${job.pid || "—"}`)
         .join(" · ")
       : "无活动进程";
@@ -464,7 +575,9 @@ function renderCluster(goals, jobs, data) {
       );
     }
     return `
-      <article class="cluster-card ${health.attention ? "attention" : ""}"
+      <article class="cluster-card ${health.attention ? "attention" : ""} heartbeat-${escapeHtml(heartbeat.tone)}"
+               data-heartbeat-state="${escapeHtml(heartbeat.state)}"
+               data-queue-reason="${escapeHtml(queue.state)}"
                data-goal-id="${escapeHtml(goal.goal_id)}">
         <div class="card-top">
           <span class="task-id">${escapeHtml(goal.goal_id)}</span>
@@ -475,11 +588,23 @@ function renderCluster(goals, jobs, data) {
           <span class="chip">${escapeHtml(goal.project_name || "未知项目")}</span>
           <span class="chip owner">${escapeHtml(goal.autonomy)}</span>
           <span class="chip">lead ticks ${escapeHtml(goal.lead_ticks ?? 0)}</span>
-          <span class="chip">${escapeHtml(runText)}</span>
+          <span class="chip active-jobs-chip">活动任务 ${escapeHtml(activeJobCount)} · ${escapeHtml(runText)}</span>
           ${health.attention ? '<span class="chip attention-chip">需关注</span>' : ""}
         </div>
+        <div class="cluster-diagnostics">
+          <div class="cluster-diagnostic heartbeat-${escapeHtml(heartbeat.tone)}">
+            <span>心跳</span>
+            <strong>${escapeHtml(heartbeat.label)}</strong>
+            <small>${escapeHtml(heartbeat.state)} · ${escapeHtml(heartbeatAge)}</small>
+          </div>
+          <div class="cluster-diagnostic queue-${escapeHtml(queue.state)}">
+            <span>队列</span>
+            <strong>${escapeHtml(queue.label)}</strong>
+            <small>${escapeHtml(queue.state)} · 预计等待 ${escapeHtml(estimatedWait)}</small>
+          </div>
+        </div>
         <div class="cluster-guidance">
-          <span>健康</span>
+          <span>目标健康</span>
           <strong class="${health.attention ? "attention" : ""}">${escapeHtml(health.label)}</strong>
           <span>下一步</span>
           <p>${escapeHtml(nextActionText(goal))}</p>
@@ -567,8 +692,15 @@ function buildBoardSignature(data) {
   }
   const normalized = JSON.parse(JSON.stringify(data ?? {}));
   delete normalized.generated_at;
+  if (normalized.cluster_summary) {
+    delete normalized.cluster_summary.oldest_heartbeat_age_seconds;
+  }
   for (const task of normalized.tasks || []) {
     delete task.claim_wait_seconds;
+  }
+  for (const goal of normalized.cluster_goals || []) {
+    delete goal.heartbeat_age_seconds;
+    delete goal.estimated_wait_seconds;
   }
   return JSON.stringify(normalized);
 }
@@ -863,9 +995,12 @@ if (typeof window !== "undefined") {
     buildBoardSignature,
     buildClusterMetrics,
     createClusterPayload,
+    goalHeartbeatInfo,
     goalHealth,
+    goalQueueReason,
     nextActionText,
     renderBoard,
+    waitDurationText,
   });
 }
 
