@@ -87,6 +87,23 @@ class TeamFlowTests(unittest.TestCase):
             ]
         )
         self.assertEqual(args.commit, "abc1234")
+        ensure_args = build_parser().parse_args(
+            [
+                "cluster",
+                "ensure",
+                "--repo",
+                ".",
+                "--objective",
+                "Automatic cluster gate",
+                "--no-daemon",
+            ]
+        )
+        self.assertEqual(ensure_args.cluster_command, "ensure")
+        self.assertTrue(ensure_args.no_daemon)
+        archive_args = build_parser().parse_args(
+            ["cluster", "archive", "G-EXAMPLE"]
+        )
+        self.assertEqual(archive_args.cluster_command, "archive")
 
     def test_write_task_requires_worktree_and_full_review_flow(self) -> None:
         task = self.team.create_task(
@@ -181,7 +198,7 @@ class TeamFlowTests(unittest.TestCase):
         self.assertIn("claimed", event_types)
         self.assertIn("submitted", event_types)
         self.assertIn("reviewed", event_types)
-        self.assertEqual(schema_version, 7)
+        self.assertEqual(schema_version, 8)
         history = self.team.get_task_events(done["task_id"])
         self.assertIn("worktree_created", [item["event_type"] for item in history["events"]])
 
@@ -542,6 +559,46 @@ class TeamFlowTests(unittest.TestCase):
         self.assertEqual(summary["heartbeat_overdue"], 0)
         self.assertEqual(summary["oldest_heartbeat_age_seconds"], 0)
         self.assertEqual(summary["fairness_wait_count"], 0)
+
+    def test_cluster_goal_archive_hides_restores_and_rejects_unfinished(self) -> None:
+        manager = ClusterManager(
+            self.settings,
+            team=self.team,
+            worktrees=self.worktrees,
+        )
+        goal = manager.create_goal(
+            self.repo,
+            objective="Archive a completed cluster goal",
+            autonomy="auto",
+        )
+        manager.set_goal_status(goal["goal_id"], "active")
+        with self.assertRaisesRegex(TeamError, "only completed or failed"):
+            manager.set_goal_archived(goal["goal_id"], True)
+        manager.set_goal_status(goal["goal_id"], "completed")
+
+        archived = manager.set_goal_archived(goal["goal_id"], True)
+        self.assertTrue(archived["archived_at"])
+        active = self.team.dashboard_snapshot()
+        visible = self.team.dashboard_snapshot(include_archived=True)
+        self.assertNotIn(
+            goal["goal_id"],
+            {item["goal_id"] for item in active["cluster_goals"]},
+        )
+        self.assertIn(
+            goal["goal_id"],
+            {item["goal_id"] for item in visible["cluster_goals"]},
+        )
+        with self.assertRaisesRegex(TeamError, "restore it first"):
+            manager.set_goal_status(goal["goal_id"], "paused")
+
+        restored = manager.set_goal_archived(goal["goal_id"], False)
+        self.assertFalse(restored["archived_at"])
+        event_types = [
+            event["event_type"]
+            for event in manager.get_goal(goal["goal_id"])["events"]
+        ]
+        self.assertIn("goal_archived", event_types)
+        self.assertIn("goal_restored", event_types)
 
     def test_dashboard_flags_old_ready_task_for_claim_followup(self) -> None:
         task = self.team.create_task(
@@ -1148,6 +1205,22 @@ class TeamFlowTests(unittest.TestCase):
             for item in _tool_definitions()
             if item["name"] == "team_create_task"
         )
+        ensure_tool = next(
+            item
+            for item in _tool_definitions()
+            if item["name"] == "team_cluster_ensure"
+        )
+        self.assertIn("repo_root", ensure_tool["inputSchema"]["required"])
+        self.assertIn("objective", ensure_tool["inputSchema"]["required"])
+        control_tool = next(
+            item
+            for item in _tool_definitions()
+            if item["name"] == "team_cluster_control"
+        )
+        self.assertIn(
+            "archive",
+            control_tool["inputSchema"]["properties"]["action"]["enum"],
+        )
         priority_schema = create_tool["inputSchema"]["properties"]["priority"]
         self.assertEqual(priority_schema["minimum"], 0)
         self.assertEqual(priority_schema["maximum"], 3)
@@ -1231,6 +1304,31 @@ class TeamFlowTests(unittest.TestCase):
             },
         )
         self.assertEqual(canceled["status"], "canceled")
+
+        with patch(
+            "codex_team.mcp.ensure_daemon",
+            return_value={"running": True, "pid": 1234},
+        ):
+            ensured = mcp.call_tool(
+                "team_cluster_ensure",
+                {
+                    "repo_root": str(self.repo),
+                    "objective": "Automatic team task",
+                },
+            )
+            reused = mcp.call_tool(
+                "team_cluster_ensure",
+                {
+                    "repo_root": str(self.repo),
+                    "objective": "Continue automatic team task",
+                },
+            )
+        self.assertTrue(ensured["created"])
+        self.assertTrue(reused["reused"])
+        self.assertEqual(
+            ensured["goal"]["goal_id"],
+            reused["goal"]["goal_id"],
+        )
 
     def test_concurrent_claim_has_one_winner_and_expired_lease_can_move(self) -> None:
         task = self.team.create_task(

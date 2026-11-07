@@ -4,7 +4,7 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
@@ -93,7 +93,8 @@ CREATE TABLE IF NOT EXISTS cluster_goals (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     completed_at TEXT,
-    last_error TEXT NOT NULL DEFAULT ''
+    last_error TEXT NOT NULL DEFAULT '',
+    archived_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS cluster_jobs (
@@ -148,6 +149,8 @@ CREATE INDEX IF NOT EXISTS idx_cluster_jobs_goal
     ON cluster_jobs(goal_id, status, job_id);
 CREATE INDEX IF NOT EXISTS idx_cluster_events_goal
     ON cluster_events(goal_id, event_id);
+CREATE INDEX IF NOT EXISTS idx_cluster_goals_archived
+    ON cluster_goals(project_id, archived_at, updated_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_cluster_one_active_goal
     ON cluster_goals(project_id)
     WHERE status IN ('planning', 'active');
@@ -181,6 +184,10 @@ TASK_MIGRATION_COLUMNS = {
 }
 
 PROJECT_MIGRATION_COLUMNS = {
+    "archived_at": "TEXT",
+}
+
+CLUSTER_GOAL_MIGRATION_COLUMNS = {
     "archived_at": "TEXT",
 }
 
@@ -237,4 +244,13 @@ def _upgrade_schema(connection: sqlite3.Connection) -> None:
         if name not in project_columns:
             connection.execute(
                 f"ALTER TABLE projects ADD COLUMN {name} {declaration}"
+            )
+    cluster_goal_columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(cluster_goals)").fetchall()
+    }
+    for name, declaration in CLUSTER_GOAL_MIGRATION_COLUMNS.items():
+        if name not in cluster_goal_columns:
+            connection.execute(
+                f"ALTER TABLE cluster_goals ADD COLUMN {name} {declaration}"
             )

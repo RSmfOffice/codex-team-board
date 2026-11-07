@@ -652,35 +652,42 @@ class TeamService:
                 ).fetchall()
             projects = [dict(row) for row in project_rows]
             if project_id:
-                goal_rows = connection.execute(
-                    """
-                    SELECT g.*, p.name AS project_name, p.root_path
-                    FROM cluster_goals g
-                    JOIN projects p ON p.project_id = g.project_id
-                    WHERE g.project_id = ?
-                    ORDER BY g.updated_at DESC
-                    """,
-                    (project_id,),
-                ).fetchall()
-                job_rows = connection.execute(
-                    """
-                    SELECT j.*, g.objective
-                    FROM cluster_jobs j JOIN cluster_goals g ON g.goal_id = j.goal_id
-                    WHERE g.project_id = ?
-                    ORDER BY j.started_at DESC LIMIT 100
-                    """,
-                    (project_id,),
-                ).fetchall()
-            else:
-                archive_filter = (
-                    "" if include_archived else "WHERE p.archived_at IS NULL"
+                goal_archive_filter = (
+                    "" if include_archived else "AND g.archived_at IS NULL"
                 )
                 goal_rows = connection.execute(
                     f"""
                     SELECT g.*, p.name AS project_name, p.root_path
                     FROM cluster_goals g
                     JOIN projects p ON p.project_id = g.project_id
-                    {archive_filter}
+                    WHERE g.project_id = ?
+                    {goal_archive_filter}
+                    ORDER BY g.updated_at DESC
+                    """,
+                    (project_id,),
+                ).fetchall()
+                job_rows = connection.execute(
+                    f"""
+                    SELECT j.*, g.objective
+                    FROM cluster_jobs j JOIN cluster_goals g ON g.goal_id = j.goal_id
+                    WHERE g.project_id = ?
+                    {goal_archive_filter}
+                    ORDER BY j.started_at DESC LIMIT 100
+                    """,
+                    (project_id,),
+                ).fetchall()
+            else:
+                goal_archive_filter = (
+                    ""
+                    if include_archived
+                    else "WHERE p.archived_at IS NULL AND g.archived_at IS NULL"
+                )
+                goal_rows = connection.execute(
+                    f"""
+                    SELECT g.*, p.name AS project_name, p.root_path
+                    FROM cluster_goals g
+                    JOIN projects p ON p.project_id = g.project_id
+                    {goal_archive_filter}
                     ORDER BY g.updated_at DESC
                     """
                 ).fetchall()
@@ -690,7 +697,7 @@ class TeamService:
                     FROM cluster_jobs j
                     JOIN cluster_goals g ON g.goal_id = j.goal_id
                     JOIN projects p ON p.project_id = g.project_id
-                    {archive_filter}
+                    {goal_archive_filter}
                     ORDER BY j.started_at DESC LIMIT 100
                     """
                 ).fetchall()
@@ -1872,8 +1879,12 @@ def _agents_block(project_id: str, max_threads: int) -> str:
   再关闭任务。
 - 接手或验收任务前使用 `team_get_task_events` 检查认领、进度、提交和 Review
   事件，不能只看最终状态。
-- 用户要求自动持续推进时使用 `team_cluster_start`。常驻 `teamd` 负责 Lead
-  resume/重建、Worker 自动重试和 lease 回收；不得手工重复 spawn 同一 goal 的
-  Agent。`supervised` 模式在 Review 阶段暂停等待人工决定。
+- 在团队项目中，凡是非平凡开发任务（会修改文件、跨多个步骤或预计超过 5 分钟），
+  主 Agent 必须在第一次编辑或创建 worktree 前调用 `team_cluster_ensure`，
+  确保项目已有但仅有一个 planning/active cluster goal。已有目标时复用，不重复
+  创建；paused goal 不得自动恢复。纯问答和无需修改文件的单次只读检查可跳过。
+- `team_cluster_start` 只用于明确新建目标。常驻 `teamd` 负责 Lead resume/重建、
+  Worker 自动重试和 lease 回收；不得手工重复 spawn 同一 goal 的 Agent。
+  `supervised` 模式在 Review 阶段暂停等待人工决定。
 - 推荐最大并发线程数：{max_threads}。只有任务文件范围互不重叠时才提高并发。
 <!-- CODEX_TEAM_BOARD:END -->"""

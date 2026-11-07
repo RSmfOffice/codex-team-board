@@ -81,6 +81,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/clusters/control":
             self._control_cluster_goal()
             return
+        if parsed.path == "/api/clusters/archive":
+            self._archive_cluster_goal()
+            return
         if parsed.path not in {"/api/projects/archive", "/api/tasks/archive"}:
             self._send_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
             return
@@ -220,6 +223,34 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 else daemon_status(self.team_service.settings)
             )
             self._send_json({"goal": goal, "daemon": daemon})
+        except TeamError as exc:
+            self._send_json(
+                {"error": str(exc)},
+                status=HTTPStatus.CONFLICT,
+            )
+        except (OSError, ValueError) as exc:
+            self._send_json(
+                {"error": str(exc)},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+
+    def _archive_cluster_goal(self) -> None:
+        try:
+            payload = self._read_json()
+            goal_id = self._required_text(payload, "goal_id")
+            archived = payload.get("archived")
+            if not isinstance(archived, bool):
+                raise ValueError("archived must be a boolean")
+            cluster = ClusterManager(
+                self.team_service.settings,
+                team=self.team_service,
+            )
+            goal = cluster.set_goal_archived(
+                goal_id,
+                archived,
+                actor="human",
+            )
+            self._send_json({"goal": goal})
         except TeamError as exc:
             self._send_json(
                 {"error": str(exc)},

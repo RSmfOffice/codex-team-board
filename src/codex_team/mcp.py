@@ -15,7 +15,9 @@ LOGGER = logging.getLogger("codex_team.mcp")
 PROTOCOL_VERSION = "2025-06-18"
 INSTRUCTIONS = (
     "This MCP server is the shared task and worktree source of truth for a Codex team. "
-    "For an initialized team project, call team_status or team_list_tasks before planning; "
+    "For an initialized team project, call team_cluster_ensure before non-trivial development "
+    "work so every project has one persistent cluster goal. Then call team_status or "
+    "team_list_tasks before planning; "
     "reuse existing tasks when possible. The lead creates tasks, creates a worktree for every "
     "write task, assigns a role, and "
     "is the only reviewer allowed to mark tasks done. Workers must claim a task, keep its "
@@ -420,6 +422,40 @@ def _tool_definitions() -> list[dict[str, Any]]:
             },
         },
         {
+            "name": "team_cluster_ensure",
+            "description": (
+                "Idempotently ensure the project has one planning/active cluster goal before "
+                "non-trivial development work. Reuse an existing goal; never auto-resume a "
+                "paused goal. Start the background scheduler when needed."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo_root": repo,
+                    "objective": {"type": "string", "minLength": 1},
+                    "autonomy": {
+                        "type": "string",
+                        "enum": ["auto", "supervised"],
+                        "default": "auto",
+                    },
+                    "max_worker_attempts": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 10,
+                        "default": 3,
+                    },
+                    "max_lead_attempts": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20,
+                        "default": 5,
+                    },
+                },
+                "required": ["repo_root", "objective"],
+                "additionalProperties": False,
+            },
+        },
+        {
             "name": "team_cluster_status",
             "description": "Read cluster goals, Lead/Worker runs, retries, errors, and daemon status.",
             "inputSchema": {
@@ -432,12 +468,21 @@ def _tool_definitions() -> list[dict[str, Any]]:
         },
         {
             "name": "team_cluster_control",
-            "description": "Pause, resume, or cancel an automated cluster goal.",
+            "description": "Pause, resume, cancel, archive, or restore an automated cluster goal.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "goal_id": {"type": "string"},
-                    "action": {"type": "string", "enum": ["pause", "resume", "cancel"]},
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "pause",
+                            "resume",
+                            "cancel",
+                            "archive",
+                            "restore",
+                        ],
+                    },
                 },
                 "required": ["goal_id", "action"],
                 "additionalProperties": False,
@@ -610,6 +655,18 @@ class TeamMcpServer:
                 "goal": self.cluster.get_goal(goal["goal_id"]),
                 "daemon": ensure_daemon(self.settings),
             }
+        if name == "team_cluster_ensure":
+            result = self.cluster.ensure_goal(
+                arguments["repo_root"],
+                objective=arguments["objective"],
+                autonomy=arguments.get("autonomy", "auto"),
+                max_worker_attempts=int(arguments.get("max_worker_attempts", 3)),
+                max_lead_attempts=int(arguments.get("max_lead_attempts", 5)),
+            )
+            return {
+                **result,
+                "daemon": ensure_daemon(self.settings),
+            }
         if name == "team_cluster_status":
             goal_id = arguments.get("goal_id")
             return {
@@ -623,7 +680,13 @@ class TeamMcpServer:
         if name == "team_cluster_control":
             action = arguments["action"]
             reason = f"{action} requested through MCP"
-            if action == "cancel":
+            if action in {"archive", "restore"}:
+                goal = self.cluster.set_goal_archived(
+                    arguments["goal_id"],
+                    action == "archive",
+                    actor="human",
+                )
+            elif action == "cancel":
                 goal = self.cluster.cancel_goal(
                     arguments["goal_id"],
                     reason=reason,
@@ -637,7 +700,11 @@ class TeamMcpServer:
                 )
             return {
                 "goal": goal,
-                "daemon": ensure_daemon(self.settings) if action == "resume" else cluster_daemon_status(self.settings),
+                "daemon": (
+                    ensure_daemon(self.settings)
+                    if action == "resume"
+                    else cluster_daemon_status(self.settings)
+                ),
             }
         raise TeamError(f"unknown tool: {name}")
 

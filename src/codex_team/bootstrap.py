@@ -91,8 +91,12 @@ def _agents_block(project_root: Path) -> str:
   真实消费者的一体化路径。
 - 接手或验收任务前使用 `team_get_task_events` 检查认领、进度、提交和 Review
   事件，不能只看最终状态。
-- 用户要求自动持续推进时，使用 `team_cluster_start` 创建集群目标。由常驻
-  `teamd` 自动启动/恢复 Lead 和 Worker；不得手工重复 spawn 同一 goal 的 Agent。
+- 在团队项目中，凡是非平凡开发任务（会修改文件、跨多个步骤或预计超过 5 分钟），
+  主 Agent 必须在第一次编辑或创建 worktree 前调用 `team_cluster_ensure`，
+  确保项目已有但仅有一个 planning/active cluster goal。已有目标时复用，不重复
+  创建；paused goal 不得自动恢复。纯问答和无需修改文件的单次只读检查可跳过。
+- `team_cluster_start` 只用于明确新建目标。由常驻 `teamd` 自动启动/恢复 Lead
+  和 Worker；不得手工重复 spawn 同一 goal 的 Agent。
 - `teamd` 会 resume 中断的 Lead 线程、重建连续失败的 Lead generation、回收过期
   Worker lease，并按 `max_worker_attempts` 自动重试。主 Agent 通过
   `team_cluster_status` 查看状态，不直接管理 Worker 进程。

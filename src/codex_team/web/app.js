@@ -570,15 +570,24 @@ function renderCluster(goals, jobs, data) {
         '<button class="goal-action resume" type="button" data-control-action="resume">恢复</button>',
       );
     }
+    if (terminalGoalStatuses.has(status)) {
+      controls.push(
+        goal.archived_at
+          ? '<button class="goal-action resume" type="button" data-control-action="restore">恢复目标</button>'
+          : '<button class="goal-action" type="button" data-control-action="archive">归档目标</button>',
+      );
+    }
     if (!terminalGoalStatuses.has(status)) {
       controls.push(
         '<button class="goal-action danger" type="button" data-control-action="cancel">取消</button>',
       );
     }
+    const archivedClass = goal.archived_at ? " archived" : "";
     return `
-      <article class="cluster-card ${health.attention ? "attention" : ""} heartbeat-${escapeHtml(heartbeat.tone)}"
+      <article class="cluster-card ${health.attention ? "attention" : ""} heartbeat-${escapeHtml(heartbeat.tone)}${archivedClass}"
                data-heartbeat-state="${escapeHtml(heartbeat.state)}"
                data-queue-reason="${escapeHtml(queue.state)}"
+               data-archived="${goal.archived_at ? "true" : "false"}"
                data-goal-id="${escapeHtml(goal.goal_id)}">
         <div class="card-top">
           <span class="task-id">${escapeHtml(goal.goal_id)}</span>
@@ -590,6 +599,7 @@ function renderCluster(goals, jobs, data) {
           <span class="chip owner">${escapeHtml(goal.autonomy)}</span>
           <span class="chip">lead ticks ${escapeHtml(goal.lead_ticks ?? 0)}</span>
           <span class="chip active-jobs-chip">活动任务 ${escapeHtml(activeJobCount)} · ${escapeHtml(runText)}</span>
+          ${goal.archived_at ? '<span class="chip archived">已归档</span>' : ""}
           ${health.attention ? '<span class="chip attention-chip">需关注</span>' : ""}
         </div>
         <div class="cluster-diagnostics">
@@ -901,7 +911,10 @@ async function handleClusterControl(button) {
   const action = button.dataset.controlAction;
   const card = button.closest(".cluster-card");
   const goalId = card?.dataset.goalId;
-  if (!goalId || !["pause", "resume", "cancel"].includes(action)) return;
+  if (
+    !goalId
+    || !["pause", "resume", "cancel", "archive", "restore"].includes(action)
+  ) return;
   if (
     action === "cancel"
     && !window.confirm(`取消目标 ${goalId}？未完成任务会保留。`)
@@ -912,16 +925,24 @@ async function handleClusterControl(button) {
     pause: "正在暂停…",
     resume: "正在恢复…",
     cancel: "正在取消…",
+    archive: "正在归档目标…",
+    restore: "正在恢复目标…",
   };
   button.disabled = true;
   setActionStatus("cluster-action-status", labels[action], "pending");
   try {
+    const endpoint = ["archive", "restore"].includes(action)
+      ? "/api/clusters/archive"
+      : "/api/clusters/control";
+    const payload = ["archive", "restore"].includes(action)
+      ? { goal_id: goalId, archived: action === "archive" }
+      : { goal_id: goalId, action };
     await requestJson(
-      "/api/clusters/control",
+      endpoint,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ goal_id: goalId, action }),
+        body: JSON.stringify(payload),
       },
       "cluster control",
     );
@@ -929,6 +950,8 @@ async function handleClusterControl(button) {
       pause: "目标已暂停",
       resume: "目标已恢复",
       cancel: "目标已取消",
+      archive: "目标已归档",
+      restore: "目标已恢复",
     };
     setActionStatus(
       "cluster-action-status",

@@ -31,8 +31,12 @@
   再关闭任务。
 - 接手或验收任务前使用 `team_get_task_events` 检查认领、进度、提交和 Review
   事件，不能只看最终状态。
-- 用户要求自动持续推进时使用 `team_cluster_start`。常驻 `teamd` 负责 Lead
-  resume/重建、Worker 自动重试和 lease 回收；不得手工重复 spawn 同一 goal 的
-  Agent。`supervised` 模式在 Review 阶段暂停等待人工决定。
+- 在团队项目中，凡是非平凡开发任务（会修改文件、跨多个步骤或预计超过 5 分钟），
+  主 Agent 必须在第一次编辑或创建 worktree 前调用 `team_cluster_ensure`，
+  确保项目已有但仅有一个 planning/active cluster goal。已有目标时复用，不重复
+  创建；paused goal 不得自动恢复。纯问答和无需修改文件的单次只读检查可跳过。
+- `team_cluster_start` 只用于明确新建目标。常驻 `teamd` 负责 Lead resume/重建、
+  Worker 自动重试和 lease 回收；不得手工重复 spawn 同一 goal 的 Agent。
+  `supervised` 模式在 Review 阶段暂停等待人工决定。
 - 推荐最大并发线程数：4。只有任务文件范围互不重叠时才提高并发。
 <!-- CODEX_TEAM_BOARD:END -->

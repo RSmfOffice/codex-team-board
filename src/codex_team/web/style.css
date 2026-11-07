@@ -273,6 +273,10 @@ input[type="text"]:focus {
   border-color: rgba(244, 191, 101, 0.58);
   box-shadow: inset 3px 0 0 rgba(244, 191, 101, 0.78);
 }
+.cluster-card.archived {
+  opacity: 0.78;
+  border-style: dashed;
+}
 .cluster-card.heartbeat-warning {
   border-color: rgba(244, 191, 101, 0.58);
 }

@@ -205,6 +205,28 @@ class DashboardClusterControlTests(unittest.TestCase):
             )
             self.assertEqual(status, 409)
             self.assertIn("invalid goal transition", invalid_resume["error"])
+            status, archived = self.post(
+                "/api/clusters/archive",
+                {"goal_id": goal["goal_id"], "archived": True},
+            )
+            self.assertEqual(status, 200)
+            self.assertTrue(archived["goal"]["archived_at"])
+            active_board = self.get("/api/board")
+            visible_board = self.get("/api/board?include_archived=1")
+            self.assertNotIn(
+                goal["goal_id"],
+                {item["goal_id"] for item in active_board["cluster_goals"]},
+            )
+            self.assertIn(
+                goal["goal_id"],
+                {item["goal_id"] for item in visible_board["cluster_goals"]},
+            )
+            status, restored = self.post(
+                "/api/clusters/archive",
+                {"goal_id": goal["goal_id"], "archived": False},
+            )
+            self.assertEqual(status, 200)
+            self.assertIsNone(restored["goal"]["archived_at"])
 
     def test_daemon_start_failure_marks_goal_failed(self) -> None:
         with patch(

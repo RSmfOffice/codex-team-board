@@ -130,6 +130,7 @@ class ClusterManager:
                 """
                 SELECT goal_id FROM cluster_goals
                 WHERE project_id = ? AND status IN ('planning', 'active')
+                  AND archived_at IS NULL
                 """,
                 (project["project_id"],),
             ).fetchone()
@@ -155,6 +156,93 @@ class ClusterManager:
             )
             self._event(connection, goal_id, "goal_created", "teamd", {"objective": objective})
         return self.get_goal(goal_id)
+
+    def ensure_goal(
+        self,
+        repo: str | Path,
+        *,
+        objective: str,
+        autonomy: str = "auto",
+        max_worker_attempts: int = 3,
+        max_lead_attempts: int = 5,
+    ) -> dict[str, Any]:
+        """Return a project's unfinished goal, creating one when none exists."""
+        objective = objective.strip()
+        if not objective:
+            raise ClusterError("objective must not be empty")
+        if autonomy not in {"auto", "supervised"}:
+            raise ClusterError("autonomy must be auto or supervised")
+        project = self.team.init_project(repo)
+        now = utc_now()
+        created = False
+        with self.team.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            active = connection.execute(
+                """
+                SELECT goal_id, status, objective
+                FROM cluster_goals
+                WHERE project_id = ?
+                  AND status IN ('planning', 'active', 'paused')
+                  AND archived_at IS NULL
+                ORDER BY
+                    CASE status
+                        WHEN 'active' THEN 0
+                        WHEN 'planning' THEN 1
+                        ELSE 2
+                    END,
+                    updated_at DESC
+                LIMIT 1
+                """,
+                (project["project_id"],),
+            ).fetchone()
+            if active:
+                goal_id = str(active["goal_id"])
+                self._event(
+                    connection,
+                    goal_id,
+                    "goal_reused",
+                    "lead",
+                    {
+                        "status": active["status"],
+                        "existing_objective": active["objective"],
+                        "requested_objective": objective,
+                    },
+                )
+            else:
+                goal_id = self._new_id("G")
+                created = True
+                connection.execute(
+                    """
+                    INSERT INTO cluster_goals(
+                        goal_id, project_id, objective, status, autonomy,
+                        max_worker_attempts, max_lead_attempts, created_at, updated_at
+                    ) VALUES (?, ?, ?, 'planning', ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        goal_id,
+                        project["project_id"],
+                        objective,
+                        autonomy,
+                        max(1, min(int(max_worker_attempts), 10)),
+                        max(1, min(int(max_lead_attempts), 20)),
+                        now,
+                        now,
+                    ),
+                )
+                self._event(
+                    connection,
+                    goal_id,
+                    "goal_created",
+                    "lead",
+                    {"objective": objective, "via": "ensure_goal"},
+                )
+        goal = self.get_goal(goal_id)
+        return {
+            "goal": goal,
+            "created": created,
+            "reused": not created,
+            "requires_resume": goal["status"] == "paused",
+        }
 
     def get_goal(self, goal_id: str) -> dict[str, Any]:
         with self.team.connection(write=False) as connection:
@@ -187,8 +275,14 @@ class ClusterManager:
             )
             return result
 
-    def list_goals(self, statuses: list[str] | None = None) -> list[dict[str, Any]]:
+    def list_goals(
+        self,
+        statuses: list[str] | None = None,
+        *,
+        include_archived: bool = False,
+    ) -> list[dict[str, Any]]:
         with self.team.connection(write=False) as connection:
+            archive_filter = "" if include_archived else "AND g.archived_at IS NULL"
             if statuses:
                 placeholders = ",".join("?" for _ in statuses)
                 rows = connection.execute(
@@ -196,6 +290,7 @@ class ClusterManager:
                     SELECT g.*, p.name AS project_name, p.root_path
                     FROM cluster_goals g JOIN projects p ON p.project_id = g.project_id
                     WHERE g.status IN ({placeholders})
+                    {archive_filter}
                     ORDER BY g.updated_at DESC
                     """,
                     statuses,
@@ -205,6 +300,8 @@ class ClusterManager:
                     """
                     SELECT g.*, p.name AS project_name, p.root_path
                     FROM cluster_goals g JOIN projects p ON p.project_id = g.project_id
+                    WHERE 1 = 1
+                    {archive_filter}
                     ORDER BY g.updated_at DESC
                     """
                 ).fetchall()
@@ -221,6 +318,8 @@ class ClusterManager:
             ).fetchone()
             if row is None:
                 raise ClusterError(f"cluster goal not found: {goal_id}")
+            if row["archived_at"]:
+                raise ClusterError("archived goal cannot change status; restore it first")
             current_status = row["status"]
             if (
                 status != current_status
@@ -326,6 +425,56 @@ class ClusterManager:
                     {"goal_id": goal_id, "reason": reason},
                 )
         return self.set_goal_status(goal_id, "failed", reason=reason)
+
+    def set_goal_archived(
+        self,
+        goal_id: str,
+        archived: bool,
+        *,
+        actor: str = "human",
+    ) -> dict[str, Any]:
+        with self.team.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            goal = connection.execute(
+                "SELECT * FROM cluster_goals WHERE goal_id = ?",
+                (goal_id,),
+            ).fetchone()
+            if goal is None:
+                raise ClusterError(f"cluster goal not found: {goal_id}")
+            if archived:
+                if goal["status"] not in TERMINAL_GOAL_STATUSES:
+                    raise ClusterError(
+                        "only completed or failed cluster goals can be archived"
+                    )
+                active_job = connection.execute(
+                    """
+                    SELECT job_id FROM cluster_jobs
+                    WHERE goal_id = ? AND status IN ('starting', 'running')
+                    LIMIT 1
+                    """,
+                    (goal_id,),
+                ).fetchone()
+                if active_job:
+                    raise ClusterError(
+                        f"goal has an active job: {active_job['job_id']}"
+                    )
+            archived_at = utc_now() if archived else None
+            connection.execute(
+                """
+                UPDATE cluster_goals
+                SET archived_at = ?, updated_at = ?
+                WHERE goal_id = ?
+                """,
+                (archived_at, utc_now(), goal_id),
+            )
+            self._event(
+                connection,
+                goal_id,
+                "goal_archived" if archived else "goal_restored",
+                actor,
+                {"archived": archived},
+            )
+        return self.get_goal(goal_id)
 
     def tick(self) -> dict[str, Any]:
         self._reconcile_jobs()

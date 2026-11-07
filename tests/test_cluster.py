@@ -671,6 +671,56 @@ class ClusterSchedulerTests(unittest.TestCase):
                 "completed",
             )
 
+    def test_ensure_goal_reuses_active_goal_and_never_resumes_paused(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            manager = ClusterManager(
+                settings,
+                team=team,
+                agent_command=["codex"],
+            )
+            repo = _repo(base, "ensure-goal")
+
+            first = manager.ensure_goal(
+                repo,
+                objective="Implement the feature cluster",
+            )
+            second = manager.ensure_goal(
+                repo,
+                objective="Continue the same feature cluster",
+            )
+
+            self.assertTrue(first["created"])
+            self.assertFalse(first["reused"])
+            self.assertFalse(second["created"])
+            self.assertTrue(second["reused"])
+            self.assertEqual(
+                first["goal"]["goal_id"],
+                second["goal"]["goal_id"],
+            )
+            manager.set_goal_status(first["goal"]["goal_id"], "paused")
+            paused = manager.ensure_goal(
+                repo,
+                objective="Must not auto-resume",
+            )
+            self.assertFalse(paused["created"])
+            self.assertTrue(paused["reused"])
+            self.assertTrue(paused["requires_resume"])
+            self.assertEqual(
+                paused["goal"]["goal_id"],
+                first["goal"]["goal_id"],
+            )
+            self.assertEqual(paused["goal"]["status"], "paused")
+            self.assertIn(
+                "goal_reused",
+                [
+                    event["event_type"]
+                    for event in manager.get_goal(first["goal"]["goal_id"])["events"]
+                ],
+            )
+
     def test_worker_heartbeat_warning_and_critical_alert_without_kill(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)

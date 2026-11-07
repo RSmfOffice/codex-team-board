@@ -48,8 +48,9 @@ expectText(html, "创建目标", "index.html");
 expectText(app, "暂停", "app.js");
 expectText(app, "恢复", "app.js");
 expectText(app, "取消", "app.js");
-expectText(app, "JSON.stringify({ goal_id: goalId, action })", "app.js");
+expectText(app, "JSON.stringify(payload)", "app.js");
 expectText(app, "/api/clusters/control", "app.js");
+expectText(app, "/api/clusters/archive", "app.js");
 expectText(app, "/api/board", "app.js");
 expectText(app, "/api/projects", "app.js");
 expectText(app, "data.cluster_summary", "app.js");
@@ -60,6 +61,7 @@ expectText(css, ".cluster-card.attention", "style.css");
 expectText(css, ".cluster-actions", "style.css");
 expectText(css, ".cluster-card.heartbeat-warning", "style.css");
 expectText(css, ".cluster-card.heartbeat-critical", "style.css");
+expectText(css, ".cluster-card.archived", "style.css");
 expectText(css, ".cluster-diagnostic.heartbeat-warning", "style.css");
 expectText(css, ".cluster-diagnostic.heartbeat-critical", "style.css");
 for (const field of [
@@ -198,7 +200,7 @@ const firstBoard = {
   messages: [],
   events: [],
   cluster_summary: {
-    goals_total: 3,
+    goals_total: 5,
     goals_active: 2,
     goals_paused: 1,
     goals_failed: 0,
@@ -255,6 +257,34 @@ const firstBoard = {
       heartbeat_age_seconds: 0,
       queue_reason: "none",
       estimated_wait_seconds: 0,
+    },
+    {
+      goal_id: "G-DONE",
+      status: "completed",
+      objective: "可归档的已完成目标",
+      project_name: "Demo",
+      autonomy: "auto",
+      lead_ticks: 4,
+      active_job_count: 0,
+      heartbeat_state: "idle",
+      heartbeat_age_seconds: 0,
+      queue_reason: "none",
+      estimated_wait_seconds: 0,
+      archived_at: null,
+    },
+    {
+      goal_id: "G-ARCHIVED",
+      status: "failed",
+      objective: "已归档且可恢复的目标",
+      project_name: "Demo",
+      autonomy: "auto",
+      lead_ticks: 2,
+      active_job_count: 0,
+      heartbeat_state: "idle",
+      heartbeat_age_seconds: 0,
+      queue_reason: "none",
+      estimated_wait_seconds: 0,
+      archived_at: "2026-11-07T09:00:00Z",
     },
   ],
   cluster_jobs: [
@@ -349,6 +379,10 @@ assert.match(clusterHtmlBefore, /Worker 心跳延迟/);
 assert.match(clusterHtmlBefore, /检查 Worker 进度/);
 assert.match(clusterHtmlBefore, /data-control-action="pause"/);
 assert.match(clusterHtmlBefore, /data-control-action="cancel"/);
+assert.match(clusterHtmlBefore, /data-control-action="archive"/);
+assert.match(clusterHtmlBefore, /data-control-action="restore"/);
+assert.match(clusterHtmlBefore, /data-archived="true"/);
+assert.match(clusterHtmlBefore, /已归档/);
 assert.equal(
   hooks.renderBoard(secondBoard),
   false,
@@ -420,7 +454,7 @@ assert.deepEqual(metrics, {
   jobs: "3/4",
   queued: 2,
   "heartbeat-overdue": 2,
-  goals: 3,
+    goals: 5,
   active: 2,
   paused: 1,
   attention: 2,

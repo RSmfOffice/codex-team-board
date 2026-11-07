@@ -38,7 +38,7 @@ class MigrationTests(unittest.TestCase):
             try:
                 self.assertEqual(
                     upgraded.execute("PRAGMA user_version").fetchone()[0],
-                    7,
+                    8,
                 )
                 columns = {
                     row["name"]
@@ -61,6 +61,13 @@ class MigrationTests(unittest.TestCase):
                     for row in upgraded.execute("PRAGMA table_info(projects)").fetchall()
                 }
                 self.assertIn("archived_at", project_columns)
+                cluster_goal_columns = {
+                    row["name"]
+                    for row in upgraded.execute(
+                        "PRAGMA table_info(cluster_goals)"
+                    ).fetchall()
+                }
+                self.assertIn("archived_at", cluster_goal_columns)
                 self.assertEqual(
                     upgraded.execute("PRAGMA integrity_check").fetchone()[0],
                     "ok",

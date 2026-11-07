@@ -163,6 +163,13 @@ def build_parser() -> argparse.ArgumentParser:
     cluster_start.add_argument("--max-worker-attempts", type=int, default=3)
     cluster_start.add_argument("--max-lead-attempts", type=int, default=5)
     cluster_start.add_argument("--no-daemon", action="store_true")
+    cluster_ensure = cluster_sub.add_parser("ensure")
+    cluster_ensure.add_argument("--repo", default=".")
+    cluster_ensure.add_argument("--objective", required=True)
+    cluster_ensure.add_argument("--autonomy", choices=["auto", "supervised"], default="auto")
+    cluster_ensure.add_argument("--max-worker-attempts", type=int, default=3)
+    cluster_ensure.add_argument("--max-lead-attempts", type=int, default=5)
+    cluster_ensure.add_argument("--no-daemon", action="store_true")
     cluster_sub.add_parser("list")
     cluster_status = cluster_sub.add_parser("status")
     cluster_status.add_argument("goal_id", nargs="?")
@@ -172,6 +179,10 @@ def build_parser() -> argparse.ArgumentParser:
     cluster_resume.add_argument("goal_id")
     cluster_cancel = cluster_sub.add_parser("cancel")
     cluster_cancel.add_argument("goal_id")
+    cluster_archive = cluster_sub.add_parser("archive")
+    cluster_archive.add_argument("goal_id")
+    cluster_restore = cluster_sub.add_parser("restore")
+    cluster_restore.add_argument("goal_id")
     cluster_sub.add_parser("daemon-status")
     cluster_sub.add_parser("stop-daemon")
     daemon = cluster_sub.add_parser("daemon")
@@ -365,6 +376,16 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 daemon = None if args.no_daemon else ensure_daemon(settings)
                 _print({"goal": goal, "daemon": daemon})
+            elif args.cluster_command == "ensure":
+                result = cluster.ensure_goal(
+                    args.repo,
+                    objective=args.objective,
+                    autonomy=args.autonomy,
+                    max_worker_attempts=args.max_worker_attempts,
+                    max_lead_attempts=args.max_lead_attempts,
+                )
+                daemon = None if args.no_daemon else ensure_daemon(settings)
+                _print({**result, "daemon": daemon})
             elif args.cluster_command == "list":
                 _print({"goals": cluster.list_goals()})
             elif args.cluster_command == "status":
@@ -379,6 +400,22 @@ def main(argv: list[str] | None = None) -> int:
                 _print({"daemon": ensure_daemon(settings)})
             elif args.cluster_command == "cancel":
                 _print(cluster.cancel_goal(args.goal_id, reason="canceled by user"))
+            elif args.cluster_command == "archive":
+                _print(
+                    cluster.set_goal_archived(
+                        args.goal_id,
+                        True,
+                        actor="human",
+                    )
+                )
+            elif args.cluster_command == "restore":
+                _print(
+                    cluster.set_goal_archived(
+                        args.goal_id,
+                        False,
+                        actor="human",
+                    )
+                )
             elif args.cluster_command == "daemon-status":
                 _print(daemon_status(settings))
             elif args.cluster_command == "stop-daemon":
