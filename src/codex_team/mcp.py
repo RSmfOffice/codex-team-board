@@ -148,7 +148,11 @@ def _tool_definitions() -> list[dict[str, Any]]:
         },
         {
             "name": "team_list_tasks",
-            "description": "List tasks, blockers, leases, worktrees, and current status.",
+            "description": (
+                "List tasks, blockers, leases, worktrees, and current status. "
+                "Set include_archived=true to inspect tasks archived by the UI or "
+                "cascaded from an archived goal."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {

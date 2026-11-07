@@ -4,7 +4,7 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
@@ -48,7 +48,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     completed_at TEXT,
-    archived_at TEXT
+    archived_at TEXT,
+    archived_by_goal INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_dependencies (
@@ -201,6 +202,8 @@ CREATE INDEX IF NOT EXISTS idx_tasks_claim
     ON tasks(claim_token);
 CREATE INDEX IF NOT EXISTS idx_tasks_archived
     ON tasks(project_id, archived_at, status);
+CREATE INDEX IF NOT EXISTS idx_tasks_goal_archive
+    ON tasks(goal_id, status, archived_at);
 CREATE INDEX IF NOT EXISTS idx_dependencies_depends_on
     ON task_dependencies(depends_on);
 CREATE INDEX IF NOT EXISTS idx_events_task
@@ -249,6 +252,7 @@ TASK_MIGRATION_COLUMNS = {
     "version": "INTEGER NOT NULL DEFAULT 1",
     "completed_at": "TEXT",
     "archived_at": "TEXT",
+    "archived_by_goal": "INTEGER NOT NULL DEFAULT 0",
     "continuity_mode": "TEXT NOT NULL DEFAULT 'auto'",
 }
 

@@ -511,6 +511,7 @@ class ClusterManager:
                 result["root_path"],
                 goal_id=goal_id,
                 include_done=True,
+                include_archived=True,
             )
             return result
 
@@ -714,21 +715,113 @@ class ClusterManager:
                     raise ClusterError(
                         f"goal has an active job: {active_job['job_id']}"
                     )
-            archived_at = utc_now() if archived else None
+            now = utc_now()
+            archived_at = now if archived else None
+            changed_task_ids: list[str] = []
+            if archived:
+                tasks = connection.execute(
+                    """
+                    SELECT task_id
+                    FROM tasks
+                    WHERE goal_id = ? AND status = 'done'
+                      AND archived_at IS NULL
+                    ORDER BY task_id
+                    """,
+                    (goal_id,),
+                ).fetchall()
+                for task in tasks:
+                    task_id = str(task["task_id"])
+                    updated = connection.execute(
+                        """
+                        UPDATE tasks
+                        SET archived_at = ?, archived_by_goal = 1,
+                            updated_at = ?, version = version + 1
+                        WHERE task_id = ? AND status = 'done'
+                          AND archived_at IS NULL
+                        """,
+                        (now, now, task_id),
+                    )
+                    if updated.rowcount != 1:
+                        continue
+                    changed_task_ids.append(task_id)
+                    connection.execute(
+                        """
+                        INSERT INTO task_events(
+                            task_id, event_type, actor, data_json, created_at
+                        ) VALUES (?, 'archived_by_goal', ?, ?, ?)
+                        """,
+                        (
+                            task_id,
+                            actor,
+                            json.dumps(
+                                {"goal_id": goal_id},
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            ),
+                            now,
+                        ),
+                    )
+            else:
+                tasks = connection.execute(
+                    """
+                    SELECT task_id
+                    FROM tasks
+                    WHERE goal_id = ? AND status = 'done'
+                      AND archived_by_goal = 1
+                    ORDER BY task_id
+                    """,
+                    (goal_id,),
+                ).fetchall()
+                for task in tasks:
+                    task_id = str(task["task_id"])
+                    updated = connection.execute(
+                        """
+                        UPDATE tasks
+                        SET archived_at = NULL, archived_by_goal = 0,
+                            updated_at = ?, version = version + 1
+                        WHERE task_id = ? AND status = 'done'
+                          AND archived_by_goal = 1
+                        """,
+                        (now, task_id),
+                    )
+                    if updated.rowcount != 1:
+                        continue
+                    changed_task_ids.append(task_id)
+                    connection.execute(
+                        """
+                        INSERT INTO task_events(
+                            task_id, event_type, actor, data_json, created_at
+                        ) VALUES (?, 'restored_by_goal', ?, ?, ?)
+                        """,
+                        (
+                            task_id,
+                            actor,
+                            json.dumps(
+                                {"goal_id": goal_id},
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            ),
+                            now,
+                        ),
+                    )
             connection.execute(
                 """
                 UPDATE cluster_goals
                 SET archived_at = ?, updated_at = ?
                 WHERE goal_id = ?
                 """,
-                (archived_at, utc_now(), goal_id),
+                (archived_at, now, goal_id),
             )
             self._event(
                 connection,
                 goal_id,
                 "goal_archived" if archived else "goal_restored",
                 actor,
-                {"archived": archived},
+                {
+                    "archived": archived,
+                    "task_ids": changed_task_ids,
+                    "task_count": len(changed_task_ids),
+                },
             )
         return self.get_goal(goal_id)
 

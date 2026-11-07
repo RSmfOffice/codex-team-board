@@ -134,7 +134,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 
 如果仍需联动上下文插件，追加
 `-ContextMeterRoot "D:\path\to\codex-context-meter"`。安装完成后重新打开 Codex，
-并确认健康接口返回 `"version": "0.4.0"`：
+并确认健康接口返回 `"version": "0.4.1"`：
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8765/api/health
@@ -487,7 +487,7 @@ MCP 的 `team_cluster_control.action` 除 `pause`、`resume`、`cancel` 外，�
 
 - 没有打开任务详情时：归档或恢复当前项目。
 - 打开任务详情时：归档或恢复当前任务。
-- 集群目标使用目标卡片上的“归档目标”或“恢复目标”按钮。
+- 集群目标使用目标卡片上的“归档目标（含Done）”或“恢复目标（含Done）”按钮。
 - 先关闭任务详情，按钮才会切回项目归档。
 
 项目、任务和集群目标都采用软归档：
@@ -503,6 +503,11 @@ MCP 的 `team_cluster_control.action` 除 `pause`、`resume`、`cancel` 外，�
   恢复后解除限制。
 - 只有 `completed`/`failed` 集群目标可以在没有活动 job 时归档；归档目标不能
   直接改变状态，恢复后才能继续生命周期操作。
+- 归档目标会同时软归档该目标下尚未归档的 `done` 任务。恢复目标时只恢复由目标
+  级联归档的任务，用户单独归档的任务保持归档。
+- 目标归档不会归档 Agent Thread、Codex 会话、任务事件、worktree、分支或合并
+  记录。归档任务可通过 `team_list_tasks(include_archived=true)` 读取；目标详情
+  和 `team_cluster_status` 始终包含关联任务，供 Agent 按需查询。
 
 ## MCP 工具
 
@@ -901,5 +906,5 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -File .\scripts\build-release.ps1
 ```
 
-输出位于 `dist\codex-team-board-v0.4.0.zip`，同时生成 SHA256 文件。GitHub
+输出位于 `dist\codex-team-board-v0.4.1.zip`，同时生成 SHA256 文件。GitHub
 Release 应附带 ZIP 与 `.sha256` 两个资产。

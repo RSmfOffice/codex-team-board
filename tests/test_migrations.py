@@ -38,7 +38,7 @@ class MigrationTests(unittest.TestCase):
             try:
                 self.assertEqual(
                     upgraded.execute("PRAGMA user_version").fetchone()[0],
-                    10,
+                    11,
                 )
                 columns = {
                     row["name"]
@@ -54,6 +54,7 @@ class MigrationTests(unittest.TestCase):
                         "worktree_path",
                         "completed_at",
                         "archived_at",
+                        "archived_by_goal",
                     }.issubset(columns)
                 )
                 project_columns = {

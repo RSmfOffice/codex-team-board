@@ -15,6 +15,7 @@ from codex_team.config import Settings
 from codex_team.cli import build_parser
 from codex_team.cluster import ClusterManager
 from codex_team.dashboard import build_server
+from codex_team.db import utc_now
 from codex_team.mcp import TeamMcpServer, _tool_definitions
 from codex_team.service import TeamError, TeamService
 from codex_team.worktrees import WorktreeManager
@@ -269,7 +270,7 @@ class TeamFlowTests(unittest.TestCase):
         self.assertIn("claimed", event_types)
         self.assertIn("submitted", event_types)
         self.assertIn("reviewed", event_types)
-        self.assertEqual(schema_version, 10)
+        self.assertEqual(schema_version, 11)
         history = self.team.get_task_events(done["task_id"])
         self.assertIn("worktree_created", [item["event_type"] for item in history["events"]])
 
@@ -799,8 +800,81 @@ class TeamFlowTests(unittest.TestCase):
             manager.set_goal_archived(goal["goal_id"], True)
         manager.set_goal_status(goal["goal_id"], "completed")
 
+        cascaded = self.team.create_task(
+            self.repo,
+            title="Cascade completed task",
+            description="Archived with its goal.",
+            acceptance="archived by goal",
+            kind="read",
+            owner_role="team_explorer",
+            goal_id=goal["goal_id"],
+        )
+        manually_archived = self.team.create_task(
+            self.repo,
+            title="Individually archived task",
+            description="Keeps its independent archive state.",
+            acceptance="not restored by goal",
+            kind="read",
+            owner_role="team_explorer",
+            goal_id=goal["goal_id"],
+        )
+        canceled = self.team.create_task(
+            self.repo,
+            title="Canceled task",
+            description="Only done tasks cascade.",
+            acceptance="remains unarchived",
+            kind="read",
+            owner_role="team_explorer",
+            goal_id=goal["goal_id"],
+        )
+        now = utc_now()
+        with self.team.connection() as connection:
+            connection.execute(
+                """
+                UPDATE tasks
+                SET status = 'done', completed_at = ?, updated_at = ?,
+                    version = version + 1
+                WHERE task_id IN (?, ?)
+                """,
+                (now, now, cascaded["task_id"], manually_archived["task_id"]),
+            )
+            connection.execute(
+                """
+                UPDATE tasks
+                SET status = 'canceled', completed_at = ?, updated_at = ?,
+                    version = version + 1
+                WHERE task_id = ?
+                """,
+                (now, now, canceled["task_id"]),
+            )
+        self.team.set_task_archived(manually_archived["task_id"], True)
+        persistent_agent = manager.agent_pool.register_thread(
+            goal["project_id"],
+            "team_explorer",
+            goal["workstream_key"],
+            "goal-archive-persistent-thread",
+            manager.model,
+            manager.model_provider,
+            "Goal archive persistent explorer",
+        )
+
         archived = manager.set_goal_archived(goal["goal_id"], True)
         self.assertTrue(archived["archived_at"])
+        cascaded_archived = self.team.get_task(cascaded["task_id"])
+        self.assertIsNotNone(cascaded_archived["archived_at"])
+        self.assertEqual(cascaded_archived["archived_by_goal"], 1)
+        self.assertEqual(
+            self.team.get_task(manually_archived["task_id"])["archived_by_goal"],
+            0,
+        )
+        self.assertIsNone(
+            self.team.get_task(canceled["task_id"])["archived_at"]
+        )
+        goal_detail = manager.get_goal(goal["goal_id"])
+        self.assertIn(
+            cascaded["task_id"],
+            {task["task_id"] for task in goal_detail["tasks"]},
+        )
         active = self.team.dashboard_snapshot()
         visible = self.team.dashboard_snapshot(include_archived=True)
         self.assertNotIn(
@@ -811,11 +885,55 @@ class TeamFlowTests(unittest.TestCase):
             goal["goal_id"],
             {item["goal_id"] for item in visible["cluster_goals"]},
         )
+        mcp = TeamMcpServer(self.settings)
+        visible_tasks = mcp.call_tool(
+            "team_list_tasks",
+            {
+                "repo_root": str(self.repo),
+                "goal_id": goal["goal_id"],
+                "include_archived": False,
+            },
+        )["tasks"]
+        archived_tasks = mcp.call_tool(
+            "team_list_tasks",
+            {
+                "repo_root": str(self.repo),
+                "goal_id": goal["goal_id"],
+                "include_archived": True,
+            },
+        )["tasks"]
+        self.assertNotIn(
+            cascaded["task_id"],
+            {task["task_id"] for task in visible_tasks},
+        )
+        self.assertIn(
+            cascaded["task_id"],
+            {task["task_id"] for task in archived_tasks},
+        )
+        agent_after_archive = next(
+            agent
+            for agent in manager.list_agents(goal["project_id"])
+            if agent["agent_id"] == persistent_agent["agent_id"]
+        )
+        self.assertIsNone(agent_after_archive["archived_at"])
+        self.assertEqual(agent_after_archive["status"], "idle")
         with self.assertRaisesRegex(TeamError, "restore it first"):
             manager.set_goal_status(goal["goal_id"], "paused")
 
         restored = manager.set_goal_archived(goal["goal_id"], False)
         self.assertFalse(restored["archived_at"])
+        cascaded_restored = self.team.get_task(cascaded["task_id"])
+        self.assertIsNone(cascaded_restored["archived_at"])
+        self.assertEqual(cascaded_restored["archived_by_goal"], 0)
+        manual_after_restore = self.team.get_task(manually_archived["task_id"])
+        self.assertIsNotNone(manual_after_restore["archived_at"])
+        self.assertEqual(manual_after_restore["archived_by_goal"], 0)
+        cascade_events = [
+            event["event_type"]
+            for event in self.team.get_task_events(cascaded["task_id"])["events"]
+        ]
+        self.assertIn("archived_by_goal", cascade_events)
+        self.assertIn("restored_by_goal", cascade_events)
         event_types = [
             event["event_type"]
             for event in manager.get_goal(goal["goal_id"])["events"]

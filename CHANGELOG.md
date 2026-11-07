@@ -2,6 +2,24 @@
 
 本项目遵循语义化版本。
 
+## [0.4.1] - 2026-11-07
+
+### Changed
+
+- 集群目标归档会级联归档同一目标下尚未归档的 `done` 任务；恢复目标时只恢复
+  由该目标级联归档的任务。
+- 用户单独归档的任务不会因目标恢复而自动恢复。
+- 归档目标和级联任务仍是软归档；Agent Thread、Codex 会话、任务事件、worktree
+  和合并记录均不会归档或删除。
+- `team_list_tasks` 可通过 `include_archived=true` 读取归档任务；集群目标详情和
+  `team_cluster_status` 始终保留其关联任务，便于 Agent 按需查询。
+- WebUI 目标按钮明确标记“含Done”，并在操作前说明 Agent Threads 不随目标归档。
+
+### Fixed
+
+- 数据库 schema 升级为 11，新增 `tasks.archived_by_goal`，避免目标恢复时误恢复
+  用户单独归档的任务。
+
 ## [0.4.0] - 2026-11-07
 
 ### Added

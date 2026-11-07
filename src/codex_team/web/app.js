@@ -687,8 +687,8 @@ function renderCluster(goals, jobs, data) {
     if (terminalGoalStatuses.has(status)) {
       controls.push(
         goal.archived_at
-          ? '<button class="goal-action resume" type="button" data-control-action="restore">恢复目标</button>'
-          : '<button class="goal-action" type="button" data-control-action="archive">归档目标</button>',
+          ? '<button class="goal-action resume" type="button" data-control-action="restore" title="恢复目标，以及由该目标归档的 done 任务">恢复目标（含Done）</button>'
+          : '<button class="goal-action" type="button" data-control-action="archive" title="归档目标及其 done 任务；不归档 Agent threads">归档目标（含Done）</button>',
       );
     }
     if (!terminalGoalStatuses.has(status)) {
@@ -1143,6 +1143,14 @@ async function handleClusterControl(button) {
   ) {
     return;
   }
+  if (
+    action === "archive"
+    && !window.confirm(
+      `归档目标 ${goalId}？该目标下的 done 任务会一起归档，但 Agent threads 会保留并继续按复用规则工作。`,
+    )
+  ) {
+    return;
+  }
   const labels = {
     pause: "正在暂停…",
     resume: "正在恢复…",
@@ -1172,8 +1180,8 @@ async function handleClusterControl(button) {
       pause: "目标已暂停",
       resume: "目标已恢复",
       cancel: "目标已取消",
-      archive: "目标已归档",
-      restore: "目标已恢复",
+    archive: "目标及已完成任务已归档",
+    restore: "目标及目标归档任务已恢复",
     };
     setActionStatus(
       "cluster-action-status",

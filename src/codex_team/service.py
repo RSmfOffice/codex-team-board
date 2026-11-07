@@ -306,7 +306,8 @@ class TeamService:
             connection.execute(
                 """
                 UPDATE tasks
-                SET archived_at = ?, updated_at = ?, version = version + 1
+                SET archived_at = ?, archived_by_goal = 0,
+                    updated_at = ?, version = version + 1
                 WHERE task_id = ?
                 """,
                 (now if archived else None, now, task_id),

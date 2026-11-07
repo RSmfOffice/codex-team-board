@@ -13,6 +13,7 @@ from unittest.mock import patch
 from codex_team.cluster import ClusterError, ClusterManager
 from codex_team.config import Settings
 from codex_team.dashboard import build_server
+from codex_team.db import utc_now
 from codex_team.service import TeamService
 
 
@@ -205,12 +206,34 @@ class DashboardClusterControlTests(unittest.TestCase):
             )
             self.assertEqual(status, 409)
             self.assertIn("invalid goal transition", invalid_resume["error"])
+            done_task = self.team.create_task(
+                self.repo,
+                title="Goal cascade archive",
+                description="Done task archived with its goal.",
+                acceptance="cascade through dashboard API",
+                kind="read",
+                owner_role="team_explorer",
+                goal_id=goal["goal_id"],
+            )
+            with self.team.connection() as connection:
+                connection.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'done', completed_at = ?, updated_at = ?,
+                        version = version + 1
+                    WHERE task_id = ?
+                    """,
+                    (utc_now(), utc_now(), done_task["task_id"]),
+                )
             status, archived = self.post(
                 "/api/clusters/archive",
                 {"goal_id": goal["goal_id"], "archived": True},
             )
             self.assertEqual(status, 200)
             self.assertTrue(archived["goal"]["archived_at"])
+            archived_task = self.team.get_task(done_task["task_id"])
+            self.assertIsNotNone(archived_task["archived_at"])
+            self.assertEqual(archived_task["archived_by_goal"], 1)
             active_board = self.get("/api/board")
             visible_board = self.get("/api/board?include_archived=1")
             self.assertNotIn(
@@ -227,6 +250,9 @@ class DashboardClusterControlTests(unittest.TestCase):
             )
             self.assertEqual(status, 200)
             self.assertIsNone(restored["goal"]["archived_at"])
+            restored_task = self.team.get_task(done_task["task_id"])
+            self.assertIsNone(restored_task["archived_at"])
+            self.assertEqual(restored_task["archived_by_goal"], 0)
 
     def test_daemon_start_failure_marks_goal_failed(self) -> None:
         with patch(
