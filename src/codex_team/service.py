@@ -18,6 +18,8 @@ from .scheduling import (
     DEFAULT_GOAL_WORKER_CAPACITY,
     DEFAULT_HEARTBEAT_CRITICAL_SECONDS,
     DEFAULT_HEARTBEAT_WARNING_SECONDS,
+    MAX_GLOBAL_JOB_CAPACITY,
+    MAX_GOAL_WORKER_CAPACITY,
     env_int,
 )
 
@@ -623,10 +625,12 @@ class TeamService:
         system_capacity = env_int(
             "CODEX_TEAM_CLUSTER_MAX_JOBS",
             DEFAULT_GLOBAL_JOB_CAPACITY,
+            maximum=MAX_GLOBAL_JOB_CAPACITY,
         )
         goal_capacity = env_int(
             "CODEX_TEAM_CLUSTER_MAX_WORKERS",
             DEFAULT_GOAL_WORKER_CAPACITY,
+            maximum=MAX_GOAL_WORKER_CAPACITY,
         )
         heartbeat_warning_seconds = env_int(
             "CODEX_TEAM_HEARTBEAT_WARNING_SECONDS",
@@ -703,9 +707,17 @@ class TeamService:
                 ).fetchall()
             cluster_goals = [dict(row) for row in goal_rows]
             cluster_jobs = [dict(row) for row in job_rows]
-            schedulable_goal_count = sum(
-                goal["status"] in {"planning", "active"}
-                for goal in cluster_goals
+            schedulable_goal_count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) AS goal_count
+                    FROM cluster_goals g
+                    JOIN projects p ON p.project_id = g.project_id
+                    WHERE g.status IN ('planning', 'active')
+                      AND g.archived_at IS NULL
+                      AND p.archived_at IS NULL
+                    """
+                ).fetchone()["goal_count"]
             )
             global_capacity = schedulable_goal_count * goal_capacity
             task_archive_filter = (
@@ -818,30 +830,18 @@ class TeamService:
                 task.pop("claim_token", None)
                 task["blocked_by"] = blocked_by.get(task["task_id"], [])
                 task["lease_expired"] = self._lease_expired(task.get("lease_until"))
-            if project_id:
-                active_job_rows = connection.execute(
-                    """
-                    SELECT j.*, g.objective
-                    FROM cluster_jobs j
-                    JOIN cluster_goals g ON g.goal_id = j.goal_id
-                    WHERE g.project_id = ?
-                      AND j.status IN ('starting', 'running')
-                    ORDER BY j.started_at, j.job_id
-                    """,
-                    (project_id,),
-                ).fetchall()
-            else:
-                active_job_rows = connection.execute(
-                    f"""
-                    SELECT j.*, g.objective
-                    FROM cluster_jobs j
-                    JOIN cluster_goals g ON g.goal_id = j.goal_id
-                    JOIN projects p ON p.project_id = g.project_id
-                    WHERE j.status IN ('starting', 'running')
-                    {archive_filter}
-                    ORDER BY j.started_at, j.job_id
-                    """
-                ).fetchall()
+            active_job_rows = connection.execute(
+                """
+                SELECT j.*, g.objective, g.project_id
+                FROM cluster_jobs j
+                JOIN cluster_goals g ON g.goal_id = j.goal_id
+                JOIN projects p ON p.project_id = g.project_id
+                WHERE j.status IN ('starting', 'running')
+                  AND g.archived_at IS NULL
+                  AND p.archived_at IS NULL
+                ORDER BY j.started_at, j.job_id
+                """
+            ).fetchall()
             active_jobs = [dict(row) for row in active_job_rows]
             active_jobs_by_task = {
                 job["task_id"]: {
@@ -888,9 +888,9 @@ class TeamService:
                     )
             now_utc = datetime.now(UTC)
 
-            def age_seconds(value: str | None) -> int:
+            def parse_time(value: str | None) -> datetime | None:
                 if not value:
-                    return 0
+                    return None
                 try:
                     parsed = datetime.fromisoformat(
                         str(value).replace("Z", "+00:00")
@@ -898,6 +898,12 @@ class TeamService:
                     if parsed.tzinfo is None:
                         parsed = parsed.replace(tzinfo=UTC)
                 except (TypeError, ValueError):
+                    return None
+                return parsed
+
+            def age_seconds(value: str | None) -> int:
+                parsed = parse_time(value)
+                if parsed is None:
                     return 0
                 return max(0, int((now_utc - parsed).total_seconds()))
 
@@ -914,10 +920,15 @@ class TeamService:
                     continue
                 heartbeat_at = job.get("started_at")
                 if job.get("task_id"):
-                    heartbeat_at = latest_task_activity.get(
+                    activity_at = latest_task_activity.get(
                         str(job["task_id"]),
-                        heartbeat_at,
                     )
+                    started_at = parse_time(heartbeat_at)
+                    activity_time = parse_time(activity_at)
+                    if activity_time and (
+                        started_at is None or activity_time >= started_at
+                    ):
+                        heartbeat_at = activity_at
                 worker_heartbeat_ages[str(job["job_id"])] = age_seconds(
                     heartbeat_at
                 )

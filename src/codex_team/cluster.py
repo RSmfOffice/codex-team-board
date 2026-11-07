@@ -23,6 +23,8 @@ from .scheduling import (
     DEFAULT_HEARTBEAT_WARNING_SECONDS,
     DEFAULT_LEAD_TIMEOUT_SECONDS,
     DEFAULT_WORKER_TIMEOUT_SECONDS,
+    MAX_GLOBAL_JOB_CAPACITY,
+    MAX_GOAL_WORKER_CAPACITY,
     env_int,
 )
 from .service import TeamError, TeamService
@@ -80,8 +82,8 @@ class ClusterManager:
             if max_jobs is None
             else int(max_jobs)
         )
-        self.max_workers = max(1, min(configured_workers, 8))
-        self.max_jobs = max(1, min(configured_jobs, 32))
+        self.max_workers = max(1, min(configured_workers, MAX_GOAL_WORKER_CAPACITY))
+        self.max_jobs = max(1, min(configured_jobs, MAX_GLOBAL_JOB_CAPACITY))
         self.worker_timeout_seconds = env_int(
             "CODEX_TEAM_WORKER_TIMEOUT_SECONDS",
             DEFAULT_WORKER_TIMEOUT_SECONDS,

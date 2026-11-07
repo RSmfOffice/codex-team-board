@@ -939,7 +939,9 @@ class TeamFlowTests(unittest.TestCase):
                     critical_task["task_id"],
                     "worker",
                     "team_explorer",
-                    now.isoformat().replace("+00:00", "Z"),
+                    (now - timedelta(seconds=1300))
+                    .isoformat()
+                    .replace("+00:00", "Z"),
                 ),
                 (
                     "J-WARNING-WORKER",
@@ -947,7 +949,9 @@ class TeamFlowTests(unittest.TestCase):
                     warning_task["task_id"],
                     "worker",
                     "team_explorer",
-                    now.isoformat().replace("+00:00", "Z"),
+                    (now - timedelta(seconds=500))
+                    .isoformat()
+                    .replace("+00:00", "Z"),
                 ),
                 (
                     "J-LEAD-NORMAL",
@@ -1103,6 +1107,22 @@ class TeamFlowTests(unittest.TestCase):
                     dashboard["cluster_summary"]["fairness_wait_count"],
                     1,
                 )
+                filtered = self.team.dashboard_snapshot(
+                    second_goal["project_id"]
+                )
+                filtered_goal = next(
+                    goal
+                    for goal in filtered["cluster_goals"]
+                    if goal["goal_id"] == second_goal["goal_id"]
+                )
+                self.assertEqual(
+                    filtered_goal["queue_reason"],
+                    "global_capacity",
+                )
+                self.assertEqual(
+                    filtered["cluster_summary"]["system_jobs"],
+                    3,
+                )
 
             with patch.dict(
                 "os.environ",
@@ -1122,6 +1142,90 @@ class TeamFlowTests(unittest.TestCase):
                     dashboard["cluster_summary"]["fairness_wait_count"],
                     0,
                 )
+
+            with patch.dict(
+                "os.environ",
+                {
+                    "CODEX_TEAM_CLUSTER_MAX_JOBS": "999",
+                    "CODEX_TEAM_CLUSTER_MAX_WORKERS": "999",
+                },
+            ):
+                clamped = self.team.dashboard_snapshot()
+                self.assertEqual(
+                    clamped["cluster_summary"]["system_capacity"],
+                    32,
+                )
+                self.assertEqual(
+                    clamped["cluster_summary"]["worker_capacity_per_goal"],
+                    8,
+                )
+                self.assertEqual(
+                    clamped["cluster_summary"]["global_capacity"],
+                    16,
+                )
+
+    def test_heartbeat_ignores_events_from_a_previous_attempt(self) -> None:
+        manager = ClusterManager(
+            self.settings,
+            team=self.team,
+            worktrees=self.worktrees,
+        )
+        goal = manager.create_goal(
+            self.repo,
+            objective="Current attempt heartbeat",
+            autonomy="auto",
+        )
+        manager.set_goal_status(goal["goal_id"], "active")
+        task = self.team.create_task(
+            self.repo,
+            title="Fresh worker attempt",
+            description="Old progress must not affect this attempt.",
+            acceptance="heartbeat is normal",
+            kind="read",
+            owner_role="team_explorer",
+            goal_id=goal["goal_id"],
+        )
+        self.team.claim_task(task["task_id"], actor="worker")
+        now = datetime.now(UTC)
+        with self.team.connection() as connection:
+            connection.execute(
+                """
+                UPDATE task_events SET created_at = ?
+                WHERE task_id = ? AND event_type = 'claimed'
+                """,
+                (
+                    (now - timedelta(seconds=1200))
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                    task["task_id"],
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO cluster_jobs(
+                    job_id, goal_id, task_id, kind, role, status,
+                    log_path, output_path, started_at
+                ) VALUES (?, ?, ?, 'worker', 'team_explorer', 'running', ?, ?, ?)
+                """,
+                (
+                    "J-CURRENT-ATTEMPT",
+                    goal["goal_id"],
+                    task["task_id"],
+                    str(self.base / "current.log"),
+                    str(self.base / "current.out"),
+                    now.isoformat().replace("+00:00", "Z"),
+                ),
+            )
+
+        dashboard = self.team.dashboard_snapshot()
+        saved = next(
+            item
+            for item in dashboard["cluster_goals"]
+            if item["goal_id"] == goal["goal_id"]
+        )
+        self.assertEqual(saved["heartbeat_state"], "normal")
+        self.assertLess(saved["heartbeat_age_seconds"], 60)
+        self.assertEqual(dashboard["cluster_summary"]["heartbeat_overdue"], 0)
 
     def test_dependency_wait_and_lead_heartbeat_are_not_false_alarms(self) -> None:
         manager = ClusterManager(
