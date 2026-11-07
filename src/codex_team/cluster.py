@@ -16,6 +16,15 @@ from typing import Any
 from .config import Settings
 from .db import connect, connect_readonly, utc_now
 from .processes import pid_is_running
+from .scheduling import (
+    DEFAULT_GLOBAL_JOB_CAPACITY,
+    DEFAULT_GOAL_WORKER_CAPACITY,
+    DEFAULT_HEARTBEAT_CRITICAL_SECONDS,
+    DEFAULT_HEARTBEAT_WARNING_SECONDS,
+    DEFAULT_LEAD_TIMEOUT_SECONDS,
+    DEFAULT_WORKER_TIMEOUT_SECONDS,
+    env_int,
+)
 from .service import TeamError, TeamService
 from .worktrees import WorktreeManager
 
@@ -29,8 +38,10 @@ GOAL_STATUS_TRANSITIONS = {
     "completed": frozenset(),
     "failed": frozenset(),
 }
-WORKER_TIMEOUT_SECONDS = 30 * 60
-LEAD_TIMEOUT_SECONDS = 20 * 60
+WORKER_TIMEOUT_SECONDS = DEFAULT_WORKER_TIMEOUT_SECONDS
+LEAD_TIMEOUT_SECONDS = DEFAULT_LEAD_TIMEOUT_SECONDS
+FAIRNESS_DEFERRED_INTERVAL_SECONDS = 60
+WORKER_ACTIVITY_EVENT_TYPES = ("claimed", "heartbeat", "progress")
 _CLAIM_TOKEN_RE = re.compile(
     r'(?P<prefix>(?:\\?"claim_token\\?"\s*:\s*\\?"))(?P<token>[^"\\]+)(?P<suffix>\\?")'
 )
@@ -48,14 +59,39 @@ class ClusterManager:
         team: TeamService | None = None,
         worktrees: WorktreeManager | None = None,
         agent_command: list[str] | None = None,
-        max_workers: int = 3,
+        max_workers: int | None = None,
+        max_jobs: int | None = None,
         lead_cooldown_seconds: float = 8.0,
     ) -> None:
         self.settings = settings
         self.team = team or TeamService(settings)
         self.worktrees = worktrees or WorktreeManager(self.team)
         self.agent_command = agent_command or _default_codex_command()
-        self.max_workers = max(1, min(int(max_workers), 8))
+        configured_workers = (
+            env_int(
+                "CODEX_TEAM_CLUSTER_MAX_WORKERS",
+                DEFAULT_GOAL_WORKER_CAPACITY,
+            )
+            if max_workers is None
+            else int(max_workers)
+        )
+        configured_jobs = (
+            env_int("CODEX_TEAM_CLUSTER_MAX_JOBS", DEFAULT_GLOBAL_JOB_CAPACITY)
+            if max_jobs is None
+            else int(max_jobs)
+        )
+        self.max_workers = max(1, configured_workers)
+        self.max_jobs = max(1, configured_jobs)
+        self.worker_timeout_seconds = env_int(
+            "CODEX_TEAM_WORKER_TIMEOUT_SECONDS",
+            DEFAULT_WORKER_TIMEOUT_SECONDS,
+        )
+        self.lead_timeout_seconds = env_int(
+            "CODEX_TEAM_LEAD_TIMEOUT_SECONDS",
+            DEFAULT_LEAD_TIMEOUT_SECONDS,
+        )
+        self.heartbeat_warning_seconds = DEFAULT_HEARTBEAT_WARNING_SECONDS
+        self.heartbeat_critical_seconds = DEFAULT_HEARTBEAT_CRITICAL_SECONDS
         self.lead_cooldown_seconds = max(0.0, float(lead_cooldown_seconds))
         self.processes: dict[str, subprocess.Popen[str]] = {}
         self.log_threads: dict[str, threading.Thread] = {}
@@ -284,22 +320,23 @@ class ClusterManager:
 
     def tick(self) -> dict[str, Any]:
         self._reconcile_jobs()
+        self._check_worker_health()
         goals = self.list_goals(["planning", "active"])
-        scheduled: list[dict[str, Any]] = []
+        schedulable: list[dict[str, Any]] = []
         for goal in goals:
-            summary = self._tick_goal(goal)
-            if summary:
-                scheduled.extend(summary)
+            if self._prepare_goal(goal):
+                schedulable.append(goal)
+        scheduled = self._schedule_goals(schedulable)
         return {"tick_at": utc_now(), "scheduled": scheduled, "goals": len(goals)}
 
-    def _tick_goal(self, goal: dict[str, Any]) -> list[dict[str, Any]]:
+    def _prepare_goal(self, goal: dict[str, Any]) -> bool:
         goal_id = goal["goal_id"]
         root = Path(goal["root_path"])
         tasks = self.team.list_tasks(root, goal_id=goal_id, include_done=True)
         active_workers = self._active_worker_jobs(goal_id)
         if tasks and all(item["status"] in TERMINAL_TASK_STATUSES for item in tasks):
             self.set_goal_status(goal_id, "completed", reason="all tasks completed")
-            return []
+            return False
         if (
             goal["autonomy"] == "supervised"
             and any(item["status"] == "review" for item in tasks)
@@ -309,7 +346,7 @@ class ClusterManager:
                 "paused",
                 reason="waiting for human review in supervised mode",
             )
-            return []
+            return False
 
         for task in tasks:
             if task["status"] == "running" and not active_workers.get(task["task_id"]):
@@ -319,40 +356,73 @@ class ClusterManager:
                         goal_id,
                         reason="worker lease expired without an active job",
                     )
+        return True
+
+    def _schedule_goals(self, goals: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not goals:
+            return []
 
         scheduled: list[dict[str, Any]] = []
-        slots = self.max_workers - len(self._active_worker_jobs(goal_id))
-        if slots > 0:
+        blocked_goals: set[str] = set()
+        max_passes = self.max_jobs + len(goals) * 2
+        active_jobs = self._active_job_count()
+        for _ in range(max(2, max_passes)):
             candidates = [
-                task
-                for task in tasks
-                if task["status"] == "ready"
-                and not task.get("blocked_by")
-                and task["task_id"] not in self._active_worker_jobs(goal_id)
-                and self._retry_allowed(task["task_id"], goal)
+                goal for goal in goals if goal["goal_id"] not in blocked_goals
             ]
-            candidates.sort(key=lambda item: (int(item["priority"]), item["created_at"]))
-            for task in candidates[:slots]:
-                try:
-                    scheduled.append(self._dispatch_worker(goal, task))
-                except Exception as exc:
-                    self.team.block_task(
-                        task["task_id"],
-                        actor="teamd",
-                        reason=f"automatic dispatch failed: {exc}",
-                    )
-                    with self.team.connection() as connection:
-                        self._event(
-                            connection,
-                            goal_id,
-                            "dispatch_failed",
-                            "teamd",
-                            {"task_id": task["task_id"], "error": str(exc)},
-                        )
-                    continue
+            if not candidates:
+                break
+            changed = False
+            for goal in self._fair_goal_order(candidates):
+                if active_jobs >= self.max_jobs:
+                    self._record_global_full_deferrals(candidates)
+                    return scheduled
+                tasks = self.team.list_tasks(
+                    goal["root_path"],
+                    goal_id=goal["goal_id"],
+                    include_done=True,
+                )
+                job, goal_changed, keep_goal = self._dispatch_next_job(goal, tasks)
+                if job is not None:
+                    scheduled.append(job)
+                    active_jobs += 1
+                    changed = True
+                elif goal_changed:
+                    changed = True
+                if not keep_goal:
+                    blocked_goals.add(goal["goal_id"])
+            if not changed:
+                break
+        return scheduled
 
-        tasks = self.team.list_tasks(root, goal_id=goal_id, include_done=True)
+    def _dispatch_next_job(
+        self,
+        goal: dict[str, Any],
+        tasks: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any] | None, bool, bool]:
+        goal_id = goal["goal_id"]
         active_workers = self._active_worker_jobs(goal_id)
+        candidates = self._ready_worker_candidates(goal, tasks, active_workers)
+        if len(active_workers) < self.max_workers and candidates:
+            task = candidates[0]
+            try:
+                return self._dispatch_worker(goal, task), True, True
+            except Exception as exc:
+                self.team.block_task(
+                    task["task_id"],
+                    actor="teamd",
+                    reason=f"automatic dispatch failed: {exc}",
+                )
+                with self.team.connection() as connection:
+                    self._event(
+                        connection,
+                        goal_id,
+                        "dispatch_failed",
+                        "teamd",
+                        {"task_id": task["task_id"], "error": str(exc)},
+                    )
+                return None, True, True
+
         active_lead = self._active_lead_job(goal_id)
         needs_lead = (
             not tasks
@@ -365,7 +435,7 @@ class ClusterManager:
             and not self._lead_cooldown_active(goal_id)
         ):
             try:
-                scheduled.append(self._dispatch_lead(goal, tasks))
+                return self._dispatch_lead(goal, tasks), True, True
             except Exception as exc:
                 with self.team.connection() as connection:
                     connection.execute(
@@ -383,7 +453,246 @@ class ClusterManager:
                         "teamd",
                         {"error": str(exc)},
                     )
-        return scheduled
+                return None, True, False
+        return None, False, True
+
+    def _ready_worker_candidates(
+        self,
+        goal: dict[str, Any],
+        tasks: list[dict[str, Any]],
+        active_workers: dict[str, dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        active_task_ids = set(active_workers)
+        candidates = [
+            task
+            for task in tasks
+            if task["status"] == "ready"
+            and not task.get("blocked_by")
+            and task["task_id"] not in active_task_ids
+            and self._retry_allowed(task["task_id"], goal)
+        ]
+        candidates.sort(key=lambda item: (int(item["priority"]), item["created_at"]))
+        return candidates
+
+    def _fair_goal_order(
+        self,
+        goals: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        goal_ids = [str(goal["goal_id"]) for goal in goals]
+        placeholders = ",".join("?" for _ in goal_ids)
+        with self.team.connection(write=False) as connection:
+            rows = connection.execute(
+                f"""
+                SELECT g.goal_id, g.created_at,
+                       COALESCE(MAX(j.started_at), g.created_at) AS last_started_at,
+                       COALESCE(SUM(
+                           CASE WHEN j.status IN ('starting', 'running') THEN 1 ELSE 0 END
+                       ), 0) AS active_jobs
+                FROM cluster_goals g
+                LEFT JOIN cluster_jobs j ON j.goal_id = g.goal_id
+                WHERE g.goal_id IN ({placeholders})
+                GROUP BY g.goal_id, g.created_at
+                """,
+                goal_ids,
+            ).fetchall()
+        fairness = {str(row["goal_id"]): dict(row) for row in rows}
+        return sorted(
+            goals,
+            key=lambda goal: (
+                fairness.get(str(goal["goal_id"]), {}).get(
+                    "last_started_at",
+                    goal["created_at"],
+                ),
+                int(
+                    fairness.get(str(goal["goal_id"]), {}).get(
+                        "active_jobs",
+                        0,
+                    )
+                ),
+                str(goal["goal_id"]),
+            ),
+        )
+
+    def _active_job_count(self) -> int:
+        with self.team.connection(write=False) as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS active_jobs
+                FROM cluster_jobs
+                WHERE status IN ('starting', 'running')
+                """
+            ).fetchone()
+        return int(row["active_jobs"])
+
+    def _record_global_full_deferrals(self, goals: list[dict[str, Any]]) -> None:
+        reason = "global capacity full"
+        for goal in goals:
+            tasks = self.team.list_tasks(
+                goal["root_path"],
+                goal_id=goal["goal_id"],
+                include_done=True,
+            )
+            active_workers = self._active_worker_jobs(goal["goal_id"])
+            ready_tasks = len(
+                self._ready_worker_candidates(goal, tasks, active_workers)
+            )
+            if ready_tasks:
+                self._record_fairness_deferred(
+                    goal["goal_id"],
+                    reason=reason,
+                    ready_tasks=ready_tasks,
+                )
+
+    def _record_fairness_deferred(
+        self,
+        goal_id: str,
+        *,
+        reason: str,
+        ready_tasks: int,
+    ) -> None:
+        now = datetime.now(UTC)
+        with self.team.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT data_json, created_at
+                FROM cluster_events
+                WHERE goal_id = ? AND event_type = 'fairness_deferred'
+                ORDER BY event_id DESC
+                LIMIT 100
+                """,
+                (goal_id,),
+            ).fetchall()
+            for row in rows:
+                try:
+                    existing_reason = json.loads(row["data_json"]).get("reason")
+                except (TypeError, ValueError):
+                    existing_reason = None
+                created = _parse_iso(row["created_at"])
+                if (
+                    existing_reason == reason
+                    and created is not None
+                    and (now - created).total_seconds()
+                    < FAIRNESS_DEFERRED_INTERVAL_SECONDS
+                ):
+                    return
+            self._event(
+                connection,
+                goal_id,
+                "fairness_deferred",
+                "teamd",
+                {
+                    "reason": reason,
+                    "ready_tasks": ready_tasks,
+                    "capacity": self.max_jobs,
+                },
+            )
+
+    def _check_worker_health(self) -> None:
+        now = datetime.now(UTC)
+        with self.team.connection(write=False) as connection:
+            jobs = [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT job_id, goal_id, task_id, started_at
+                    FROM cluster_jobs
+                    WHERE kind = 'worker'
+                      AND status IN ('starting', 'running')
+                      AND task_id IS NOT NULL
+                    ORDER BY started_at
+                    """
+                ).fetchall()
+            ]
+            activities: dict[str, str] = {}
+            for job in jobs:
+                activity_placeholders = ",".join(
+                    "?" for _ in WORKER_ACTIVITY_EVENT_TYPES
+                )
+                row = connection.execute(
+                    f"""
+                    SELECT MAX(created_at) AS last_activity_at
+                    FROM task_events
+                    WHERE task_id = ?
+                      AND event_type IN ({activity_placeholders})
+                    """,
+                    (job["task_id"], *WORKER_ACTIVITY_EVENT_TYPES),
+                ).fetchone()
+                if row and row["last_activity_at"]:
+                    activities[str(job["task_id"])] = str(row["last_activity_at"])
+
+        for job in jobs:
+            started_at = _parse_iso(job.get("started_at"))
+            event_activity = _parse_iso(activities.get(str(job["task_id"])))
+            last_activity = event_activity or started_at
+            if last_activity is None:
+                continue
+            if started_at is not None and last_activity < started_at:
+                last_activity = started_at
+            idle_seconds = (now - last_activity).total_seconds()
+            if idle_seconds >= self.heartbeat_critical_seconds:
+                severity = "critical"
+                event_type = "worker_heartbeat_critical"
+            elif idle_seconds >= self.heartbeat_warning_seconds:
+                severity = "warning"
+                event_type = "worker_heartbeat_warning"
+            else:
+                continue
+            if self._worker_health_event_exists(
+                job,
+                event_type,
+                last_activity,
+            ):
+                continue
+            with self.team.connection() as connection:
+                self._event(
+                    connection,
+                    job["goal_id"],
+                    event_type,
+                    "teamd",
+                    {
+                        "job_id": job["job_id"],
+                        "task_id": job["task_id"],
+                        "severity": severity,
+                        "idle_seconds": int(idle_seconds),
+                        "last_activity_at": last_activity.isoformat().replace(
+                            "+00:00",
+                            "Z",
+                        ),
+                        "warning_seconds": self.heartbeat_warning_seconds,
+                        "critical_seconds": self.heartbeat_critical_seconds,
+                        "action": "alert",
+                    },
+                )
+
+    def _worker_health_event_exists(
+        self,
+        job: dict[str, Any],
+        event_type: str,
+        last_activity: datetime,
+    ) -> bool:
+        with self.team.connection(write=False) as connection:
+            rows = connection.execute(
+                """
+                SELECT data_json
+                FROM cluster_events
+                WHERE goal_id = ? AND event_type = ?
+                ORDER BY event_id DESC
+                LIMIT 100
+                """,
+                (job["goal_id"], event_type),
+            ).fetchall()
+        for row in rows:
+            try:
+                data = json.loads(row["data_json"])
+            except (TypeError, ValueError):
+                continue
+            if (
+                data.get("job_id") == job["job_id"]
+                and data.get("last_activity_at")
+                == last_activity.isoformat().replace("+00:00", "Z")
+            ):
+                return True
+        return False
 
     def _dispatch_worker(self, goal: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
         role = str(task["owner_role"])
@@ -869,15 +1178,14 @@ Rules:
             )
         self.processes.pop(job["job_id"], None)
 
-    @staticmethod
-    def _job_timed_out(job: dict[str, Any]) -> bool:
+    def _job_timed_out(self, job: dict[str, Any]) -> bool:
         started = _parse_iso(job.get("started_at"))
         if started is None:
             return True
         timeout = (
-            LEAD_TIMEOUT_SECONDS
+            self.lead_timeout_seconds
             if job.get("kind") == "lead"
-            else WORKER_TIMEOUT_SECONDS
+            else self.worker_timeout_seconds
         )
         return (datetime.now(UTC) - started).total_seconds() > timeout
 
