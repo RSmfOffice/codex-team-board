@@ -786,18 +786,18 @@ class TeamService:
                     "input_tokens",
                     "cached_input_tokens",
                     "uncached_input_tokens",
+                    "cache_write_input_tokens",
                     "output_tokens",
+                    "reasoning_output_tokens",
                     "first_input_tokens",
                     "first_cached_input_tokens",
                     "first_uncached_input_tokens",
                     "context_tokens",
                 )
-                if (
-                    not job.get("usage_source")
-                    and not any(int(job.get(field) or 0) for field in usage_fields)
-                ):
+                if not job.get("usage_source"):
                     for field in usage_fields:
-                        job[field] = None
+                        if not int(job.get(field) or 0):
+                            job[field] = None
                 job["cache_hit_rate"] = self._cache_hit_rate(
                     job.get("input_tokens"),
                     job.get("cached_input_tokens"),

@@ -3765,12 +3765,19 @@ Do not return raw logs or a full transcript.
             )
             process_error = forced_error or parsed.get("error", "")
         usage = self._app_job_usage(job, app_state) if app_server_runtime else parsed
-        usage_source = (
-            "cluster_agents.last_usage+runtime_raw_turn"
-            if app_server_runtime
-            else parsed.get("usage_source")
-        )
-        telemetry_complete = usage_is_cost_complete(usage)
+        if app_server_runtime:
+            usage_has_evidence = _app_usage_state_has_evidence(job, app_state)
+            usage_source = (
+                "cluster_agents.last_usage+runtime_raw_turn"
+                if usage_has_evidence
+                else None
+            )
+            telemetry_complete = (
+                usage_is_cost_complete(usage) if usage_has_evidence else False
+            )
+        else:
+            usage_source = parsed.get("usage_source")
+            telemetry_complete = usage_is_cost_complete(usage)
         if job["kind"] == "worker":
             task = self.team.get_task(job["task_id"])
             worker_ok = task["status"] in {"review", "done", "blocked"}
@@ -4257,6 +4264,17 @@ def _usage_state_has_evidence(state: Mapping[str, Any] | None) -> bool:
     if not isinstance(state, Mapping):
         return False
     return _usage_has_evidence(state.get("usage"))
+
+
+def _app_usage_state_has_evidence(
+    job: Mapping[str, Any],
+    state: Mapping[str, Any] | None,
+) -> bool:
+    if _usage_state_has_evidence(state):
+        return True
+    return _usage_state_has_evidence(
+        _app_usage_state_from_log(job.get("log_path"))
+    )
 
 
 def _app_usage_state_from_log(path: Any) -> dict[str, Any] | None:
