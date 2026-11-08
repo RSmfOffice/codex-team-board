@@ -771,6 +771,117 @@ class TeamFlowTests(unittest.TestCase):
         self.assertEqual(active_job["uncached_input_tokens"], 200)
         self.assertEqual(active_job["cache_hit_rate"], 0.75)
 
+    def test_dashboard_projects_missing_usage_fields_to_null(self) -> None:
+        manager = ClusterManager(
+            self.settings,
+            team=self.team,
+            worktrees=self.worktrees,
+        )
+        goal = manager.create_goal(
+            self.repo,
+            objective="Project partial usage field unknowns",
+        )
+        task = self.team.create_task(
+            self.repo,
+            title="Partial usage diagnostics",
+            description="Only input and context were observed.",
+            acceptance="Unknown token fields render as null.",
+            kind="read",
+            owner_role="team_explorer",
+            goal_id=goal["goal_id"],
+        )
+        now = utc_now()
+        missing_fields = [
+            "cached_input_tokens",
+            "uncached_input_tokens",
+            "output_tokens",
+            "first_cached_input_tokens",
+            "first_uncached_input_tokens",
+            "cache_write_input_tokens",
+            "reasoning_output_tokens",
+            "model_context_window",
+        ]
+        with self.team.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO cluster_jobs(
+                    job_id, goal_id, task_id, kind, role, status, pid,
+                    thread_id, attempt, log_path, output_path, started_at,
+                    turn_id, runtime, input_tokens, cached_input_tokens,
+                    uncached_input_tokens, output_tokens, first_input_tokens,
+                    first_cached_input_tokens, first_uncached_input_tokens,
+                    context_tokens, cache_write_input_tokens,
+                    reasoning_output_tokens, model_context_window,
+                    usage_source, telemetry_complete, usage_missing_fields
+                ) VALUES (
+                    'J-PARTIAL-USAGE', ?, ?, 'worker', 'team_explorer',
+                    'running', 4322, 'thread-partial', 1, ?, ?, ?,
+                    'turn-partial', 'app_server', 37, 0, 0, 0, 37, 0, 0,
+                    0, 0, 0, NULL, 'app_server.token_usage', 0, ?
+                )
+                """,
+                (
+                    goal["goal_id"],
+                    task["task_id"],
+                    str(self.base / "partial.log"),
+                    str(self.base / "partial.out"),
+                    now,
+                    json.dumps(missing_fields),
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO cluster_jobs(
+                    job_id, goal_id, kind, role, status,
+                    log_path, output_path, started_at
+                ) VALUES (
+                    'J-LEGACY-UNKNOWN-USAGE', ?, 'worker', 'team_explorer',
+                    'completed', ?, ?, ?
+                )
+                """,
+                (
+                    goal["goal_id"],
+                    str(self.base / "legacy.log"),
+                    str(self.base / "legacy.out"),
+                    now,
+                ),
+            )
+
+        dashboard = self.team.dashboard_snapshot(task["project_id"])
+        job = next(
+            item
+            for item in dashboard["cluster_jobs"]
+            if item["job_id"] == "J-PARTIAL-USAGE"
+        )
+        self.assertEqual(job["input_tokens"], 37)
+        self.assertEqual(job["first_input_tokens"], 37)
+        self.assertEqual(job["context_tokens"], 0)
+        for field in missing_fields:
+            self.assertIsNone(job[field], field)
+        self.assertIsNone(job["cache_hit_rate"])
+
+        snapshot_task = next(
+            item
+            for item in dashboard["tasks"]
+            if item["task_id"] == task["task_id"]
+        )
+        active_job = snapshot_task["active_job"]
+        self.assertEqual(active_job["input_tokens"], 37)
+        self.assertIsNone(active_job["cached_input_tokens"])
+        self.assertIsNone(active_job["uncached_input_tokens"])
+        self.assertIsNone(active_job["output_tokens"])
+        self.assertIsNone(active_job["cache_hit_rate"])
+
+        legacy_job = next(
+            item
+            for item in dashboard["cluster_jobs"]
+            if item["job_id"] == "J-LEGACY-UNKNOWN-USAGE"
+        )
+        self.assertEqual(legacy_job["usage_missing_fields"], "[]")
+        self.assertIsNone(legacy_job["input_tokens"])
+        self.assertIsNone(legacy_job["cached_input_tokens"])
+        self.assertIsNone(legacy_job["output_tokens"])
+
     def test_dashboard_cluster_goal_includes_project_name(self) -> None:
         manager = ClusterManager(
             self.settings,
