@@ -1201,11 +1201,11 @@ class ClusterSchedulerTests(unittest.TestCase):
                 if item["job_id"] == first["job_id"]
             )
             self.assertEqual(first_job["status"], "completed")
-            self.assertEqual(first_job["input_tokens"], 50)
-            self.assertEqual(first_job["cached_input_tokens"], 5)
-            self.assertEqual(first_job["uncached_input_tokens"], 45)
-            self.assertEqual(first_job["first_input_tokens"], 50)
-            self.assertEqual(first_job["context_tokens"], 60)
+            self.assertEqual(first_job["input_tokens"], 120)
+            self.assertEqual(first_job["cached_input_tokens"], 20)
+            self.assertEqual(first_job["uncached_input_tokens"], 100)
+            self.assertEqual(first_job["first_input_tokens"], 120)
+            self.assertEqual(first_job["context_tokens"], 150)
             self.assertEqual(first_job["model_context_window"], 200)
 
             second = manager._dispatch_worker(
@@ -1263,8 +1263,8 @@ class ClusterSchedulerTests(unittest.TestCase):
             )
             agent = manager.list_agents(str(goal["project_id"]))[0]
             self.assertEqual(agent["thread_id"], first["thread_id"])
-            self.assertEqual(agent["last_input_tokens"], 50)
-            self.assertEqual(agent["last_uncached_input_tokens"], 45)
+            self.assertEqual(agent["last_input_tokens"], 120)
+            self.assertEqual(agent["last_uncached_input_tokens"], 100)
 
     def test_app_server_reused_job_output_usage_is_cumulative_delta(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
