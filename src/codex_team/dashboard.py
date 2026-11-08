@@ -18,7 +18,7 @@ from .cluster import (
     ensure_daemon,
 )
 from .config import Settings
-from .db import SCHEMA_VERSION, utc_now
+from .db import effective_schema_version, utc_now
 from .service import TeamError, TeamService
 
 WEB_ROOT = Path(__file__).resolve().parent / "web"
@@ -68,6 +68,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/health":
             database = self.team_service.settings.db_path.resolve()
             cluster_runtime = self._cluster_runtime()
+            with self.team_service.connection(write=False) as connection:
+                schema_version = effective_schema_version(connection)
             self._send_json(
                 {
                     "ok": True,
@@ -80,7 +82,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "database_id": hashlib.sha256(
                         str(database).casefold().encode("utf-8")
                     ).hexdigest()[:16],
-                    "schema_version": SCHEMA_VERSION,
+                    "schema_version": schema_version,
                     "cluster_runtime": cluster_runtime,
                     "generated_at": utc_now(),
                 }

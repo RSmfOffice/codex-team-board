@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -113,10 +114,30 @@ class DashboardClusterControlTests(unittest.TestCase):
         start_daemon.assert_called_once_with(self.settings)
 
     def test_dashboard_exposes_default_thread_reuse_runtime(self) -> None:
+        connection = sqlite3.connect(self.settings.db_path)
+        try:
+            self.assertEqual(
+                connection.execute("PRAGMA user_version").fetchone()[0],
+                13,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT MAX(version) FROM schema_migrations"
+                ).fetchone()[0],
+                13,
+            )
+            connection.execute("PRAGMA user_version = 7")
+            connection.execute(
+                "UPDATE metadata SET value = '7' WHERE key = 'schema_version'"
+            )
+            connection.commit()
+        finally:
+            connection.close()
         with patch.dict(os.environ, {"CODEX_TEAM_AGENT_RUNTIME": ""}):
             health = self.get("/api/health")
             board = self.get("/api/board")
 
+        self.assertEqual(health["schema_version"], 13)
         self.assertEqual(
             health["cluster_runtime"],
             {
@@ -124,7 +145,7 @@ class DashboardClusterControlTests(unittest.TestCase):
                 "thread_reuse": True,
                 "running": False,
                 "config_mismatch": False,
-                "version": "0.4.2",
+                "version": "0.5.0",
             },
         )
         self.assertEqual(board["cluster_runtime"], health["cluster_runtime"])

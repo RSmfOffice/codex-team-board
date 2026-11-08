@@ -5,7 +5,7 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
@@ -95,6 +95,8 @@ CREATE TABLE IF NOT EXISTS cluster_goals (
     max_lead_attempts INTEGER NOT NULL DEFAULT 5,
     workstream_key TEXT,
     continuity_reason TEXT NOT NULL DEFAULT '',
+    checkpoint_summary TEXT NOT NULL DEFAULT '',
+    checkpoint_updated_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     completed_at TEXT,
@@ -198,6 +200,11 @@ CREATE TABLE IF NOT EXISTS metadata (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INTEGER PRIMARY KEY,
+    applied_at TEXT NOT NULL
+);
 """
 
 INDEXES = """
@@ -269,6 +276,8 @@ CLUSTER_GOAL_MIGRATION_COLUMNS = {
     "archived_at": "TEXT",
     "workstream_key": "TEXT",
     "continuity_reason": "TEXT NOT NULL DEFAULT ''",
+    "checkpoint_summary": "TEXT NOT NULL DEFAULT ''",
+    "checkpoint_updated_at": "TEXT",
 }
 
 CLUSTER_JOB_MIGRATION_COLUMNS = {
@@ -307,6 +316,13 @@ def connect(path: Path) -> sqlite3.Connection:
     _upgrade_schema(connection)
     connection.executescript(INDEXES)
     connection.execute(
+        """
+        INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+        VALUES (?, ?)
+        """,
+        (SCHEMA_VERSION, utc_now()),
+    )
+    connection.execute(
         "INSERT OR REPLACE INTO metadata(key, value) VALUES ('schema_version', ?)",
         (str(SCHEMA_VERSION),),
     )
@@ -324,6 +340,19 @@ def connect_readonly(path: Path) -> sqlite3.Connection:
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA query_only=ON")
     return connection
+
+
+def effective_schema_version(connection: sqlite3.Connection) -> int:
+    """Return the highest applied schema, tolerant of stale writers."""
+
+    try:
+        migrated = connection.execute(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"
+        ).fetchone()[0]
+    except sqlite3.OperationalError:
+        migrated = 0
+    pragma = connection.execute("PRAGMA user_version").fetchone()[0]
+    return max(int(migrated or 0), int(pragma or 0))
 
 
 def _upgrade_schema(connection: sqlite3.Connection) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -295,10 +296,6 @@ class AgentPool:
             return False
         if continuity_mode == "reuse":
             return True
-        if role in {"team_explorer", "team_reviewer"}:
-            return True
-        if role == "team_worker":
-            return task_kind != "write"
         if role == "lead":
             return self._goal_workstream_is_continuous(
                 connection,
@@ -306,6 +303,18 @@ class AgentPool:
                 workstream_key,
             )
         return False
+
+    @staticmethod
+    def _context_reuse_ratio() -> float:
+        raw = os.environ.get(
+            "CODEX_TEAM_AGENT_REUSE_CONTEXT_RATIO",
+            "0.85",
+        ).strip()
+        try:
+            value = float(raw)
+        except ValueError:
+            value = 0.85
+        return min(1.0, max(0.1, value))
 
     def select_agent(
         self,
@@ -333,6 +342,7 @@ class AgentPool:
             raise AgentPoolError(f"unsupported task_kind: {task_kind}")
         model = self._normalize_model(model)
         model_provider = self._normalize_model(model_provider)
+        context_reuse_ratio = self._context_reuse_ratio()
         now = utc_now()
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -362,6 +372,11 @@ class AgentPool:
                   AND status IN ({", ".join("?" for _ in self.IDLE_STATUSES)})
                   AND archived_at IS NULL
                   AND reset_requested_at IS NULL
+                  AND (
+                    model_context_window IS NULL
+                    OR model_context_window <= 0
+                    OR context_tokens <= model_context_window * ?
+                  )
                 ORDER BY
                     CASE WHEN last_used_at IS NULL THEN 0 ELSE 1 END,
                     last_used_at ASC,
@@ -376,6 +391,7 @@ class AgentPool:
                     model,
                     model_provider,
                     *self.IDLE_STATUSES,
+                    context_reuse_ratio,
                 ),
             ).fetchone()
             if row is None:

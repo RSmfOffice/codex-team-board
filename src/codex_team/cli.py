@@ -198,6 +198,13 @@ def build_parser() -> argparse.ArgumentParser:
     cluster_workstream.add_argument("goal_id")
     cluster_workstream.add_argument("--workstream-key")
     cluster_workstream.add_argument("--continuity-reason")
+    cluster_checkpoint = cluster_sub.add_parser("checkpoint")
+    cluster_checkpoint.add_argument("goal_id")
+    checkpoint_source = cluster_checkpoint.add_mutually_exclusive_group(
+        required=True
+    )
+    checkpoint_source.add_argument("--summary")
+    checkpoint_source.add_argument("--summary-file")
     cluster_sub.add_parser("daemon-status")
     cluster_sub.add_parser("stop-daemon")
     daemon = cluster_sub.add_parser("daemon")
@@ -470,6 +477,19 @@ def main(argv: list[str] | None = None) -> int:
                         args.goal_id,
                         workstream_key=args.workstream_key,
                         continuity_reason=args.continuity_reason,
+                        actor="human",
+                    )
+                )
+            elif args.cluster_command == "checkpoint":
+                summary = args.summary
+                if args.summary_file:
+                    summary = Path(args.summary_file).read_text(
+                        encoding="utf-8"
+                    )
+                _print(
+                    cluster.set_goal_checkpoint(
+                        args.goal_id,
+                        summary=summary,
                         actor="human",
                     )
                 )

@@ -135,7 +135,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 
 如果仍需联动上下文插件，追加
 `-ContextMeterRoot "D:\path\to\codex-context-meter"`。安装完成后重新打开 Codex，
-并确认健康接口返回 `"version": "0.4.2"`：
+并确认健康接口返回 `"version": "0.5.0"`：
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8765/api/health
@@ -630,8 +630,15 @@ input、cached、uncached、output 优先记录 `last`；只有 `last` 缺失时
 同一 Agent 的累计差值兜底。这样跨 turn 复用不会把历史 input 或 output 重复
 计入单轮成本，同时仍保留 total 供诊断。
 
-`workstream_key` 是项目内连续性作用域；省略时默认使用当前 `goal_id`。AgentPool
-只会在同一项目、同一角色和同一 workstream 内复用，不会跨项目误用 thread。
+`workstream_key` 是项目内连续性作用域；省略时默认使用当前 `goal_id`。默认复用
+策略为：
+
+- Lead：同项目、同角色、同 workstream 且连续时自动恢复 thread。
+- Explorer、Reviewer、Worker：`auto` 默认 fresh。
+- 任意角色：显式 `continuity_mode=reuse` 才允许复用；超过上下文阈值仍会换新。
+
+`CODEX_TEAM_AGENT_REUSE_CONTEXT_RATIO` 默认 `0.85`。当 Agent 的
+`context_tokens / model_context_window` 达到该比例时，不再复用旧 thread。
 `continuity_reason` 说明相关 goal 为什么可以延续同一 Lead 上下文。创建或恢复
 目标时可以直接提供：
 
@@ -648,9 +655,9 @@ input、cached、uncached、output 优先记录 `last`；只有 `last` 缺失时
   --continuity-reason "同一功能的多阶段实现"
 ```
 
-任务默认 `continuity_mode=auto`。`team_worker` 的 write 任务在 `auto` 下 fresh；
-read/review 和满足 Lead 连续性条件的任务可复用；`fresh` 强制新 thread，`reuse`
-显式允许复用。创建任务时可覆盖：
+任务默认 `continuity_mode=auto`。所有 Worker 子任务在 `auto` 下 fresh，只有
+满足连续条件的 Lead 自动复用；`fresh` 强制新 thread，`reuse` 显式允许复用。
+创建任务时可覆盖：
 
 ```powershell
 .\scripts\team.ps1 task create `
@@ -676,6 +683,23 @@ read/review 和满足 Lead 连续性条件的任务可复用；`fresh` 强制新
 CLI、MCP、ClusterManager 和 WebUI 的 reset 都统一进入
 `AgentPool.request_reset`；`starting`/`busy`、`superseded` 和已归档 Agent
 会被拒绝，避免重置正在执行或已失效的 thread。
+
+### Workstream checkpoint
+
+阶段边界使用 compact checkpoint 代替复制完整历史：
+
+```powershell
+.\scripts\team.ps1 cluster checkpoint <goal-id> `
+  --summary-file .\workstream-checkpoint.md
+```
+
+checkpoint 应包含确认决策、已完成工作、变更文件、测试结果、已否决方案、风险
+和下一步，不包含原始日志或完整 transcript。Lead 通过
+`team_goal_set_checkpoint` 自动维护；fresh Worker 会收到同 workstream 最近一次
+checkpoint 的截断摘要。
+
+Lead 的每轮 Board 只包含状态计数、活动任务、最近 8 个完成摘要和省略数量；
+完整任务与事件仅在需要时通过 Team Board MCP 读取。
 
 App Server 初始化失败时会重启 runtime 重试一次；仍失败则记录
 `agent_runtime_fallback`，清理该 job 的 thread/Agent 关联，并让同一 job 使用
@@ -782,6 +806,7 @@ Agent runtime 与模型配置：
 | 环境变量 | 默认值 | 合法值/作用 |
 | --- | --- | --- |
 | `CODEX_TEAM_AGENT_RUNTIME` | `app_server` | `app_server` 启用持久 thread；显式设为 `exec` 可关闭复用 |
+| `CODEX_TEAM_AGENT_REUSE_CONTEXT_RATIO` | `0.85` | 复用 thread 的 context/window 上限比例，范围 `0.1..1.0` |
 | `CODEX_TEAM_AGENT_CODEX_HOME` | `<CODEX_TEAM_HOME>\agent-codex-home` | 托管 Agent 专用 Codex Home；同步 `config.toml`、`auth.json`、`models.json`，不复制用户 sessions |
 | `CODEX_TEAM_MODEL` | 空 | 可选模型覆盖；空值使用 Codex 默认模型 |
 | `CODEX_TEAM_MODEL_PROVIDER` | 空 | 可选 provider 覆盖；必须与 AgentPool 身份匹配 |
@@ -934,7 +959,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -File .\scripts\build-release.ps1
 ```
 
-输出位于 `dist\codex-team-board-v0.4.2.zip`，同时生成 SHA256 文件。GitHub
+输出位于 `dist\codex-team-board-v0.5.0.zip`，同时生成 SHA256 文件。GitHub
 Release 应附带 ZIP 与 `.sha256` 两个资产。
 
 推送 `v*` tag 会触发 `.github/workflows/release.yml`：Actions 先校验版本和完整

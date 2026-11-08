@@ -33,6 +33,7 @@ MUTATING_TOOLS = frozenset(
         "team_cluster_ensure",
         "team_cluster_control",
         "team_goal_set_workstream",
+        "team_goal_set_checkpoint",
         "team_agent_reset",
     }
 )
@@ -609,6 +610,27 @@ def _tool_definitions() -> list[dict[str, Any]]:
             },
         },
         {
+            "name": "team_goal_set_checkpoint",
+            "description": (
+                "Persist a compact structured workstream checkpoint for a "
+                "cluster goal. Use only durable decisions, completed work, "
+                "tests, rejected approaches, risks, and next action."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "goal_id": {"type": "string", "minLength": 1},
+                    "summary": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 12000,
+                    },
+                },
+                "required": ["goal_id", "summary"],
+                "additionalProperties": False,
+            },
+        },
+        {
             "name": "team_agent_list",
             "description": (
                 "List persistent Agent threads, cache usage, current assignment, "
@@ -876,6 +898,12 @@ class TeamMcpServer:
                 workstream_key=arguments.get("workstream_key"),
                 continuity_reason=arguments.get("continuity_reason"),
                 actor="human",
+            )
+        if name == "team_goal_set_checkpoint":
+            return self.cluster.set_goal_checkpoint(
+                arguments["goal_id"],
+                summary=arguments["summary"],
+                actor="lead",
             )
         if name == "team_agent_list":
             return {

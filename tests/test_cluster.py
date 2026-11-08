@@ -19,6 +19,7 @@ from codex_team.cluster import (
     ClusterManager,
     _redact_sensitive_file,
     _redact_sensitive_log,
+    _stable_developer_instructions,
 )
 from codex_team.agent_pool import AgentPool
 from codex_team.app_server import AppServerEvents, AppServerRuntime
@@ -2861,6 +2862,142 @@ class ClusterSchedulerTests(unittest.TestCase):
             self.assertEqual(manager.agent_runtime, "exec")
             self.assertIsNone(manager.runtime)
 
+    def test_checkpoint_and_prompt_layout_are_cache_friendly(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            manager = ClusterManager(
+                settings,
+                team=TeamService(settings),
+            )
+            repo = _repo(base, "checkpoint")
+            goal = manager.create_goal(
+                repo,
+                objective="Implement durable continuity",
+                workstream_key="context-v2",
+            )
+            updated = manager.set_goal_checkpoint(
+                goal["goal_id"],
+                summary=(
+                    "Decisions: use fresh subagents.\n"
+                    "Tests: parser and cluster suites.\n"
+                    "Next: measure cache."
+                ),
+            )
+            self.assertIn(
+                "fresh subagents",
+                updated["checkpoint_summary"],
+            )
+            self.assertTrue(updated["checkpoint_updated_at"])
+            latest = manager.latest_workstream_checkpoint(
+                goal["project_id"],
+                "context-v2",
+            )
+            self.assertEqual(latest["goal_id"], goal["goal_id"])
+            manager.set_goal_status(
+                goal["goal_id"],
+                "active",
+                reason="checkpoint archive test",
+            )
+            manager.set_goal_status(
+                goal["goal_id"],
+                "completed",
+                reason="checkpoint archive test",
+            )
+            manager.set_goal_archived(
+                goal["goal_id"],
+                True,
+                actor="test",
+            )
+            archived_latest = manager.latest_workstream_checkpoint(
+                goal["project_id"],
+                "context-v2",
+            )
+            self.assertEqual(archived_latest["goal_id"], goal["goal_id"])
+            inherited = manager._checkpoint_context(
+                {
+                    **goal,
+                    "checkpoint_summary": "",
+                    "checkpoint_updated_at": None,
+                }
+            )
+            self.assertEqual(inherited["source"], "latest_workstream")
+            prompt = _stable_developer_instructions(
+                goal,
+                "team_explorer",
+                "ROLE_CONTRACT_MARKER",
+            )
+            self.assertTrue(
+                prompt.startswith("# Managed Agent Role Contract")
+            )
+            self.assertLess(
+                prompt.index("ROLE_CONTRACT_MARKER"),
+                prompt.index("## Thread Scope"),
+            )
+
+    def test_lead_board_digest_bounds_completed_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            manager = ClusterManager(
+                settings,
+                team=TeamService(settings),
+            )
+            goal = {
+                "goal_id": "G-DIGEST",
+                "objective": "Bound history",
+                "autonomy": "auto",
+                "project_id": "P-DIGEST",
+                "root_path": str(base),
+                "workstream_key": "digest",
+            }
+            tasks = [
+                {
+                    "task_id": f"T-{index:02d}",
+                    "title": f"Done {index}",
+                    "kind": "read",
+                    "status": "done",
+                    "owner_role": "team_explorer",
+                    "priority": 2,
+                    "completed_at": f"2026-11-08T00:{index:02d}:00Z",
+                    "updated_at": f"2026-11-08T00:{index:02d}:00Z",
+                    "result": "x" * 2000,
+                    "tests": "ok",
+                    "commit_sha": "",
+                }
+                for index in range(10)
+            ]
+            tasks.append(
+                {
+                    "task_id": "T-ACTIVE",
+                    "title": "Active",
+                    "description": "Still running",
+                    "acceptance": "Finish",
+                    "kind": "write",
+                    "status": "running",
+                    "owner_role": "team_worker",
+                    "priority": 1,
+                    "blocked_by": [],
+                }
+            )
+            digest = manager._lead_board_digest(
+                goal,
+                tasks,
+                {"summary": "durable checkpoint"},
+            )
+            self.assertEqual(digest["counts"], {"done": 10, "running": 1})
+            self.assertEqual(len(digest["active_tasks"]), 1)
+            self.assertEqual(len(digest["recent_completed"]), 8)
+            self.assertEqual(digest["omitted_completed_count"], 2)
+            self.assertIn(
+                "...[truncated]",
+                digest["recent_completed"][0]["result"],
+            )
+            self.assertEqual(
+                digest["checkpoint"]["summary"],
+                "durable checkpoint",
+            )
+
     def test_cli_and_mcp_expose_continuity_and_agent_controls(self) -> None:
         parser = build_parser()
         task_args = parser.parse_args(
@@ -2909,6 +3046,16 @@ class ClusterSchedulerTests(unittest.TestCase):
             ]
         )
         self.assertEqual(workstream_args.workstream_key, "renamed")
+        checkpoint_args = parser.parse_args(
+            [
+                "cluster",
+                "checkpoint",
+                "G-EXAMPLE",
+                "--summary",
+                "Durable checkpoint",
+            ]
+        )
+        self.assertEqual(checkpoint_args.summary, "Durable checkpoint")
         agent_args = parser.parse_args(["agent", "reset", "A-EXAMPLE"])
         self.assertEqual(agent_args.agent_command, "reset")
 
@@ -2917,6 +3064,7 @@ class ClusterSchedulerTests(unittest.TestCase):
             {
                 "team_agent_list",
                 "team_agent_reset",
+                "team_goal_set_checkpoint",
                 "team_goal_set_workstream",
             }.issubset(tool_names)
         )
@@ -2953,6 +3101,17 @@ class ClusterSchedulerTests(unittest.TestCase):
                 },
             )
             self.assertEqual(updated["workstream_key"], "mcp-workstream")
+            checkpoint = server.call_tool(
+                "team_goal_set_checkpoint",
+                {
+                    "goal_id": goal["goal_id"],
+                    "summary": "MCP durable checkpoint",
+                },
+            )
+            self.assertEqual(
+                checkpoint["checkpoint_summary"],
+                "MCP durable checkpoint",
+            )
             listed = server.call_tool(
                 "team_agent_list",
                 {"project_id": project["project_id"]},

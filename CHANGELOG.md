@@ -2,6 +2,42 @@
 
 本项目遵循语义化版本。
 
+## [0.5.0] - 2026-11-08
+
+### Changed
+
+- Agent 上下文策略改为“Lead 连续、Subagent fresh”：Explorer、Reviewer 和
+  Worker 的 `auto` 模式默认新建 thread，只有显式 `continuity_mode=reuse`
+  才复用。
+- Lead 仅在已有关联 workstream 时自动恢复 thread；新增上下文比例阈值
+  `CODEX_TEAM_AGENT_REUSE_CONTEXT_RATIO`，默认 `0.85`。
+- Stable Developer Prompt 改为角色 Contract 前置、项目/workstream scope 后置；
+  Worker turn input 改为静态 Assignment Contract 前置、动态 Goal/Task/checkpoint
+  后置。
+- Lead 每轮不再接收完整 task 历史，改为状态计数、全部活动任务、最近 8 个完成
+  摘要和省略数量。
+- Worker 和 Lead 只返回结构化摘要，不复制原始日志或完整 transcript。
+
+### Added
+
+- `cluster_goals` 新增持久 `checkpoint_summary` 与 `checkpoint_updated_at`。
+- 新增 MCP `team_goal_set_checkpoint`。
+- 新增 CLI `cluster checkpoint <goal-id> --summary|--summary-file`。
+- fresh Worker 会继承同 project/workstream 的最近 checkpoint。
+
+### Database
+
+- schema 升级到 13；`TeamService` 启动时执行真实迁移并新增 checkpoint 列，
+  不删除已有数据。
+- `/api/health` 的 `schema_version` 改为读取不可回退的
+  `schema_migrations` 账本并兼容 `PRAGMA user_version`，不再只返回代码常量，
+  也不会因旧版 MCP 进程重连而把已迁移版本误报为旧值。
+
+### Fixed
+
+- 已归档 goal 仍可提供同 project/workstream 的最近 checkpoint；归档继续只承担
+  页面整理职责，不会切断 Agent 的持久上下文。
+
 ## [0.4.2] - 2026-11-08
 
 ### Added

@@ -55,10 +55,17 @@ LEAD_DEVELOPER_INSTRUCTIONS = """You are the managed Lead for an automated
 Codex work cluster. Do not spawn subagents; the deterministic teamd dispatcher
 launches Workers. You may use shell tools and codexTeamBoard MCP tools.
 
-Use the board returned in each turn as the current source of truth. If there are
+Use the compact board digest returned in each turn as the current source of
+truth. Request a full task only when its detail is required. If there are
 no tasks, decompose the objective into small, non-overlapping tasks with a goal
 ID, acceptance criteria, dependencies, and owner roles. Use kind write for code
 changes and team_worker; use read for team_explorer.
+
+At phase boundaries, call team_goal_set_checkpoint with a compact structured
+summary containing confirmed decisions, completed work, changed files, tests,
+open risks, rejected approaches, and the next action. Update the checkpoint
+whenever those durable facts change. Do not copy raw logs or full transcripts
+into it.
 
 For review tasks, inspect the diff and team_get_task_events, run tests, merge the
 task branch into its recorded target branch, then call team_review_task with the
@@ -82,7 +89,10 @@ def _stable_developer_instructions(
     workstream = str(goal.get("workstream_key") or "").strip()
     if not workstream or workstream == str(goal.get("goal_id") or ""):
         workstream = "default (goal-scoped)"
-    prefix = f"""## Stable Team Context
+    return f"""# Managed Agent Role Contract
+{instructions.strip()}
+
+## Thread Scope
 
 - Project ID: `{goal.get("project_id") or "unknown"}`
 - Project root: `{goal.get("root_path") or "unknown"}`
@@ -92,7 +102,13 @@ def _stable_developer_instructions(
 This identity is stable for the Agent thread. The current goal, assignment,
 board state, and task-specific instructions arrive in the turn input.
 """
-    return f"{prefix.rstrip()}\n\n{instructions.strip()}"
+
+
+def _clip_text(value: object, limit: int) -> str:
+    text = str(value or "")
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 20)].rstrip() + "\n...[truncated]"
 
 
 def _runtime_mode(value: str | None) -> str:
@@ -888,6 +904,98 @@ class ClusterManager:
             )
         return self.get_goal(goal_id)
 
+    def set_goal_checkpoint(
+        self,
+        goal_id: str,
+        *,
+        summary: str,
+        actor: str = "lead",
+    ) -> dict[str, Any]:
+        normalized = str(summary or "").strip()
+        if not normalized:
+            raise ClusterError("checkpoint summary must not be empty")
+        if len(normalized) > 12000:
+            raise ClusterError("checkpoint summary must not exceed 12000 characters")
+        now = utc_now()
+        with self.team.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM cluster_goals WHERE goal_id = ?",
+                (goal_id,),
+            ).fetchone()
+            if row is None:
+                raise ClusterError(f"cluster goal not found: {goal_id}")
+            if row["archived_at"]:
+                raise ClusterError("archived goal cannot update checkpoint")
+            connection.execute(
+                """
+                UPDATE cluster_goals
+                SET checkpoint_summary = ?, checkpoint_updated_at = ?,
+                    updated_at = ?
+                WHERE goal_id = ?
+                """,
+                (normalized, now, now, goal_id),
+            )
+            self._event(
+                connection,
+                goal_id,
+                "goal_checkpoint_updated",
+                actor,
+                {
+                    "summary_chars": len(normalized),
+                    "checkpoint_updated_at": now,
+                },
+            )
+        return self.get_goal(goal_id)
+
+    def latest_workstream_checkpoint(
+        self,
+        project_id: str,
+        workstream_key: str,
+    ) -> dict[str, Any] | None:
+        project_id = str(project_id or "").strip()
+        workstream_key = str(workstream_key or "").strip()
+        if not project_id or not workstream_key:
+            return None
+        with self.team.connection(write=False) as connection:
+            row = connection.execute(
+                """
+                SELECT goal_id, objective, checkpoint_summary,
+                       checkpoint_updated_at
+                FROM cluster_goals
+                WHERE project_id = ? AND workstream_key = ?
+                  AND checkpoint_summary != ''
+                ORDER BY checkpoint_updated_at DESC, updated_at DESC, goal_id DESC
+                LIMIT 1
+                """,
+                (project_id, workstream_key),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def _checkpoint_context(self, goal: Mapping[str, Any]) -> dict[str, Any]:
+        summary = str(goal.get("checkpoint_summary") or "").strip()
+        if summary:
+            return {
+                "goal_id": goal.get("goal_id"),
+                "objective": goal.get("objective"),
+                "summary": summary,
+                "updated_at": goal.get("checkpoint_updated_at"),
+                "source": "current_goal",
+            }
+        workstream = str(
+            goal.get("workstream_key") or goal.get("goal_id") or ""
+        ).strip()
+        inherited = self.latest_workstream_checkpoint(
+            str(goal.get("project_id") or ""),
+            workstream,
+        )
+        if inherited is None:
+            return {
+                "summary": "",
+                "source": "none",
+            }
+        return {**inherited, "source": "latest_workstream"}
+
     def list_agents(
         self,
         project_id: str | None = None,
@@ -1355,22 +1463,40 @@ class ClusterManager:
             cwd = Path(goal["root_path"])
         role_data = self.team.role_prompt(role, goal["root_path"])
         actor = f"auto-{role}-{task['task_id'].lower()}"
-        assignment = f"""# Automated assignment
+        checkpoint = self._checkpoint_context(goal)
+        checkpoint_summary = _clip_text(
+            checkpoint.get("summary"),
+            3000,
+        )
+        assignment = f"""# Managed Assignment Contract
+Use the `codexTeamBoard` MCP tools. Do not spawn subagents or another team.
+First call `team_claim_task` for the current task using the Actor name below.
+Work only on this task. Keep the claim token private. For jobs that may exceed
+four minutes, call `team_heartbeat` at least every three minutes. If your context
+approaches its limit, commit safe progress, call `team_block_task` with the reason
+`worker-context-near-limit`, and stop. Before exiting, either call
+`team_submit_task` or call `team_block_task` with a precise blocker.
 
+Return a compact structured summary:
+- outcome
+- changed files
+- tests and results
+- confirmed decisions
+- risks or unresolved questions
+- next action
+Do not return raw logs or a full transcript.
+
+# Current Assignment
 - Goal ID: `{goal["goal_id"]}`
 - Task ID: `{task["task_id"]}`
 - Repository: `{goal["root_path"]}`
 - Worktree: `{task.get("worktree_path") or "(none)"}`
 - Actor name: `{actor}`
 
-Use the `codexTeamBoard` MCP tools. Do not spawn subagents or another team.
-First call `team_claim_task` for this task with actor `{actor}`.
-Work only on this task. Keep the claim token private. For jobs that may exceed
-four minutes, call `team_heartbeat` at least every three minutes. If your context
-approaches its limit, commit safe progress, call `team_block_task` with the reason
-`worker-context-near-limit`, and stop. Before exiting, either call
-`team_submit_task` with commit SHA, result, changed files, risks, tests and
-review focus, or call `team_block_task` with a precise blocker.
+## Workstream Checkpoint
+```text
+{checkpoint_summary or "(none)"}
+```
 """
         return self._start_job(
             goal,
@@ -1392,6 +1518,90 @@ review focus, or call `team_block_task` with a precise blocker.
             else "workspace-write"
         )
 
+    @staticmethod
+    def _compact_task_digest(
+        task: Mapping[str, Any],
+        *,
+        completed: bool,
+    ) -> dict[str, Any]:
+        common = {
+            "task_id": task.get("task_id"),
+            "title": task.get("title"),
+            "kind": task.get("kind"),
+            "status": task.get("status"),
+            "owner_role": task.get("owner_role"),
+            "priority": task.get("priority"),
+        }
+        if completed:
+            return {
+                **common,
+                "commit_sha": task.get("commit_sha") or "",
+                "result": _clip_text(task.get("result"), 1200),
+                "tests": _clip_text(task.get("tests"), 600),
+                "completed_at": task.get("completed_at"),
+            }
+        return {
+            **common,
+            "description": _clip_text(task.get("description"), 1800),
+            "acceptance": _clip_text(task.get("acceptance"), 1000),
+            "blocked_by": list(task.get("blocked_by") or []),
+            "blocker": _clip_text(task.get("blocker"), 800),
+            "claimed_by": task.get("claimed_by"),
+            "branch": task.get("branch"),
+            "worktree_path": task.get("worktree_path"),
+            "result": _clip_text(task.get("result"), 1200),
+            "tests": _clip_text(task.get("tests"), 600),
+            "commit_sha": task.get("commit_sha") or "",
+        }
+
+    def _lead_board_digest(
+        self,
+        goal: Mapping[str, Any],
+        tasks: list[dict[str, Any]],
+        checkpoint: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        counts: dict[str, int] = {}
+        for task in tasks:
+            status = str(task.get("status") or "unknown")
+            counts[status] = counts.get(status, 0) + 1
+        active_tasks = [
+            self._compact_task_digest(task, completed=False)
+            for task in tasks
+            if task.get("status") not in {"done", "canceled"}
+        ]
+        completed_tasks = sorted(
+            (
+                task
+                for task in tasks
+                if task.get("status") == "done"
+            ),
+            key=lambda task: str(
+                task.get("completed_at") or task.get("updated_at") or ""
+            ),
+            reverse=True,
+        )
+        recent_completed = [
+            self._compact_task_digest(task, completed=True)
+            for task in completed_tasks[:8]
+        ]
+        return {
+            "goal": {
+                "goal_id": goal["goal_id"],
+                "objective": goal["objective"],
+                "autonomy": goal["autonomy"],
+                "workstream_key": goal.get("workstream_key"),
+            },
+            "counts": counts,
+            "checkpoint": dict(checkpoint),
+            "active_tasks": active_tasks,
+            "recent_completed": recent_completed,
+            "omitted_completed_count": max(0, len(completed_tasks) - 8),
+            "detail_policy": (
+                "This is a compact digest. Use team_get_task and "
+                "team_get_task_events only when full history is needed."
+            ),
+        }
+
     def _dispatch_lead(
         self,
         goal: dict[str, Any],
@@ -1400,23 +1610,23 @@ review focus, or call `team_block_task` with a precise blocker.
         if int(goal["lead_ticks"]) >= 20:
             self.set_goal_status(goal["goal_id"], "failed", reason="lead tick limit exceeded")
             raise ClusterError("lead tick limit exceeded")
-        board = {
-            "goal": {
-                "goal_id": goal["goal_id"],
-                "objective": goal["objective"],
-                "autonomy": goal["autonomy"],
-            },
-            "tasks": tasks,
-        }
-        turn_input = f"""Goal:
+        checkpoint = self._checkpoint_context(goal)
+        board = self._lead_board_digest(goal, tasks, checkpoint)
+        turn_input = f"""# Current Goal
 {goal["objective"]}
 
-Current board:
+## Compact Board Digest
 ```json
 {json.dumps(board, ensure_ascii=False, indent=2)}
 ```
 
-Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
+# Turn Rules
+- Use goal_id = "{goal["goal_id"]}" when creating tasks.
+- Use the compact digest by default.
+- Read a full task or its events only when the digest is insufficient.
+- At phase boundaries, call `team_goal_set_checkpoint` with durable decisions,
+  completed work, tests, rejected approaches, risks, and next action.
+- Do not copy raw logs or full transcripts into the checkpoint.
 """
         return self._start_job(
             goal,

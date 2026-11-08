@@ -49,6 +49,10 @@ class TeamService:
         agent_pool: AgentPool | None = None,
     ) -> None:
         self.settings = settings
+        # A service instance is the process-level owner of the database.
+        # Migrate before any read-only dashboard query can observe an old schema.
+        with self.connection():
+            pass
         self.agent_pool = agent_pool or AgentPool(settings)
 
     @contextmanager

@@ -276,7 +276,7 @@ const firstBoard = {
     thread_reuse: true,
     running: true,
     config_mismatch: false,
-    version: "0.4.2",
+    version: "0.5.0",
   },
   cluster_goals: [
     {
@@ -291,6 +291,8 @@ const firstBoard = {
       active_job_count: 2,
       heartbeat_state: "warning",
       heartbeat_age_seconds: 320,
+      checkpoint_summary: "Use fresh subagents and durable checkpoints.",
+      checkpoint_updated_at: "2026-11-07T09:55:00Z",
       queue_reason: "global_capacity",
       estimated_wait_seconds: 120,
     },
@@ -541,6 +543,7 @@ assert.match(summaryHtml, /data-metric="attention"/);
 assert.match(clusterHtmlBefore, /G-WARNING/);
 assert.match(clusterHtmlBefore, /G-CRITICAL/);
 assert.match(clusterHtmlBefore, /活动任务 2/);
+assert.match(clusterHtmlBefore, /checkpoint/);
 assert.match(clusterHtmlBefore, /心跳延迟/);
 assert.match(clusterHtmlBefore, /心跳超时/);
 assert.match(clusterHtmlBefore, /warning · 5 分钟/);

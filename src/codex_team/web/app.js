@@ -681,6 +681,9 @@ function renderCluster(goals, jobs, data) {
     const goalJobs = activeJobs.filter((job) => job.goal_id === goal.goal_id);
     const heartbeat = goalHeartbeatInfo(goal);
     const queue = goalQueueReason(goal);
+    const checkpoint = goal.checkpoint_updated_at
+      ? `<span class="chip" title="${escapeHtml(goal.checkpoint_summary || "")}">checkpoint ${escapeHtml(timeText(goal.checkpoint_updated_at))}</span>`
+      : "";
     const activeJobCount = nonNegativeNumber(
       goal.active_job_count,
       goalJobs.length,
@@ -733,6 +736,7 @@ function renderCluster(goals, jobs, data) {
           <span class="chip owner">${escapeHtml(goal.autonomy)}</span>
           <span class="chip">lead ticks ${escapeHtml(goal.lead_ticks ?? 0)}</span>
           <span class="chip active-jobs-chip">活动任务 ${escapeHtml(activeJobCount)} · ${escapeHtml(runText)}</span>
+          ${checkpoint}
           ${goal.archived_at ? '<span class="chip archived">已归档</span>' : ""}
           ${health.attention ? '<span class="chip attention-chip">需关注</span>' : ""}
         </div>
