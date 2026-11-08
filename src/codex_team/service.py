@@ -23,6 +23,7 @@ from .scheduling import (
     MAX_GOAL_WORKER_CAPACITY,
     env_int,
 )
+from .usage import cache_hit_rate
 
 TERMINAL_STATUSES = frozenset({"done", "canceled"})
 ACTIVE_STATUSES = frozenset({"ready", "running", "review", "blocked"})
@@ -95,22 +96,16 @@ class TeamService:
         input_tokens: object,
         cached_input_tokens: object,
         uncached_input_tokens: object,
-    ) -> float:
-        """Return the cached input share as a ratio in the closed [0, 1] range."""
+    ) -> float | None:
+        """Return cached input share, or None when usage is unavailable."""
 
-        def number(value: object) -> int:
-            try:
-                return max(0, int(value or 0))
-            except (TypeError, ValueError):
-                return 0
-
-        input_count = number(input_tokens)
-        cached_count = number(cached_input_tokens)
-        uncached_count = number(uncached_input_tokens)
-        denominator = input_count or cached_count + uncached_count
-        if denominator <= 0:
-            return 0.0
-        return max(0.0, min(1.0, cached_count / denominator))
+        return cache_hit_rate(
+            {
+                "input": input_tokens,
+                "cached": cached_input_tokens,
+                "uncached": uncached_input_tokens,
+            }
+        )
 
     @staticmethod
     def _root(path: str | Path) -> Path:
@@ -779,6 +774,22 @@ class TeamService:
             cluster_goals = [dict(row) for row in goal_rows]
             cluster_jobs = [dict(row) for row in job_rows]
             for job in cluster_jobs:
+                usage_fields = (
+                    "input_tokens",
+                    "cached_input_tokens",
+                    "uncached_input_tokens",
+                    "output_tokens",
+                    "first_input_tokens",
+                    "first_cached_input_tokens",
+                    "first_uncached_input_tokens",
+                    "context_tokens",
+                )
+                if (
+                    not job.get("usage_source")
+                    and not any(int(job.get(field) or 0) for field in usage_fields)
+                ):
+                    for field in usage_fields:
+                        job[field] = None
                 job["cache_hit_rate"] = self._cache_hit_rate(
                     job.get("input_tokens"),
                     job.get("cached_input_tokens"),

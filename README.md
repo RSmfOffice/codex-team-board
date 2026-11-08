@@ -92,7 +92,8 @@ Invoke-RestMethod http://127.0.0.1:8765/api/health
 codex mcp get codexTeamBoard --json
 ```
 
-预期看板健康响应包含 `"service": "codex-team-board"`。在 Codex 右侧点击上下文
+预期看板健康响应包含 `"service": "codex-team-board"`、`team_home`、`database`、
+`database_id` 和 `schema_version`。插件会拒绝打开数据库身份不匹配的看板。在 Codex 右侧点击上下文
 悬浮窗右键，选择“打开 Codex 团队看板”；看板已运行时应直接打开浏览器，未运行
 时应自动启动后打开。
 
@@ -511,6 +512,11 @@ MCP 的 `team_cluster_control.action` 除 `pause`、`resume`、`cancel` 外，�
 
 ## MCP 工具
 
+`codexTeamBoard` MCP 支持 `CODEX_TEAM_MCP_ACCESS=full|read_only|off`。
+`read_only` 仅暴露查询工具，`off` 不暴露任何工具。设置
+`CODEX_TEAM_ALLOWED_ROOTS`（Windows 使用 `;` 分隔）后，所有带 `repo_root`/`repo`
+参数的调用必须位于允许根目录内。基准程序固定使用 `off`。
+
 - `team_init_project`
 - `team_status`
 - `team_list_roles`
@@ -805,6 +811,20 @@ $env:CODEX_TEAM_AGENT_RUNTIME = "app_server"
 powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -File .\scripts\ensure-cluster-daemon.ps1
 .\scripts\team.ps1 cluster daemon-status
+```
+
+daemon 状态文件会记录 runtime、model/provider、Team Home、版本和配置指纹。
+修改运行配置后，使用以下命令安全重启：
+
+```powershell
+.\scripts\team.ps1 daemon restart --if-idle
+```
+
+已有的 exec JSONL usage 可离线回填。先 dry-run，再应用；缺失字段保持缺失：
+
+```powershell
+.\scripts\team.ps1 usage backfill --dry-run
+.\scripts\team.ps1 usage backfill --apply
 ```
 
 每个 active goal 的正常容量是 1 个 Lead 加 `CODEX_TEAM_CLUSTER_MAX_WORKERS`

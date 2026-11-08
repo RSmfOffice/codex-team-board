@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-from .cluster import ClusterManager, daemon_paths
+from .cluster import ClusterManager, daemon_identity, daemon_paths
 from .config import Settings
 from .db import utc_now
 from .processes import pid_is_running
@@ -67,6 +67,7 @@ def run(interval: float = 5.0, once: bool = False) -> int:
     settings.ensure()
     _, state_path, _ = daemon_paths(settings)
     manager = ClusterManager(settings)
+    identity = daemon_identity(settings)
     try:
         with acquire_lock(settings):
             while True:
@@ -76,12 +77,14 @@ def run(interval: float = 5.0, once: bool = False) -> int:
                         "ok": True,
                         **result,
                         "pid": os.getpid(),
+                        "identity": identity,
                     }
                 except Exception as exc:
                     state = {
                         "ok": False,
                         "tick_at": utc_now(),
                         "pid": os.getpid(),
+                        "identity": identity,
                         "error": str(exc),
                     }
                 write_json_atomic(state_path, state)

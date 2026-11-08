@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1400,6 +1401,15 @@ class ClusterSchedulerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary)
             completed = threading.Event()
+            source_codex_home = Path(
+                os.environ.get("CODEX_HOME", Path.home() / ".codex")
+            ).expanduser()
+            isolated_codex_home = workspace / "codex-home"
+            isolated_codex_home.mkdir()
+            for filename in ("config.toml", "auth.json", "models.json"):
+                source = source_codex_home / filename
+                if source.is_file():
+                    shutil.copy2(source, isolated_codex_home / filename)
 
             class LifecycleEvents(AppServerEvents):
                 def __init__(self) -> None:
@@ -1429,6 +1439,7 @@ class ClusterSchedulerTests(unittest.TestCase):
                 startup_timeout=20.0,
                 stop_timeout=5.0,
                 event_handler=events,
+                env={"CODEX_HOME": str(isolated_codex_home)},
             )
             self.addCleanup(runtime.stop)
             started = runtime.start()

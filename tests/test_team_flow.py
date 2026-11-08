@@ -15,7 +15,7 @@ from codex_team.config import Settings
 from codex_team.cli import build_parser
 from codex_team.cluster import ClusterManager
 from codex_team.dashboard import build_server
-from codex_team.db import utc_now
+from codex_team.db import SCHEMA_VERSION, utc_now
 from codex_team.mcp import TeamMcpServer, _tool_definitions
 from codex_team.service import TeamError, TeamService
 from codex_team.worktrees import WorktreeManager
@@ -270,7 +270,7 @@ class TeamFlowTests(unittest.TestCase):
         self.assertIn("claimed", event_types)
         self.assertIn("submitted", event_types)
         self.assertIn("reviewed", event_types)
-        self.assertEqual(schema_version, 11)
+        self.assertEqual(schema_version, SCHEMA_VERSION)
         history = self.team.get_task_events(done["task_id"])
         self.assertIn("worktree_created", [item["event_type"] for item in history["events"]])
 
@@ -532,6 +532,21 @@ class TeamFlowTests(unittest.TestCase):
                 timeout=5,
             ) as response:
                 self.assertEqual(response.status, 204)
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/health",
+                timeout=5,
+            ) as response:
+                health = json.loads(response.read().decode("utf-8"))
+            self.assertEqual(
+                Path(health["team_home"]).resolve(),
+                self.settings.home.resolve(),
+            )
+            self.assertEqual(
+                Path(health["database"]).resolve(),
+                self.settings.db_path.resolve(),
+            )
+            self.assertTrue(health["database_id"])
+            self.assertEqual(health["schema_version"], SCHEMA_VERSION)
             with urllib.request.urlopen(
                 f"http://127.0.0.1:{port}/api/board",
                 timeout=5,

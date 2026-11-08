@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
-from typing import Any
+from pathlib import Path
+from typing import Any, Mapping
 
 from . import __version__
 from .config import Settings
@@ -13,6 +15,27 @@ from .worktrees import WorktreeManager
 
 LOGGER = logging.getLogger("codex_team.mcp")
 PROTOCOL_VERSION = "2025-06-18"
+MUTATING_TOOLS = frozenset(
+    {
+        "team_init_project",
+        "team_create_task",
+        "team_create_worktree",
+        "team_claim_task",
+        "team_heartbeat",
+        "team_update_task",
+        "team_submit_task",
+        "team_block_task",
+        "team_unblock_task",
+        "team_cancel_task",
+        "team_review_task",
+        "team_add_message",
+        "team_cluster_start",
+        "team_cluster_ensure",
+        "team_cluster_control",
+        "team_goal_set_workstream",
+        "team_agent_reset",
+    }
+)
 INSTRUCTIONS = (
     "This MCP server is the shared task and worktree source of truth for a Codex team. "
     "For an initialized team project, call team_cluster_ensure before non-trivial development "
@@ -24,6 +47,57 @@ INSTRUCTIONS = (
     "claim_token private, send heartbeats, and submit to review with commit and test evidence. "
     "Never edit outside an assigned worktree."
 )
+
+
+def _access_mode() -> str:
+    mode = os.environ.get("CODEX_TEAM_MCP_ACCESS", "full").strip().lower()
+    if mode not in {"full", "read_only", "off"}:
+        raise TeamError(
+            "CODEX_TEAM_MCP_ACCESS must be full, read_only, or off"
+        )
+    return mode
+
+
+def _visible_tool_definitions() -> list[dict[str, Any]]:
+    mode = _access_mode()
+    if mode == "off":
+        return []
+    tools = _tool_definitions()
+    if mode == "read_only":
+        return [
+            tool
+            for tool in tools
+            if str(tool.get("name") or "") not in MUTATING_TOOLS
+        ]
+    return tools
+
+
+def _guard_tool_call(name: str, arguments: Mapping[str, Any]) -> None:
+    mode = _access_mode()
+    if mode == "off":
+        raise TeamError("Codex Team Board MCP is disabled")
+    if mode == "read_only" and name in MUTATING_TOOLS:
+        raise TeamError("Codex Team Board MCP is read-only")
+    raw_roots = os.environ.get("CODEX_TEAM_ALLOWED_ROOTS", "").strip()
+    if not raw_roots:
+        return
+    allowed = [
+        Path(value).expanduser().resolve()
+        for value in raw_roots.split(os.pathsep)
+        if value.strip()
+    ]
+    for key in ("repo_root", "repo"):
+        value = arguments.get(key)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        candidate = Path(value).expanduser().resolve()
+        if not any(
+            candidate == root or candidate.is_relative_to(root)
+            for root in allowed
+        ):
+            raise TeamError(
+                f"{key} is outside CODEX_TEAM_ALLOWED_ROOTS: {candidate}"
+            )
 
 
 def _tool_definitions() -> list[dict[str, Any]]:
@@ -873,12 +947,13 @@ def _process(server: TeamMcpServer, message: dict[str, Any]) -> dict[str, Any] |
         elif method == "ping":
             result = {}
         elif method == "tools/list":
-            result = {"tools": _tool_definitions()}
+            result = {"tools": _visible_tool_definitions()}
         elif method == "tools/call":
             name = str(params.get("name") or "")
             arguments = params.get("arguments") or {}
             if not isinstance(arguments, dict):
                 raise TeamError("tool arguments must be an object")
+            _guard_tool_call(name, arguments)
             result = _tool_result(server.call_tool(name, arguments))
         elif method in {"resources/list", "prompts/list"}:
             result = {"resources": []} if method == "resources/list" else {"prompts": []}

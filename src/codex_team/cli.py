@@ -10,10 +10,12 @@ from .cluster import (
     ClusterManager,
     daemon_status,
     ensure_daemon,
+    restart_daemon,
     stop_daemon,
 )
 from .dashboard import serve as serve_dashboard
 from .service import TeamError, TeamService
+from .usage_backfill import backfill_exec_usage
 from .worktrees import WorktreeManager
 
 
@@ -216,6 +218,24 @@ def build_parser() -> argparse.ArgumentParser:
     agent_reset.add_argument("agent_id")
     agent_reset.add_argument("--actor", default="human")
     agent_reset.add_argument("--reason", default="manual reset requested through CLI")
+
+    usage = sub.add_parser("usage", help="Inspect and repair usage telemetry")
+    usage_sub = usage.add_subparsers(dest="usage_command", required=True)
+    usage_backfill = usage_sub.add_parser("backfill")
+    mode = usage_backfill.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--dry-run", action="store_true")
+    mode.add_argument("--apply", action="store_true")
+    usage_backfill.add_argument("--project")
+    usage_backfill.add_argument("--goal")
+    usage_backfill.add_argument("--job")
+
+    daemon_admin = sub.add_parser("daemon", help="Manage the cluster daemon")
+    daemon_admin_sub = daemon_admin.add_subparsers(
+        dest="daemon_command",
+        required=True,
+    )
+    daemon_restart = daemon_admin_sub.add_parser("restart")
+    daemon_restart.add_argument("--if-idle", action="store_true")
 
     sub.add_parser("serve", help="Run the Codex MCP stdio server")
     return parser
@@ -478,6 +498,25 @@ def main(argv: list[str] | None = None) -> int:
                         args.agent_id,
                         actor=args.actor,
                         reason=args.reason,
+                    )
+                )
+        elif args.command == "usage":
+            if args.usage_command == "backfill":
+                _print(
+                    backfill_exec_usage(
+                        settings,
+                        dry_run=bool(args.dry_run),
+                        project_id=args.project,
+                        goal_id=args.goal,
+                        job_id=args.job,
+                    )
+                )
+        elif args.command == "daemon":
+            if args.daemon_command == "restart":
+                _print(
+                    restart_daemon(
+                        settings,
+                        if_idle=bool(args.if_idle),
                     )
                 )
         elif args.command == "dashboard":

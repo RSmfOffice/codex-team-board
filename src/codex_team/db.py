@@ -5,7 +5,7 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
@@ -132,7 +132,11 @@ CREATE TABLE IF NOT EXISTS cluster_jobs (
     first_cached_input_tokens INTEGER NOT NULL DEFAULT 0,
     first_uncached_input_tokens INTEGER NOT NULL DEFAULT 0,
     context_tokens INTEGER NOT NULL DEFAULT 0,
-    model_context_window INTEGER
+    model_context_window INTEGER,
+    cache_write_input_tokens INTEGER,
+    reasoning_output_tokens INTEGER,
+    usage_source TEXT,
+    telemetry_complete INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS cluster_agents (
@@ -281,6 +285,10 @@ CLUSTER_JOB_MIGRATION_COLUMNS = {
     "first_uncached_input_tokens": "INTEGER NOT NULL DEFAULT 0",
     "context_tokens": "INTEGER NOT NULL DEFAULT 0",
     "model_context_window": "INTEGER",
+    "cache_write_input_tokens": "INTEGER",
+    "reasoning_output_tokens": "INTEGER",
+    "usage_source": "TEXT",
+    "telemetry_complete": "INTEGER NOT NULL DEFAULT 0",
 }
 
 

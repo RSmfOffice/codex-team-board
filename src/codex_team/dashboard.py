@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import threading
 import webbrowser
 from http import HTTPStatus
@@ -11,7 +12,7 @@ from urllib.parse import parse_qs, urlsplit
 from . import __version__
 from .cluster import ClusterError, ClusterManager, daemon_status, ensure_daemon
 from .config import Settings
-from .db import utc_now
+from .db import SCHEMA_VERSION, utc_now
 from .service import TeamError, TeamService
 
 WEB_ROOT = Path(__file__).resolve().parent / "web"
@@ -38,11 +39,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._serve_static(parsed.path)
             return
         if parsed.path == "/api/health":
+            database = self.team_service.settings.db_path.resolve()
             self._send_json(
                 {
                     "ok": True,
                     "service": "codex-team-board",
                     "version": __version__,
+                    "team_home": str(
+                        self.team_service.settings.home.resolve()
+                    ),
+                    "database": str(database),
+                    "database_id": hashlib.sha256(
+                        str(database).casefold().encode("utf-8")
+                    ).hexdigest()[:16],
+                    "schema_version": SCHEMA_VERSION,
                     "generated_at": utc_now(),
                 }
             )

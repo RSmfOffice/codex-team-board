@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from codex_team.db import connect
+from codex_team.db import SCHEMA_VERSION, connect
 
 
 class MigrationTests(unittest.TestCase):
@@ -38,7 +38,7 @@ class MigrationTests(unittest.TestCase):
             try:
                 self.assertEqual(
                     upgraded.execute("PRAGMA user_version").fetchone()[0],
-                    11,
+                    SCHEMA_VERSION,
                 )
                 columns = {
                     row["name"]

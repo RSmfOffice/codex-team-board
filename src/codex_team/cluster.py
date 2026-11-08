@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import secrets
 import shutil
@@ -12,6 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping
 
+from . import __version__
 from .agent_pool import AgentPool, AgentPoolError
 from .app_server import AppServerEvents, AppServerRuntime
 from .config import Settings
@@ -30,6 +32,7 @@ from .scheduling import (
     env_int,
 )
 from .service import TeamError, TeamService
+from .usage import usage_from_exec_log, usage_is_cost_complete
 from .worktrees import WorktreeManager
 
 TERMINAL_GOAL_STATUSES = frozenset({"completed", "failed"})
@@ -3300,6 +3303,14 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
             "modelContextWindow",
             total.get("modelContextWindow"),
         )
+        cache_write = number(
+            last if isinstance(last_value, Mapping) else total,
+            "cache_write",
+        )
+        reasoning_output = number(
+            last if isinstance(last_value, Mapping) else total,
+            "reasoning",
+        )
         try:
             model_window = (
                 max(0, int(raw_window))
@@ -3318,6 +3329,8 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
             "first_uncached_input_tokens": first_input - first_cached,
             "context_tokens": context_tokens,
             "model_context_window": model_window,
+            "cache_write_input_tokens": cache_write,
+            "reasoning_output_tokens": reasoning_output,
         }
 
     def _finalize_app_agent(
@@ -3403,7 +3416,13 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                 )
             )
             process_error = forced_error or parsed.get("error", "")
-        usage = self._app_job_usage(job, app_state) if app_server_runtime else {}
+        usage = self._app_job_usage(job, app_state) if app_server_runtime else parsed
+        usage_source = (
+            "cluster_agents.last_usage+runtime_raw_turn"
+            if app_server_runtime
+            else parsed.get("usage_source")
+        )
+        telemetry_complete = usage_is_cost_complete(usage)
         if job["kind"] == "worker":
             task = self.team.get_task(job["task_id"])
             worker_ok = task["status"] in {"review", "done", "blocked"}
@@ -3422,7 +3441,9 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                         uncached_input_tokens = ?, output_tokens = ?,
                         first_input_tokens = ?, first_cached_input_tokens = ?,
                         first_uncached_input_tokens = ?, context_tokens = ?,
-                        model_context_window = ?
+                        model_context_window = ?, cache_write_input_tokens = ?,
+                        reasoning_output_tokens = ?, usage_source = ?,
+                        telemetry_complete = ?
                     WHERE job_id = ?
                     """,
                     (
@@ -3431,15 +3452,19 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                         utc_now(),
                         exit_code,
                         error,
-                        usage.get("input_tokens", 0),
-                        usage.get("cached_input_tokens", 0),
-                        usage.get("uncached_input_tokens", 0),
-                        usage.get("output_tokens", 0),
-                        usage.get("first_input_tokens", 0),
-                        usage.get("first_cached_input_tokens", 0),
-                        usage.get("first_uncached_input_tokens", 0),
-                        usage.get("context_tokens", 0),
+                        usage.get("input_tokens") or 0,
+                        usage.get("cached_input_tokens") or 0,
+                        usage.get("uncached_input_tokens") or 0,
+                        usage.get("output_tokens") or 0,
+                        usage.get("first_input_tokens") or 0,
+                        usage.get("first_cached_input_tokens") or 0,
+                        usage.get("first_uncached_input_tokens") or 0,
+                        usage.get("context_tokens") or 0,
                         usage.get("model_context_window"),
+                        usage.get("cache_write_input_tokens"),
+                        usage.get("reasoning_output_tokens"),
+                        usage_source,
+                        int(telemetry_complete),
                         job["job_id"],
                     ),
                 )
@@ -3483,7 +3508,9 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                     uncached_input_tokens = ?, output_tokens = ?,
                     first_input_tokens = ?, first_cached_input_tokens = ?,
                     first_uncached_input_tokens = ?, context_tokens = ?,
-                    model_context_window = ?
+                    model_context_window = ?, cache_write_input_tokens = ?,
+                    reasoning_output_tokens = ?, usage_source = ?,
+                    telemetry_complete = ?
                 WHERE job_id = ?
                 """,
                 (
@@ -3492,15 +3519,19 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
                     utc_now(),
                     exit_code,
                     error,
-                    usage.get("input_tokens", 0),
-                    usage.get("cached_input_tokens", 0),
-                    usage.get("uncached_input_tokens", 0),
-                    usage.get("output_tokens", 0),
-                    usage.get("first_input_tokens", 0),
-                    usage.get("first_cached_input_tokens", 0),
-                    usage.get("first_uncached_input_tokens", 0),
-                    usage.get("context_tokens", 0),
+                    usage.get("input_tokens") or 0,
+                    usage.get("cached_input_tokens") or 0,
+                    usage.get("uncached_input_tokens") or 0,
+                    usage.get("output_tokens") or 0,
+                    usage.get("first_input_tokens") or 0,
+                    usage.get("first_cached_input_tokens") or 0,
+                    usage.get("first_uncached_input_tokens") or 0,
+                    usage.get("context_tokens") or 0,
                     usage.get("model_context_window"),
+                    usage.get("cache_write_input_tokens"),
+                    usage.get("reasoning_output_tokens"),
+                    usage_source,
+                    int(telemetry_complete),
                     job["job_id"],
                 ),
             )
@@ -3807,10 +3838,43 @@ def _redact_sensitive_file(path: Path) -> bool:
 
 
 def _parse_codex_log(path: Path) -> dict[str, Any]:
+    usage_record = usage_from_exec_log(path)
+    usage = {
+        field: usage_record.get(field)
+        for field in (
+            "input_tokens",
+            "cached_input_tokens",
+            "uncached_input_tokens",
+            "cache_write_input_tokens",
+            "output_tokens",
+            "reasoning_output_tokens",
+            "context_tokens",
+            "model_context_window",
+        )
+    }
+    first_usage = usage_record.get("first_usage")
     result: dict[str, Any] = {
         "thread_id": None,
         "completed": False,
         "error": "",
+        **usage,
+        "first_input_tokens": (
+            first_usage.get("input_tokens")
+            if isinstance(first_usage, Mapping)
+            else usage["input_tokens"]
+        ),
+        "first_cached_input_tokens": (
+            first_usage.get("cached_input_tokens")
+            if isinstance(first_usage, Mapping)
+            else usage["cached_input_tokens"]
+        ),
+        "first_uncached_input_tokens": (
+            first_usage.get("uncached_input_tokens")
+            if isinstance(first_usage, Mapping)
+            else usage["uncached_input_tokens"]
+        ),
+        "usage_source": usage_record.get("usage_source"),
+        "telemetry_complete": usage_is_cost_complete(usage),
     }
     try:
         with path.open("r", encoding="utf-8", errors="replace") as stream:
@@ -3854,6 +3918,24 @@ def daemon_paths(settings: Settings) -> tuple[Path, Path, Path]:
     )
 
 
+def daemon_identity(settings: Settings) -> dict[str, Any]:
+    runtime = os.environ.get("CODEX_TEAM_AGENT_RUNTIME", "").strip() or "exec"
+    model = os.environ.get("CODEX_TEAM_MODEL", "").strip()
+    model_provider = os.environ.get("CODEX_TEAM_MODEL_PROVIDER", "").strip()
+    home = str(settings.home.resolve())
+    payload = {
+        "runtime": runtime,
+        "model": model,
+        "model_provider": model_provider,
+        "team_home": home,
+        "version": __version__,
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    return {**payload, "fingerprint": fingerprint}
+
+
 def daemon_status(settings: Settings) -> dict[str, Any]:
     lock_path, state_path, log_path = daemon_paths(settings)
     pid = 0
@@ -3866,6 +3948,8 @@ def daemon_status(settings: Settings) -> dict[str, Any]:
         state = json.loads(state_path.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
         pass
+    expected_identity = daemon_identity(settings)
+    actual_identity = state.get("identity") if isinstance(state, dict) else None
     return {
         "running": bool(pid and pid_is_running(pid)),
         "pid": pid or None,
@@ -3873,6 +3957,12 @@ def daemon_status(settings: Settings) -> dict[str, Any]:
         "state_path": str(state_path),
         "log_path": str(log_path),
         "state": state,
+        "expected_identity": expected_identity,
+        "config_mismatch": bool(
+            pid
+            and pid_is_running(pid)
+            and actual_identity != expected_identity
+        ),
     }
 
 
@@ -3942,3 +4032,38 @@ def stop_daemon(settings: Settings) -> dict[str, Any]:
     except FileNotFoundError:
         pass
     return {"ok": True, "stopped_pid": pid or None}
+
+
+def restart_daemon(
+    settings: Settings,
+    *,
+    if_idle: bool = False,
+) -> dict[str, Any]:
+    if if_idle:
+        connection = connect(settings.db_path)
+        try:
+            active = [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT job_id, goal_id, task_id, role, status
+                    FROM cluster_jobs
+                    WHERE status IN ('starting', 'running')
+                    ORDER BY started_at
+                    """
+                ).fetchall()
+            ]
+        finally:
+            connection.close()
+        if active:
+            raise ClusterError(
+                "cluster daemon is not idle; active jobs: "
+                + ", ".join(str(job["job_id"]) for job in active)
+            )
+    stopped = stop_daemon(settings)
+    daemon = ensure_daemon(settings)
+    return {
+        "ok": True,
+        "stopped": stopped,
+        "daemon": daemon,
+    }

@@ -2,6 +2,25 @@
 
 本项目遵循语义化版本。
 
+## [0.4.2] - 2026-11-08
+
+### Added
+
+- 新增统一 `exec`/App Server usage normalizer 和 exec JSONL usage 解析。
+- 新增 `teamctl usage backfill --dry-run|--apply`，从已有日志幂等回填 token。
+- 新增 `/api/health` 的 Team Home、数据库路径、稳定数据库 ID 和 schema version。
+- 新增 daemon 配置指纹及 `teamctl daemon restart --if-idle`。
+- 新增 `CODEX_TEAM_MCP_ACCESS=full|read_only|off` 和
+  `CODEX_TEAM_ALLOWED_ROOTS` 访问边界。
+
+### Fixed
+
+- schema 升级到 12，记录 cache-write、reasoning、usage source 和 telemetry
+  完整性。
+- exec job 不再把可解析 usage 留为全 0；无证据字段保持缺失语义。
+- cache hit rate 在无 usage 时返回 unavailable，不再显示为 0%。
+- App Server 集成测试使用临时 `CODEX_HOME`，不再向日常 Codex 会话写入测试 thread。
+
 ## [0.4.1] - 2026-11-07
 
 ### Changed
