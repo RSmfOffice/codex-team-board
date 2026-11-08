@@ -2741,6 +2741,298 @@ class ClusterSchedulerTests(unittest.TestCase):
                 failed_cancel_job["job_id"],
             )
 
+    def test_app_server_cancel_persists_logged_usage_without_breaking_completion(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            repo = _repo(base, "interrupted-usage")
+            project = team.register_project(repo)
+            runtime = StubAppServerRuntime()
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime=runtime,
+                runtime_mode="app_server",
+            )
+            events = _ClusterAppServerEvents(manager)
+
+            usage_goal = manager.create_goal(
+                repo,
+                objective="Persist canceled turn usage",
+            )
+            usage_task = team.create_task(
+                repo,
+                title="Cancel with logged usage",
+                description="The job log already contains token usage.",
+                acceptance="Cancellation retains the latest usage snapshot.",
+                kind="read",
+                owner_role="team_explorer",
+                goal_id=usage_goal["goal_id"],
+            )
+            usage_job = manager._dispatch_worker(
+                manager.get_goal(usage_goal["goal_id"]),
+                team.get_task(usage_task["task_id"]),
+            )
+            events.on_token_usage_updated(
+                usage_job["thread_id"],
+                usage_job["turn_id"],
+                {
+                    "total": {
+                        "input": 120,
+                        "cached": 20,
+                        "output": 30,
+                        "context": 150,
+                    },
+                    "last": {
+                        "input": 50,
+                        "cached": 5,
+                        "output": 10,
+                        "context": 60,
+                    },
+                    "modelContextWindow": 200,
+                },
+            )
+            events.on_token_usage_updated(
+                usage_job["thread_id"],
+                usage_job["turn_id"],
+                {
+                    "total": {
+                        "input": 150,
+                        "cached": 25,
+                        "output": 34,
+                        "context": 184,
+                    },
+                    "last": {
+                        "input": 60,
+                        "cached": 6,
+                        "output": 12,
+                        "context": 72,
+                    },
+                    "modelContextWindow": 200,
+                },
+            )
+            team.claim_task(
+                usage_task["task_id"],
+                actor="interrupted-usage-test",
+            )
+            with manager._app_state_lock:
+                manager.app_turns[usage_job["job_id"]]["usage"] = {}
+                manager.app_turns[usage_job["job_id"]]["first_usage"] = {}
+            manager.cancel_goal(
+                usage_goal["goal_id"],
+                reason="usage recovery test",
+            )
+
+            with team.connection(write=False) as connection:
+                persisted = connection.execute(
+                    """
+                    SELECT status, input_tokens, cached_input_tokens,
+                           uncached_input_tokens, output_tokens,
+                           first_input_tokens, first_cached_input_tokens,
+                           first_uncached_input_tokens, context_tokens,
+                           model_context_window, usage_source,
+                           telemetry_complete
+                    FROM cluster_jobs
+                    WHERE job_id = ?
+                    """,
+                    (usage_job["job_id"],),
+                ).fetchone()
+            self.assertEqual(persisted["status"], "interrupted")
+            self.assertEqual(persisted["input_tokens"], 60)
+            self.assertEqual(persisted["cached_input_tokens"], 6)
+            self.assertEqual(persisted["uncached_input_tokens"], 54)
+            self.assertEqual(persisted["output_tokens"], 12)
+            self.assertEqual(persisted["first_input_tokens"], 50)
+            self.assertEqual(persisted["first_cached_input_tokens"], 5)
+            self.assertEqual(persisted["first_uncached_input_tokens"], 45)
+            self.assertEqual(persisted["context_tokens"], 72)
+            self.assertEqual(persisted["model_context_window"], 200)
+            self.assertEqual(
+                persisted["usage_source"],
+                "app_server.token_usage",
+            )
+            self.assertEqual(persisted["telemetry_complete"], 1)
+
+            dashboard = team.dashboard_snapshot(project["project_id"])
+            dashboard_job = next(
+                job
+                for job in dashboard["cluster_jobs"]
+                if job["job_id"] == usage_job["job_id"]
+            )
+            self.assertEqual(dashboard_job["input_tokens"], 60)
+            self.assertEqual(dashboard_job["output_tokens"], 12)
+
+            missing_goal = manager.create_goal(
+                repo,
+                objective="Cancel without token usage",
+            )
+            missing_task = team.create_task(
+                repo,
+                title="Cancel without usage",
+                description="No token usage event was produced.",
+                acceptance="Unavailable usage remains unavailable.",
+                kind="read",
+                owner_role="team_explorer",
+                goal_id=missing_goal["goal_id"],
+            )
+            missing_job = manager._dispatch_worker(
+                manager.get_goal(missing_goal["goal_id"]),
+                team.get_task(missing_task["task_id"]),
+            )
+            team.claim_task(
+                missing_task["task_id"],
+                actor="missing-usage-test",
+            )
+            manager.cancel_goal(
+                missing_goal["goal_id"],
+                reason="missing usage test",
+            )
+            with team.connection(write=False) as connection:
+                missing = connection.execute(
+                    """
+                    SELECT usage_source, model_context_window,
+                           telemetry_complete
+                    FROM cluster_jobs WHERE job_id = ?
+                    """,
+                    (missing_job["job_id"],),
+                ).fetchone()
+            self.assertIsNone(missing["usage_source"])
+            self.assertIsNone(missing["model_context_window"])
+            self.assertEqual(missing["telemetry_complete"], 0)
+            dashboard = team.dashboard_snapshot(project["project_id"])
+            missing_dashboard_job = next(
+                job
+                for job in dashboard["cluster_jobs"]
+                if job["job_id"] == missing_job["job_id"]
+            )
+            self.assertIsNone(missing_dashboard_job["input_tokens"])
+            self.assertIsNone(missing_dashboard_job["output_tokens"])
+
+            preserved_goal = manager.create_goal(
+                repo,
+                objective="Preserve existing usage",
+            )
+            preserved_task = team.create_task(
+                repo,
+                title="Cancel with existing usage",
+                description="The job already has valid usage but no new log.",
+                acceptance="Cancellation does not clear valid usage.",
+                kind="read",
+                owner_role="team_explorer",
+                goal_id=preserved_goal["goal_id"],
+            )
+            preserved_job = manager._dispatch_worker(
+                manager.get_goal(preserved_goal["goal_id"]),
+                team.get_task(preserved_task["task_id"]),
+            )
+            with team.connection() as connection:
+                connection.execute(
+                    """
+                    UPDATE cluster_jobs
+                    SET input_tokens = 9, cached_input_tokens = 4,
+                        uncached_input_tokens = 5, output_tokens = 3,
+                        usage_source = 'existing.valid', telemetry_complete = 1
+                    WHERE job_id = ?
+                    """,
+                    (preserved_job["job_id"],),
+                )
+            team.claim_task(
+                preserved_task["task_id"],
+                actor="preserved-usage-test",
+            )
+            manager.cancel_goal(
+                preserved_goal["goal_id"],
+                reason="preserved usage test",
+            )
+            with team.connection(write=False) as connection:
+                preserved = connection.execute(
+                    """
+                    SELECT input_tokens, cached_input_tokens,
+                           uncached_input_tokens, output_tokens,
+                           usage_source, telemetry_complete
+                    FROM cluster_jobs WHERE job_id = ?
+                    """,
+                    (preserved_job["job_id"],),
+                ).fetchone()
+            self.assertEqual(preserved["input_tokens"], 9)
+            self.assertEqual(preserved["cached_input_tokens"], 4)
+            self.assertEqual(preserved["uncached_input_tokens"], 5)
+            self.assertEqual(preserved["output_tokens"], 3)
+            self.assertEqual(preserved["usage_source"], "existing.valid")
+            self.assertEqual(preserved["telemetry_complete"], 1)
+
+            completed_goal = manager.create_goal(
+                repo,
+                objective="Complete with token usage",
+            )
+            completed_task = team.create_task(
+                repo,
+                title="Complete normally",
+                description="Normal completion still records token usage.",
+                acceptance="Normal completion usage is unchanged.",
+                kind="read",
+                owner_role="team_explorer",
+                goal_id=completed_goal["goal_id"],
+            )
+            completed_job = manager._dispatch_worker(
+                manager.get_goal(completed_goal["goal_id"]),
+                team.get_task(completed_task["task_id"]),
+            )
+            events.on_token_usage_updated(
+                completed_job["thread_id"],
+                completed_job["turn_id"],
+                {
+                    "total": {
+                        "input": 100,
+                        "cached": 10,
+                        "output": 20,
+                        "context": 120,
+                    },
+                    "last": {
+                        "input": 40,
+                        "cached": 4,
+                        "output": 8,
+                        "context": 48,
+                    },
+                    "modelContextWindow": 200,
+                },
+            )
+            events.on_turn_completed(
+                completed_job["thread_id"],
+                completed_job["turn_id"],
+                {
+                    "id": completed_job["turn_id"],
+                    "status": "completed",
+                },
+            )
+            with team.connection() as connection:
+                connection.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'review', updated_at = ?, version = version + 1
+                    WHERE task_id = ?
+                    """,
+                    (utc_now(), completed_task["task_id"]),
+                )
+            manager._reconcile_jobs()
+            with team.connection(write=False) as connection:
+                completed = connection.execute(
+                    """
+                    SELECT status, input_tokens, cached_input_tokens,
+                           output_tokens, telemetry_complete
+                    FROM cluster_jobs WHERE job_id = ?
+                    """,
+                    (completed_job["job_id"],),
+                ).fetchone()
+            self.assertEqual(completed["status"], "completed")
+            self.assertEqual(completed["input_tokens"], 40)
+            self.assertEqual(completed["cached_input_tokens"], 4)
+            self.assertEqual(completed["output_tokens"], 8)
+            self.assertEqual(completed["telemetry_complete"], 1)
+
     def test_daemon_restart_marks_app_server_turn_lost_and_recovers_task(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
