@@ -619,16 +619,18 @@ $env:CODEX_TEAM_MODEL_PROVIDER = ""   # 可选
 默认的 `app_server` 模式由 `ClusterManager` 持有私有 App Server 进程。新 thread 使用
 `thread/start`，已存储且满足复用规则的 thread 使用 `thread/resume`，每次派发
 通过 `turn/start` 提交当前 goal/task。稳定 `developerInstructions` 以
-`Stable Team Context` 开头，包含项目 ID、项目根目录、角色和 workstream；不含
-goal ID、task ID、时间戳或日志路径。角色约束保持稳定，动态 board 和任务内容
-只放在后续 turn 中。`turn/start` 的 `cwd` 始终是当前执行 worktree，因此同一
-thread 可以从一个 write worktree 安全切换到另一个 worktree，sandbox policy
-按当前任务重算。
+`Managed Agent Role Contract` 开头，角色约束在前，随后才是稳定 Thread Scope；
+Thread Scope 包含项目 ID、项目根目录和 workstream，不含 goal ID、task ID、
+时间戳或日志路径。动态 board 和任务内容只放在后续 turn 中。`turn/start` 的
+`cwd` 始终是当前执行 worktree，因此同一 thread 可以从一个 write worktree
+安全切换到另一个 worktree，sandbox policy 按当前任务重算。
 
 App Server 的 `tokenUsage` 同时保留线程累计 `total` 和本轮 `last`。job 的
-input、cached、uncached、output 优先记录 `last`；只有 `last` 缺失时才使用
-同一 Agent 的累计差值兜底。这样跨 turn 复用不会把历史 input 或 output 重复
-计入单轮成本，同时仍保留 total 供诊断。
+input、cached、uncached、output 优先记录本 job 的 final `total` 与该 Agent
+thread 既有 baseline 的差值；只有 `total` 没有 token 证据时才回退 `last`。
+`usage_missing_fields` 保存字段级缺失信息，Dashboard 将未知字段展示为 null，
+不会把缺失 cached/output 伪造成 0。成功但 baseline 不完整的 thread 会被
+标记为 `failed/needs_reset`，不会进入复用池污染下一 job 的累计差值。
 
 `workstream_key` 是项目内连续性作用域；省略时默认使用当前 `goal_id`。默认复用
 策略为：

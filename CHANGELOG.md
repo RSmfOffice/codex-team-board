@@ -21,13 +21,20 @@
 ### Added
 
 - `cluster_goals` 新增持久 `checkpoint_summary` 与 `checkpoint_updated_at`。
+- `cluster_agents` 新增 `profile`，旧/NULL thread 迁移为 `legacy` 且禁止被
+  `v0.5` 架构自动复用。
+- `cluster_jobs` 新增 `usage_missing_fields`，区分显式 0、缺失字段和无 usage
+  证据；未知成本在 service/dashboard 投影为 null。
 - 新增 MCP `team_goal_set_checkpoint`。
 - 新增 CLI `cluster checkpoint <goal-id> --summary|--summary-file`。
 - fresh Worker 会继承同 project/workstream 的最近 checkpoint。
+- App Server job 成本使用 final `total` delta，并保留 JSONL usage 以修复取消、
+  超时和中断前未落库的成本。
 
 ### Database
 
-- schema 升级到 13；`TeamService` 启动时执行真实迁移并新增 checkpoint 列，
+- schema 升级到 15；`TeamService` 启动时执行真实迁移并新增 checkpoint、
+  Agent profile 与 usage presence 列，
   不删除已有数据。
 - `/api/health` 的 `schema_version` 改为读取不可回退的
   `schema_migrations` 账本并兼容 `PRAGMA user_version`，不再只返回代码常量，
@@ -37,6 +44,8 @@
 
 - 已归档 goal 仍可提供同 project/workstream 的最近 checkpoint；归档继续只承担
   页面整理职责，不会切断 Agent 的持久上下文。
+- partial/unknown usage 的成功 App Server job 会隔离对应 Agent thread，避免
+  未知 baseline 污染后续复用任务的成本归属。
 
 ## [0.4.2] - 2026-11-08
 
