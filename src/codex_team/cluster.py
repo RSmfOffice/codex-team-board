@@ -631,8 +631,8 @@ class ClusterManager:
                 dict(row)
                 for row in connection.execute(
                     """
-                    SELECT job_id, pid, role, task_id, agent_id, thread_id,
-                           turn_id, runtime
+                    SELECT job_id, goal_id, pid, role, task_id, agent_id,
+                           thread_id, turn_id, runtime
                     FROM cluster_jobs
                     WHERE goal_id = ? AND status IN ('starting', 'running')
                     """,
@@ -3380,10 +3380,13 @@ Do not return raw logs or a full transcript.
         try:
             self.runtime.interrupt_turn(thread_id, turn_id)
         except Exception as exc:
+            event_goal_id = str(job.get("goal_id") or "")
+            if not event_goal_id:
+                return
             with self.team.connection() as connection:
                 self._event(
                     connection,
-                    str(job["goal_id"]),
+                    event_goal_id,
                     "app_server_interrupt_failed",
                     "teamd",
                     {

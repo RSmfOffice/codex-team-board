@@ -2623,6 +2623,49 @@ class ClusterSchedulerTests(unittest.TestCase):
             canceled_job = manager.get_goal(cancel_goal["goal_id"])["jobs"][0]
             self.assertEqual(canceled_job["status"], "interrupted")
 
+            failed_cancel_goal = manager.create_goal(
+                repo,
+                objective="Cancel after interrupt failure",
+            )
+            failed_cancel_task = team.create_task(
+                repo,
+                title="Cancel failed interrupt",
+                description="Interrupt failure must not block cancellation.",
+                acceptance="The job converges and failure is audited.",
+                kind="read",
+                owner_role="team_explorer",
+                goal_id=failed_cancel_goal["goal_id"],
+            )
+            failed_cancel_job = manager._dispatch_worker(
+                manager.get_goal(failed_cancel_goal["goal_id"]),
+                team.get_task(failed_cancel_task["task_id"]),
+            )
+            with patch.object(
+                runtime,
+                "interrupt_turn",
+                side_effect=RuntimeError("thread not found"),
+            ):
+                failed_cancel = manager.cancel_goal(
+                    failed_cancel_goal["goal_id"],
+                    reason="interrupt failure test",
+                )
+            self.assertEqual(failed_cancel["status"], "failed")
+            converged_job = next(
+                job
+                for job in failed_cancel["jobs"]
+                if job["job_id"] == failed_cancel_job["job_id"]
+            )
+            self.assertEqual(converged_job["status"], "interrupted")
+            interrupt_event = next(
+                event
+                for event in failed_cancel["events"]
+                if event["event_type"] == "app_server_interrupt_failed"
+            )
+            self.assertEqual(
+                interrupt_event["data"]["job_id"],
+                failed_cancel_job["job_id"],
+            )
+
     def test_daemon_restart_marks_app_server_turn_lost_and_recovers_task(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
