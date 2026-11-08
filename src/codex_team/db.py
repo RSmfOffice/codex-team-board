@@ -5,7 +5,7 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
@@ -148,6 +148,7 @@ CREATE TABLE IF NOT EXISTS cluster_agents (
     workstream_key TEXT NOT NULL,
     display_name TEXT NOT NULL,
     thread_id TEXT NOT NULL UNIQUE,
+    profile TEXT NOT NULL DEFAULT 'legacy',
     status TEXT NOT NULL CHECK(status IN (
         'starting', 'busy', 'loaded', 'idle', 'stored',
         'superseded', 'failed'
@@ -300,6 +301,10 @@ CLUSTER_JOB_MIGRATION_COLUMNS = {
     "telemetry_complete": "INTEGER NOT NULL DEFAULT 0",
 }
 
+CLUSTER_AGENT_MIGRATION_COLUMNS = {
+    "profile": "TEXT NOT NULL DEFAULT 'legacy'",
+}
+
 
 def utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -392,6 +397,24 @@ def _upgrade_schema(connection: sqlite3.Connection) -> None:
             connection.execute(
                 f"ALTER TABLE cluster_jobs ADD COLUMN {name} {declaration}"
             )
+    cluster_agent_columns = {
+        row["name"]
+        for row in connection.execute(
+            "PRAGMA table_info(cluster_agents)"
+        ).fetchall()
+    }
+    for name, declaration in CLUSTER_AGENT_MIGRATION_COLUMNS.items():
+        if name not in cluster_agent_columns:
+            connection.execute(
+                f"ALTER TABLE cluster_agents ADD COLUMN {name} {declaration}"
+            )
+    connection.execute(
+        """
+        UPDATE cluster_agents
+        SET profile = 'legacy'
+        WHERE profile IS NULL OR TRIM(profile) = ''
+        """
+    )
     _backfill_goal_archive_tasks(connection)
 
 

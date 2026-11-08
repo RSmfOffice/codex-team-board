@@ -21,7 +21,7 @@ from codex_team.cluster import (
     _redact_sensitive_log,
     _stable_developer_instructions,
 )
-from codex_team.agent_pool import AgentPool
+from codex_team.agent_pool import CURRENT_AGENT_PROFILE, AgentPool
 from codex_team.app_server import AppServerEvents, AppServerRuntime
 from codex_team.cli import build_parser
 from codex_team.config import Settings
@@ -1635,6 +1635,81 @@ class ClusterSchedulerTests(unittest.TestCase):
                     self.assertEqual(runtime.resume_threads, [])
                     self.assertEqual(dispatched["thread_id"], "stub-thread-1")
                     self.assertEqual(len(runtime.start_threads), 1)
+
+    def test_legacy_idle_lead_is_replaced_before_current_profile_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            repo = _repo(base, "legacy-profile-lead")
+            project = team.init_project(repo)
+            runtime = StubAppServerRuntime()
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime=runtime,
+                runtime_mode="app_server",
+                lead_cooldown_seconds=0,
+            )
+            goal = manager.create_goal(
+                repo,
+                objective="Replace legacy profile",
+                workstream_key="profile-workstream",
+            )
+            pool = AgentPool(settings)
+            legacy = pool.register_thread(
+                project["project_id"],
+                "lead",
+                "profile-workstream",
+                "legacy-profile-thread",
+                manager.model,
+                manager.model_provider,
+                "legacy profile lead",
+            )
+            with team.connection() as connection:
+                connection.execute(
+                    """
+                    UPDATE cluster_agents SET profile = 'legacy'
+                    WHERE agent_id = ?
+                    """,
+                    (legacy["agent_id"],),
+                )
+                connection.execute(
+                    """
+                    UPDATE cluster_goals
+                    SET lead_thread_id = ?, updated_at = ?
+                    WHERE goal_id = ?
+                    """,
+                    (legacy["thread_id"], utc_now(), goal["goal_id"]),
+                )
+
+            first = manager._dispatch_lead(
+                manager.get_goal(goal["goal_id"]),
+                [],
+            )
+            self.assertEqual(runtime.resume_threads, [])
+            self.assertNotEqual(first["thread_id"], legacy["thread_id"])
+            manager.app_turns[first["job_id"]]["status"] = "completed"
+            manager._reconcile_jobs()
+
+            agents = pool.list_agents(project["project_id"])
+            old_agent = next(
+                agent for agent in agents if agent["agent_id"] == legacy["agent_id"]
+            )
+            current_agent = next(
+                agent for agent in agents if agent["thread_id"] == first["thread_id"]
+            )
+            self.assertEqual(old_agent["status"], "idle")
+            self.assertEqual(old_agent["profile"], "legacy")
+            self.assertEqual(current_agent["profile"], CURRENT_AGENT_PROFILE)
+
+            second = manager._dispatch_lead(
+                manager.get_goal(goal["goal_id"]),
+                [],
+            )
+            self.assertEqual(second["thread_id"], first["thread_id"])
+            self.assertEqual(len(runtime.start_threads), 1)
+            self.assertEqual(runtime.resume_threads, [first["thread_id"]])
 
     def test_selected_lead_resume_failure_marks_old_agent_and_starts_fresh_once(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

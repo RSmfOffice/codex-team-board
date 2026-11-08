@@ -10,8 +10,12 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
-from codex_team.agent_pool import AgentPool, AgentPoolError
-from codex_team.db import connect, utc_now
+from codex_team.agent_pool import (
+    CURRENT_AGENT_PROFILE,
+    AgentPool,
+    AgentPoolError,
+)
+from codex_team.db import SCHEMA_VERSION, connect, utc_now
 
 
 class AgentPoolTests(unittest.TestCase):
@@ -213,6 +217,136 @@ class AgentPoolTests(unittest.TestCase):
             "P1", "team_explorer", "other", "reuse", "read", "model-a", "provider-a"
         )
         self.assertEqual(selected_scoped["agent_id"], scoped["agent_id"])
+
+    def test_agent_profile_migration_is_idempotent(self) -> None:
+        path = Path(self.temporary.name) / "profile-migration.sqlite"
+        now = utc_now()
+        with closing(connect(path)) as connection:
+            self.assertEqual(SCHEMA_VERSION, 14)
+            connection.execute("ALTER TABLE cluster_agents DROP COLUMN profile")
+            connection.execute(
+                "DELETE FROM schema_migrations WHERE version = ?",
+                (SCHEMA_VERSION,),
+            )
+            connection.execute("PRAGMA user_version = 13")
+            connection.execute(
+                """
+                INSERT INTO projects(
+                    project_id, name, root_path, created_at, updated_at
+                ) VALUES ('P-PROFILE', 'Profile', ?, ?, ?)
+                """,
+                (str(path.parent / "profile-project"), now, now),
+            )
+            connection.execute(
+                """
+                INSERT INTO cluster_agents(
+                    agent_id, project_id, role, workstream_key, display_name,
+                    thread_id, status, created_at, updated_at
+                ) VALUES (
+                    'A-LEGACY', 'P-PROFILE', 'lead', 'main', 'Legacy Lead',
+                    'legacy-thread', 'idle', ?, ?
+                )
+                """,
+                (now, now),
+            )
+            connection.commit()
+
+        for _ in range(2):
+            with closing(connect(path)) as upgraded:
+                row = upgraded.execute(
+                    """
+                    SELECT profile FROM cluster_agents
+                    WHERE agent_id = 'A-LEGACY'
+                    """
+                ).fetchone()
+                self.assertEqual(row["profile"], "legacy")
+                self.assertEqual(
+                    upgraded.execute("PRAGMA user_version").fetchone()[0],
+                    SCHEMA_VERSION,
+                )
+                self.assertEqual(
+                    upgraded.execute(
+                        """
+                        SELECT COUNT(*) FROM schema_migrations
+                        WHERE version = ?
+                        """,
+                        (SCHEMA_VERSION,),
+                    ).fetchone()[0],
+                    1,
+                )
+
+    def test_selection_requires_current_profile_for_explicit_reuse(self) -> None:
+        legacy = self.register(thread_id="legacy-profile")
+        self.assertEqual(legacy["profile"], CURRENT_AGENT_PROFILE)
+        with closing(connect(self.db_path)) as connection:
+            connection.execute(
+                """
+                UPDATE cluster_agents SET profile = 'legacy'
+                WHERE agent_id = ?
+                """,
+                (legacy["agent_id"],),
+            )
+            connection.commit()
+
+        self.assertIsNone(
+            self.pool.select_agent(
+                "P1",
+                "team_explorer",
+                "main",
+                "reuse",
+                "read",
+                "model-a",
+                "provider-a",
+            )
+        )
+
+        current = self.register(thread_id="current-profile")
+        selected = self.pool.select_agent(
+            "P1",
+            "team_explorer",
+            "main",
+            "reuse",
+            "read",
+            "model-a",
+            "provider-a",
+        )
+        self.assertEqual(selected["agent_id"], current["agent_id"])
+        self.assertEqual(selected["profile"], CURRENT_AGENT_PROFILE)
+
+    def test_null_profile_is_migrated_and_not_reused(self) -> None:
+        agent = self.register(thread_id="null-profile")
+        with closing(connect(self.db_path)) as connection:
+            connection.execute("ALTER TABLE cluster_agents DROP COLUMN profile")
+            connection.execute("ALTER TABLE cluster_agents ADD COLUMN profile TEXT")
+            connection.execute(
+                """
+                UPDATE cluster_agents SET profile = NULL
+                WHERE agent_id = ?
+                """,
+                (agent["agent_id"],),
+            )
+            connection.commit()
+
+        self.assertIsNone(
+            self.pool.select_agent(
+                "P1",
+                "team_explorer",
+                "main",
+                "reuse",
+                "read",
+                "model-a",
+                "provider-a",
+            )
+        )
+        with closing(connect(self.db_path)) as connection:
+            row = connection.execute(
+                """
+                SELECT profile FROM cluster_agents
+                WHERE agent_id = ?
+                """,
+                (agent["agent_id"],),
+            ).fetchone()
+        self.assertEqual(row["profile"], "legacy")
 
     def test_selects_least_recently_used_idle_agent(self) -> None:
         older = self.register(thread_id="older")
@@ -514,6 +648,7 @@ class AgentPoolTests(unittest.TestCase):
         first = self.register(thread_id="stable-thread")
         second = self.register(thread_id="stable-thread")
         self.assertEqual(first, second)
+        self.assertEqual(first["profile"], CURRENT_AGENT_PROFILE)
         self.assertEqual(len(self.agent_events(first["agent_id"])), 1)
         with self.assertRaisesRegex(AgentPoolError, "different agent metadata"):
             self.register(thread_id="stable-thread", role="team_reviewer")
