@@ -10,7 +10,13 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from . import __version__
-from .cluster import ClusterError, ClusterManager, daemon_status, ensure_daemon
+from .cluster import (
+    ClusterError,
+    ClusterManager,
+    daemon_identity,
+    daemon_status,
+    ensure_daemon,
+)
 from .config import Settings
 from .db import SCHEMA_VERSION, utc_now
 from .service import TeamError, TeamService
@@ -28,6 +34,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
     server_version = "CodexTeamBoard/" + __version__
     team_service: TeamService
 
+    def _cluster_runtime(self) -> dict[str, object]:
+        status = daemon_status(self.team_service.settings)
+        state = status.get("state")
+        state_identity = state.get("identity") if isinstance(state, dict) else None
+        expected = status.get("expected_identity")
+        identity = (
+            state_identity
+            if isinstance(state_identity, dict)
+            else expected
+            if isinstance(expected, dict)
+            else daemon_identity(self.team_service.settings)
+        )
+        runtime = str(identity.get("runtime") or "app_server")
+        return {
+            "runtime": runtime,
+            "thread_reuse": runtime == "app_server",
+            "running": bool(status.get("running")),
+            "config_mismatch": bool(status.get("config_mismatch")),
+            "version": identity.get("version"),
+        }
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlsplit(self.path)
         if parsed.path == "/favicon.ico":
@@ -40,6 +67,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/health":
             database = self.team_service.settings.db_path.resolve()
+            cluster_runtime = self._cluster_runtime()
             self._send_json(
                 {
                     "ok": True,
@@ -53,6 +81,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         str(database).casefold().encode("utf-8")
                     ).hexdigest()[:16],
                     "schema_version": SCHEMA_VERSION,
+                    "cluster_runtime": cluster_runtime,
                     "generated_at": utc_now(),
                 }
             )
@@ -74,12 +103,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             query = parse_qs(parsed.query)
             project_id = query.get("project_id", [""])[0] or None
             include_archived = query.get("include_archived", ["0"])[0] in {"1", "true"}
-            self._send_json(
-                self.team_service.dashboard_snapshot(
-                    project_id,
-                    include_archived=include_archived,
-                )
+            data = self.team_service.dashboard_snapshot(
+                project_id,
+                include_archived=include_archived,
             )
+            data["cluster_runtime"] = self._cluster_runtime()
+            self._send_json(data)
             return
         self._send_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 

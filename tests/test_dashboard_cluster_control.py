@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 import threading
@@ -110,6 +111,23 @@ class DashboardClusterControlTests(unittest.TestCase):
         self.assertEqual(goal["max_worker_attempts"], 4)
         self.assertEqual(goal["max_lead_attempts"], 6)
         start_daemon.assert_called_once_with(self.settings)
+
+    def test_dashboard_exposes_default_thread_reuse_runtime(self) -> None:
+        with patch.dict(os.environ, {"CODEX_TEAM_AGENT_RUNTIME": ""}):
+            health = self.get("/api/health")
+            board = self.get("/api/board")
+
+        self.assertEqual(
+            health["cluster_runtime"],
+            {
+                "runtime": "app_server",
+                "thread_reuse": True,
+                "running": False,
+                "config_mismatch": False,
+                "version": "0.4.2",
+            },
+        )
+        self.assertEqual(board["cluster_runtime"], health["cluster_runtime"])
 
     def test_control_cluster_goal_pause_resume_and_cancel(self) -> None:
         cluster = ClusterManager(self.settings, team=self.team)

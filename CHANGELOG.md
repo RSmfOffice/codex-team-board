@@ -15,6 +15,18 @@
 - 新增托管 Agent 专用 `CODEX_HOME`，只同步模型配置和认证白名单，不读取用户
   日常 sessions，避免子 Agent 出现在主侧边栏。
 
+### Changed
+
+- Agent 集群 runtime 默认切换为 `app_server` thread reuse；未设置环境变量时
+  启用持久 thread，显式 `CODEX_TEAM_AGENT_RUNTIME=exec` 可回退。
+- WebUI 顶部 RUNTIME 指标和任务卡 runtime badge 显示 thread reuse / fresh exec；
+  `/api/health` 与 `/api/board` 返回 daemon 实际 runtime。
+- 新增 tag 触发的 GitHub Release workflow，自动校验版本、运行测试、构建
+  `v0.4.2` 便携包并上传 ZIP/SHA256。
+- 8 组交叉顺序微探针验证连续 thread 第二轮 cache hit 平均提高约 `0.58pp`，
+  8/8 配对为正；write Worker 的 fresh/reuse 安全边界保持不变。
+- `pyproject.toml`、运行时版本、健康接口和发布包版本统一为 `0.4.2`。
+
 ### Fixed
 
 - schema 升级到 12，记录 cache-write、reasoning、usage source 和 telemetry

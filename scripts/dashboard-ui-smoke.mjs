@@ -233,6 +233,7 @@ const firstBoard = {
       kind: "worker",
       role: "team_worker",
       status: "running",
+      runtime: "app_server",
       thread_id: "thread-task-1",
       turn_id: "turn-3",
       cached_input_tokens: 1500,
@@ -269,6 +270,13 @@ const firstBoard = {
     heartbeat_overdue: 2,
     oldest_heartbeat_age_seconds: 960,
     fairness_wait_count: 1,
+  },
+  cluster_runtime: {
+    runtime: "app_server",
+    thread_reuse: true,
+    running: true,
+    config_mismatch: false,
+    version: "0.4.2",
   },
   cluster_goals: [
     {
@@ -520,10 +528,13 @@ const agentThreadHtml = fakeElements.get("agent-thread-list").innerHTML;
 const taskCardHtml = fakeElements.get("cards-ready").innerHTML;
 assert.match(summaryHtml, /data-metric="jobs"/);
 assert.match(summaryHtml, /data-metric="queued"/);
+assert.match(summaryHtml, /data-metric="runtime"/);
 assert.match(summaryHtml, /data-metric="heartbeat-overdue"/);
 assert.match(summaryHtml, /2\/6/);
 assert.match(summaryHtml, /QUEUED/);
 assert.match(summaryHtml, /HB OVERDUE/);
+assert.match(summaryHtml, /RUNTIME/);
+assert.match(summaryHtml, /复用 Thread/);
 assert.match(summaryHtml, /公平等待 1/);
 assert.match(summaryHtml, /最老 16 分钟/);
 assert.match(summaryHtml, /data-metric="attention"/);
@@ -580,6 +591,7 @@ assert.match(agentThreadHtml, /已归档不可重置/);
 assert.match(agentThreadHtml, /data-agent-archived="true"/);
 assert.doesNotMatch(agentThreadHtml, /conversation|transcript/i);
 assert.match(taskCardHtml, /thread thread-task-1/);
+assert.match(taskCardHtml, /thread reuse/);
 assert.match(taskCardHtml, /turn turn-3/);
 assert.match(taskCardHtml, /cache 75%/);
 assert.match(taskCardHtml, /1,500 cached/);
@@ -657,6 +669,7 @@ const metrics = Object.fromEntries(
 assert.deepEqual(metrics, {
   jobs: "2/6",
   queued: 2,
+  runtime: "app_server",
   "heartbeat-overdue": 2,
   goals: 5,
   active: 2,
@@ -677,6 +690,7 @@ assert.equal(
   "worker slots must fall back to active worker jobs",
 );
 assert.equal(compatibilityMetrics.leads, 1);
+assert.equal(compatibilityMetrics.runtime, "app_server");
 assert.equal(hooks.goalHealth(firstBoard.cluster_goals[0]).attention, true);
 assert.deepEqual(
   JSON.parse(JSON.stringify(

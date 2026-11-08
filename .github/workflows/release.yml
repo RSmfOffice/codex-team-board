@@ -1,0 +1,67 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Validate version and tests
+        shell: powershell
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $version = $tag.TrimStart("v")
+          $projectVersion = (
+            Select-String -LiteralPath .\pyproject.toml `
+              -Pattern '^version = "([^"]+)"$'
+          ).Matches.Groups[1].Value
+          $runtimeVersion = (
+            Select-String -LiteralPath .\src\codex_team\__init__.py `
+              -Pattern '^__version__ = "([^"]+)"$'
+          ).Matches.Groups[1].Value
+          if ($projectVersion -ne $version -or $runtimeVersion -ne $version) {
+            throw "tag/version mismatch: tag=$version pyproject=$projectVersion runtime=$runtimeVersion"
+          }
+          if (!(Test-Path -LiteralPath ".\release-notes\$tag.md")) {
+            throw "release notes not found for $tag"
+          }
+          $env:PYTHONPATH = ".\src"
+          python -m py_compile .\src\codex_team\*.py
+          python -m unittest discover -s tests -v
+
+      - name: Build portable dashboard package
+        shell: powershell
+        run: |
+          powershell.exe -NoProfile -ExecutionPolicy Bypass `
+            -File .\scripts\build-release.ps1
+
+      - name: Publish GitHub Release
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $version = $tag.TrimStart("v")
+          gh release create $tag `
+            --verify-tag `
+            --latest `
+            --title "Codex Team Board $tag" `
+            --notes-file ".\release-notes\$tag.md" `
+            ".\dist\codex-team-board-v$version.zip" `
+            ".\dist\codex-team-board-v$version.sha256"

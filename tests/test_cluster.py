@@ -1441,35 +1441,43 @@ class ClusterSchedulerTests(unittest.TestCase):
                 event_handler=events,
                 env={"CODEX_HOME": str(isolated_codex_home)},
             )
-            self.addCleanup(runtime.stop)
-            started = runtime.start()
-            self.assertTrue(started["healthy"])
-            thread_id = runtime.start_thread(
-                workspace,
-                developer_instructions="Stable integration test instructions.",
-                service_name="codex-team-integration-test",
-            )
-            self.assertIn(thread_id, runtime.list_loaded_threads())
-            turn = runtime.start_turn(
-                thread_id,
-                "Reply with exactly OK. Do not inspect files.",
-                cwd=workspace,
-                sandbox_mode="read-only",
-            )
-            _wait_for(completed.is_set, timeout=90.0)
-            self.assertIn("completed", events.turn_statuses)
-            self.assertTrue(events.token_usage)
-            self.assertTrue(
-                all(
-                    {"total", "last", "modelContextWindow"} <= set(usage)
-                    for usage in events.token_usage
+            try:
+                started = runtime.start()
+                self.assertTrue(started["healthy"])
+                thread_id = runtime.start_thread(
+                    workspace,
+                    developer_instructions="Stable integration test instructions.",
+                    service_name="codex-team-integration-test",
                 )
-            )
-            self.assertEqual(runtime.unsubscribe_thread(thread_id), "unsubscribed")
-            resumed = runtime.resume_thread(thread_id)
-            self.assertEqual(resumed, thread_id)
-            self.assertIn(thread_id, runtime.list_loaded_threads())
-            self.assertEqual(runtime.unsubscribe_thread(thread_id), "unsubscribed")
+                self.assertIn(thread_id, runtime.list_loaded_threads())
+                runtime.start_turn(
+                    thread_id,
+                    "Reply with exactly OK. Do not inspect files.",
+                    cwd=workspace,
+                    sandbox_mode="read-only",
+                )
+                _wait_for(completed.is_set, timeout=90.0)
+                self.assertIn("completed", events.turn_statuses)
+                self.assertTrue(events.token_usage)
+                self.assertTrue(
+                    all(
+                        {"total", "last", "modelContextWindow"} <= set(usage)
+                        for usage in events.token_usage
+                    )
+                )
+                self.assertEqual(
+                    runtime.unsubscribe_thread(thread_id),
+                    "unsubscribed",
+                )
+                resumed = runtime.resume_thread(thread_id)
+                self.assertEqual(resumed, thread_id)
+                self.assertIn(thread_id, runtime.list_loaded_threads())
+                self.assertEqual(
+                    runtime.unsubscribe_thread(thread_id),
+                    "unsubscribed",
+                )
+            finally:
+                runtime.stop()
 
     def test_context_overflow_resets_agent_and_retries_new_thread_once(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2792,7 +2800,9 @@ class ClusterSchedulerTests(unittest.TestCase):
                 ],
             )
 
-    def test_default_runtime_is_exec_and_workstream_contract_is_persisted(self) -> None:
+    def test_default_runtime_is_app_server_and_workstream_contract_is_persisted(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
             settings = _settings(base)
@@ -2801,7 +2811,7 @@ class ClusterSchedulerTests(unittest.TestCase):
                     settings,
                     team=TeamService(settings),
                 )
-            self.assertEqual(manager.agent_runtime, "exec")
+            self.assertEqual(manager.agent_runtime, "app_server")
             repo = _repo(base, "workstream")
             goal = manager.create_goal(
                 repo,
@@ -2836,6 +2846,20 @@ class ClusterSchedulerTests(unittest.TestCase):
                 continuity_reason="renamed scope remains related",
             )
             self.assertEqual(updated["workstream_key"], "renamed-feature")
+
+    def test_explicit_exec_runtime_can_disable_thread_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = _settings(Path(temporary))
+            with patch.dict(
+                os.environ,
+                {"CODEX_TEAM_AGENT_RUNTIME": "exec"},
+            ):
+                manager = ClusterManager(
+                    settings,
+                    team=TeamService(settings),
+                )
+            self.assertEqual(manager.agent_runtime, "exec")
+            self.assertIsNone(manager.runtime)
 
     def test_cli_and_mcp_expose_continuity_and_agent_controls(self) -> None:
         parser = build_parser()

@@ -135,7 +135,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 
 如果仍需联动上下文插件，追加
 `-ContextMeterRoot "D:\path\to\codex-context-meter"`。安装完成后重新打开 Codex，
-并确认健康接口返回 `"version": "0.4.1"`：
+并确认健康接口返回 `"version": "0.4.2"`：
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8765/api/health
@@ -606,16 +606,17 @@ ready/review/blocked ──取消──→ canceled
 
 ### Agent runtime、workstream 与缓存复用
 
-调度器默认使用 `exec`，不会因为已安装 App Server Runtime 就改变现有行为。
-需要持久 Agent thread 时，在启动 `teamd` 的环境中显式启用：
+调度器默认使用 `app_server` 持久 Agent thread。未设置
+`CODEX_TEAM_AGENT_RUNTIME` 或设置为空时都会启用 thread 复用；需要完全关闭
+持久 thread、改用独立进程时，显式设置为 `exec`：
 
 ```powershell
-$env:CODEX_TEAM_AGENT_RUNTIME = "app_server"
+$env:CODEX_TEAM_AGENT_RUNTIME = "exec"
 $env:CODEX_TEAM_MODEL = ""            # 可选；空值使用 Codex 默认模型
 $env:CODEX_TEAM_MODEL_PROVIDER = ""   # 可选
 ```
 
-`app_server` 模式由 `ClusterManager` 持有私有 App Server 进程。新 thread 使用
+默认的 `app_server` 模式由 `ClusterManager` 持有私有 App Server 进程。新 thread 使用
 `thread/start`，已存储且满足复用规则的 thread 使用 `thread/resume`，每次派发
 通过 `turn/start` 提交当前 goal/task。稳定 `developerInstructions` 以
 `Stable Team Context` 开头，包含项目 ID、项目根目录、角色和 workstream；不含
@@ -705,7 +706,9 @@ goal 进入 failed，Worker 第二次仍溢出时任务进入 blocked 并记录�
 
 ### A/B 缓存基准
 
-A/B 默认 exec 作为基线，`app_server` 为需要显式开启的实验变体。
+基准仍以 fresh `exec` 作为对照、`app_server` thread reuse 作为复用变体；
+当前生产默认已经使用 `app_server`，设置 `CODEX_TEAM_AGENT_RUNTIME=exec`
+可以恢复对照路径。
 `scripts/agent-cache-benchmark.py` 接受 fresh/reuse 的 JSON 或 JSONL 观测，
 仅用成功任务计算 token 和延迟中位数，同时用全部样本计算成功率。主指标是
 成功任务的 `last_uncached_input_tokens` 中位数；`last_*` 全部保留，
@@ -733,8 +736,9 @@ python .\scripts\agent-cache-benchmark.py `
 - 成功任务的 median `last_uncached_input_tokens` 相对 fresh 降低至少 10%；
 - 成功任务的 median 首轮延迟相对 fresh 降低至少 20%。
 
-基准结果是实验证据，不会自动切换 runtime 或修改配置。默认仍为 `exec`；
-小样本结果不能作为生产默认切换到 `app_server` 的依据。
+8 组交叉顺序微探针显示，复用同一 `app_server` thread 的第二轮 cache hit
+平均高约 `0.58pp`，8/8 配对为正。该收益仅限连续 thread 的后续 turn；
+无关新任务和默认 write Worker 仍按 fresh 规则隔离。
 
 ### 多集群容量与公平调度
 
@@ -777,7 +781,7 @@ Agent runtime 与模型配置：
 
 | 环境变量 | 默认值 | 合法值/作用 |
 | --- | --- | --- |
-| `CODEX_TEAM_AGENT_RUNTIME` | `exec` | `exec` 或 `app_server`；只有 `app_server` 启用持久 thread |
+| `CODEX_TEAM_AGENT_RUNTIME` | `app_server` | `app_server` 启用持久 thread；显式设为 `exec` 可关闭复用 |
 | `CODEX_TEAM_AGENT_CODEX_HOME` | `<CODEX_TEAM_HOME>\agent-codex-home` | 托管 Agent 专用 Codex Home；同步 `config.toml`、`auth.json`、`models.json`，不复制用户 sessions |
 | `CODEX_TEAM_MODEL` | 空 | 可选模型覆盖；空值使用 Codex 默认模型 |
 | `CODEX_TEAM_MODEL_PROVIDER` | 空 | 可选 provider 覆盖；必须与 AgentPool 身份匹配 |
@@ -807,7 +811,8 @@ $env:CODEX_TEAM_WORKER_TIMEOUT_SECONDS = "7200"
 $env:CODEX_TEAM_LEAD_TIMEOUT_SECONDS = "2700"
 $env:CODEX_TEAM_HEARTBEAT_WARNING_SECONDS = "300"
 $env:CODEX_TEAM_HEARTBEAT_CRITICAL_SECONDS = "900"
-$env:CODEX_TEAM_AGENT_RUNTIME = "app_server"
+# 未设置时默认使用 app_server；如需回退：
+# $env:CODEX_TEAM_AGENT_RUNTIME = "exec"
 
 powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -File .\scripts\ensure-cluster-daemon.ps1
@@ -929,5 +934,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -File .\scripts\build-release.ps1
 ```
 
-输出位于 `dist\codex-team-board-v0.4.1.zip`，同时生成 SHA256 文件。GitHub
+输出位于 `dist\codex-team-board-v0.4.2.zip`，同时生成 SHA256 文件。GitHub
 Release 应附带 ZIP 与 `.sha256` 两个资产。
+
+推送 `v*` tag 会触发 `.github/workflows/release.yml`：Actions 先校验版本和完整
+测试，再构建便携包并通过仓库内置 `GITHUB_TOKEN` 创建 GitHub Release、上传
+ZIP 与 SHA256。发布机器不需要保存 Release token；Git 推送仍使用 SSH。

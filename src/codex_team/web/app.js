@@ -110,6 +110,7 @@ function cacheRateText(value, cachedValue, uncachedValue) {
 
 function jobRuntimeHtml(job) {
   if (!job) return "";
+  const runtime = String(job.runtime || "").trim();
   const thread = job.thread_id ?? job.thread;
   const turn = job.turn_id ?? job.turn;
   const cached = job.cached_input_tokens ?? job.cached_tokens;
@@ -119,6 +120,9 @@ function jobRuntimeHtml(job) {
   const hasCacheRate = job.cache_hit_rate !== undefined
     && job.cache_hit_rate !== null;
   const badges = [];
+  if (runtime) {
+    badges.push(`<span>${runtime === "app_server" ? "thread reuse" : "fresh exec"}</span>`);
+  }
   if (thread !== undefined && thread !== null && thread !== "") {
     badges.push(`<span>thread ${escapeHtml(thread)}</span>`);
   }
@@ -452,6 +456,7 @@ function nextActionText(goal) {
 
 function buildClusterMetrics(data = {}) {
   const summary = data.cluster_summary || {};
+  const runtime = data.cluster_runtime || {};
   const goals = Array.isArray(data.cluster_goals) ? data.cluster_goals : [];
   const jobs = Array.isArray(data.cluster_jobs) ? data.cluster_jobs : [];
   const activeGoals = goals.filter(
@@ -505,6 +510,12 @@ function buildClusterMetrics(data = {}) {
       (goal) => goalQueueReason(goal).state === "global_capacity",
     ).length,
   );
+  const runtimeName = String(runtime.runtime || "unknown");
+  const runtimeDetail = runtime.thread_reuse
+    ? `复用 Thread${runtime.running ? " · daemon 在线" : " · daemon 未运行"}`
+    : runtimeName === "exec"
+      ? "独立进程 · 不保留 Thread"
+      : "运行配置未知";
   return [
     {
       key: "jobs",
@@ -521,6 +532,15 @@ function buildClusterMetrics(data = {}) {
       value: queuedGoals,
       detail: `公平等待 ${fairnessWaitCount}`,
       tone: queuedGoals > 0 ? "warning" : "",
+    },
+    {
+      key: "runtime",
+      label: "RUNTIME",
+      value: runtimeName,
+      detail: runtime.config_mismatch
+        ? "配置与 daemon 不一致"
+        : runtimeDetail,
+      tone: runtime.config_mismatch ? "critical" : "",
     },
     {
       key: "heartbeat-overdue",

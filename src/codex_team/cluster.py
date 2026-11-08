@@ -98,7 +98,7 @@ board state, and task-specific instructions arrive in the turn input.
 def _runtime_mode(value: str | None) -> str:
     normalized = str(value or "").strip().lower()
     if not normalized:
-        normalized = "exec"
+        normalized = "app_server"
     if normalized not in RUNTIME_MODES:
         raise ValueError("CODEX_TEAM_AGENT_RUNTIME must be exec or app_server")
     return normalized
@@ -219,7 +219,7 @@ class ClusterManager:
             else (
                 configured_runtime
                 if configured_runtime is not None
-                else ("app_server" if runtime is not None else "exec")
+                else "app_server"
             )
         )
         self.model = _optional_text(
@@ -3924,7 +3924,7 @@ def daemon_paths(settings: Settings) -> tuple[Path, Path, Path]:
 
 
 def daemon_identity(settings: Settings) -> dict[str, Any]:
-    runtime = os.environ.get("CODEX_TEAM_AGENT_RUNTIME", "").strip() or "exec"
+    runtime = _runtime_mode(os.environ.get("CODEX_TEAM_AGENT_RUNTIME"))
     model = os.environ.get("CODEX_TEAM_MODEL", "").strip()
     model_provider = os.environ.get("CODEX_TEAM_MODEL_PROVIDER", "").strip()
     home = str(settings.home.resolve())
