@@ -33,7 +33,7 @@ from .scheduling import (
     env_int,
 )
 from .service import TeamError, TeamService
-from .usage import usage_from_exec_log, usage_is_cost_complete
+from .usage import normalize_usage, usage_from_exec_log, usage_is_cost_complete
 from .worktrees import WorktreeManager
 
 TERMINAL_GOAL_STATUSES = frozenset({"completed", "failed"})
@@ -3371,11 +3371,13 @@ Do not return raw logs or a full transcript.
         thread_id = str(job.get("thread_id") or "")
         turn_id = str(job.get("turn_id") or "")
         with self._app_state_lock:
-            state = self.app_turns.get(str(job.get("job_id")), {})
-            already_requested = bool(state.get("interrupt_requested"))
-            if not already_requested and state:
-                state["interrupt_requested"] = True
-                state["interrupt_reason"] = reason
+            current_state = self.app_turns.get(str(job.get("job_id")), {})
+            already_requested = bool(current_state.get("interrupt_requested"))
+            if not already_requested and current_state:
+                current_state["interrupt_requested"] = True
+                current_state["interrupt_reason"] = reason
+            state = dict(current_state)
+        self._persist_app_job_usage(job, state)
         if not thread_id or not turn_id or already_requested or self.runtime is None:
             return
         try:
@@ -3418,11 +3420,136 @@ Do not return raw logs or a full transcript.
         except Exception:
             pass
 
+    def _persist_app_job_usage(
+        self,
+        job: Mapping[str, Any],
+        state: Mapping[str, Any] | None = None,
+    ) -> bool:
+        """Persist available App Server usage before an interrupted terminal write."""
+
+        job_id = str(job.get("job_id") or "")
+        if not job_id:
+            return False
+        try:
+            with self.team.connection(write=False) as connection:
+                row = connection.execute(
+                    """
+                    SELECT *
+                    FROM cluster_jobs
+                    WHERE job_id = ? AND status IN ('starting', 'running')
+                    """,
+                    (job_id,),
+                ).fetchone()
+            if row is None:
+                return False
+            current_job = dict(row)
+            usage_state: dict[str, Any] = {}
+            if isinstance(state, Mapping):
+                if "usage" in state:
+                    usage_state["usage"] = state["usage"]
+                if "first_usage" in state:
+                    usage_state["first_usage"] = state["first_usage"]
+            log_state = _app_usage_state_from_log(current_job.get("log_path"))
+            if log_state:
+                usage_state.update(log_state)
+            elif not _usage_state_has_evidence(usage_state):
+                return False
+
+            usage = self._app_job_usage(
+                {**current_job, **dict(job)},
+                usage_state,
+            )
+            if not _usage_has_evidence(usage):
+                return False
+            existing_nonzero = any(
+                int(current_job.get(field) or 0) > 0
+                for field in (
+                    "input_tokens",
+                    "cached_input_tokens",
+                    "uncached_input_tokens",
+                    "output_tokens",
+                )
+            )
+            recovered_nonzero = any(
+                int(usage.get(field) or 0) > 0
+                for field in (
+                    "input_tokens",
+                    "cached_input_tokens",
+                    "uncached_input_tokens",
+                    "output_tokens",
+                )
+            )
+            if existing_nonzero and not recovered_nonzero:
+                return False
+
+            telemetry_complete = usage_is_cost_complete(usage)
+            with self.team.connection() as connection:
+                updated = connection.execute(
+                    """
+                    UPDATE cluster_jobs
+                    SET input_tokens = COALESCE(?, input_tokens),
+                        cached_input_tokens = COALESCE(?, cached_input_tokens),
+                        uncached_input_tokens = COALESCE(
+                            ?, uncached_input_tokens
+                        ),
+                        output_tokens = COALESCE(?, output_tokens),
+                        first_input_tokens = COALESCE(
+                            ?, first_input_tokens
+                        ),
+                        first_cached_input_tokens = COALESCE(
+                            ?, first_cached_input_tokens
+                        ),
+                        first_uncached_input_tokens = COALESCE(
+                            ?, first_uncached_input_tokens
+                        ),
+                        context_tokens = COALESCE(?, context_tokens),
+                        model_context_window = COALESCE(
+                            ?, model_context_window
+                        ),
+                        cache_write_input_tokens = COALESCE(
+                            NULLIF(?, 0), cache_write_input_tokens
+                        ),
+                        reasoning_output_tokens = COALESCE(
+                            NULLIF(?, 0), reasoning_output_tokens
+                        ),
+                        usage_source = COALESCE(?, usage_source),
+                        telemetry_complete = CASE
+                            WHEN ? THEN 1
+                            ELSE telemetry_complete
+                        END
+                    WHERE job_id = ? AND status IN ('starting', 'running')
+                    """,
+                    (
+                        usage.get("input_tokens"),
+                        usage.get("cached_input_tokens"),
+                        usage.get("uncached_input_tokens"),
+                        usage.get("output_tokens"),
+                        usage.get("first_input_tokens"),
+                        usage.get("first_cached_input_tokens"),
+                        usage.get("first_uncached_input_tokens"),
+                        usage.get("context_tokens"),
+                        usage.get("model_context_window"),
+                        usage.get("cache_write_input_tokens"),
+                        usage.get("reasoning_output_tokens"),
+                        "app_server.token_usage",
+                        int(telemetry_complete),
+                        job_id,
+                    ),
+                )
+            return updated.rowcount > 0
+        except Exception:
+            return False
+
     def _app_job_usage(
         self,
         job: Mapping[str, Any],
         state: Mapping[str, Any],
     ) -> dict[str, int | None]:
+        if not _usage_state_has_evidence(state):
+            log_state = _app_usage_state_from_log(job.get("log_path"))
+            if log_state:
+                state = {**state, **log_state}
+
         def values(value: Any) -> Mapping[str, Any]:
             return value if isinstance(value, Mapping) else {}
 
@@ -4117,6 +4244,59 @@ def _parse_codex_log(path: Path) -> dict[str, Any]:
     except OSError:
         result["error"] = "log unreadable"
     return result
+
+
+def _usage_has_evidence(value: Mapping[str, Any] | None) -> bool:
+    normalized = normalize_usage(value)
+    return any(item is not None for item in normalized.values())
+
+
+def _usage_state_has_evidence(state: Mapping[str, Any] | None) -> bool:
+    if not isinstance(state, Mapping):
+        return False
+    return _usage_has_evidence(state.get("usage"))
+
+
+def _app_usage_state_from_log(path: Any) -> dict[str, Any] | None:
+    """Read the first and latest App Server token usage events from a job log."""
+
+    if not path:
+        return None
+    first_usage: Mapping[str, Any] | None = None
+    latest_usage: Mapping[str, Any] | None = None
+    try:
+        with Path(str(path)).open(
+            "r",
+            encoding="utf-8",
+            errors="replace",
+        ) as stream:
+            for line in stream:
+                if not line.startswith("{"):
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(event, Mapping):
+                    continue
+                if event.get("event") != "token_usage":
+                    continue
+                usage = event.get("usage")
+                if not isinstance(usage, Mapping) or not _usage_has_evidence(
+                    usage
+                ):
+                    continue
+                if first_usage is None:
+                    first_usage = usage
+                latest_usage = usage
+    except OSError:
+        return None
+    if latest_usage is None:
+        return None
+    return {
+        "usage": latest_usage,
+        "first_usage": first_usage,
+    }
 
 
 def _parse_iso(value: str | None) -> datetime | None:
