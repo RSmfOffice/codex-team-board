@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from . import __version__
+from .agent_home import service_codex_home, sync_agent_codex_home
 from .agent_pool import AgentPool, AgentPoolError
 from .app_server import AppServerEvents, AppServerRuntime
 from .config import Settings
@@ -205,6 +206,8 @@ class ClusterManager:
         lead_cooldown_seconds: float = 8.0,
     ) -> None:
         self.settings = settings
+        self.agent_codex_home_sync = sync_agent_codex_home(settings)
+        self.agent_codex_home = self.agent_codex_home_sync.destination
         self.agent_pool = agent_pool or AgentPool(settings)
         self.team = team or TeamService(settings, agent_pool=self.agent_pool)
         self.worktrees = worktrees or WorktreeManager(self.team)
@@ -277,6 +280,7 @@ class ClusterManager:
                 event_handler=_ClusterAppServerEvents(self),
                 env={
                     "CODEX_TEAM_HOME": str(self.settings.home),
+                    "CODEX_HOME": str(self.agent_codex_home),
                     "PYTHONUTF8": "1",
                 },
             )
@@ -1601,6 +1605,7 @@ Use goal_id = "{goal["goal_id"]}" when creating tasks for this turn.
         environment = os.environ.copy()
         environment.update(
             {
+                "CODEX_HOME": str(self.agent_codex_home),
                 "CODEX_TEAM_GOAL_ID": goal["goal_id"],
                 "CODEX_TEAM_JOB_ID": job_id,
                 "CODEX_TEAM_TASK_ID": task_id or "",
@@ -3923,11 +3928,13 @@ def daemon_identity(settings: Settings) -> dict[str, Any]:
     model = os.environ.get("CODEX_TEAM_MODEL", "").strip()
     model_provider = os.environ.get("CODEX_TEAM_MODEL_PROVIDER", "").strip()
     home = str(settings.home.resolve())
+    codex_home = str(service_codex_home(settings))
     payload = {
         "runtime": runtime,
         "model": model,
         "model_provider": model_provider,
         "team_home": home,
+        "codex_home": codex_home,
         "version": __version__,
     }
     fingerprint = hashlib.sha256(

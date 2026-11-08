@@ -12,6 +12,8 @@
 - 新增 daemon 配置指纹及 `teamctl daemon restart --if-idle`。
 - 新增 `CODEX_TEAM_MCP_ACCESS=full|read_only|off` 和
   `CODEX_TEAM_ALLOWED_ROOTS` 访问边界。
+- 新增托管 Agent 专用 `CODEX_HOME`，只同步模型配置和认证白名单，不读取用户
+  日常 sessions，避免子 Agent 出现在主侧边栏。
 
 ### Fixed
 

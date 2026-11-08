@@ -778,6 +778,7 @@ Agent runtime 与模型配置：
 | 环境变量 | 默认值 | 合法值/作用 |
 | --- | --- | --- |
 | `CODEX_TEAM_AGENT_RUNTIME` | `exec` | `exec` 或 `app_server`；只有 `app_server` 启用持久 thread |
+| `CODEX_TEAM_AGENT_CODEX_HOME` | `<CODEX_TEAM_HOME>\agent-codex-home` | 托管 Agent 专用 Codex Home；同步 `config.toml`、`auth.json`、`models.json`，不复制用户 sessions |
 | `CODEX_TEAM_MODEL` | 空 | 可选模型覆盖；空值使用 Codex 默认模型 |
 | `CODEX_TEAM_MODEL_PROVIDER` | 空 | 可选 provider 覆盖；必须与 AgentPool 身份匹配 |
 
@@ -814,6 +815,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 ```
 
 daemon 状态文件会记录 runtime、model/provider、Team Home、版本和配置指纹。
+Team Board 子 Agent 使用独立 service `CODEX_HOME`，因此持久 thread、resume、
+token 和 cache 统计仍保留，但不会写入日常 Codex 侧边栏。
 修改运行配置后，使用以下命令安全重启：
 
 ```powershell
