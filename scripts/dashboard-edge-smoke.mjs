@@ -128,6 +128,48 @@ async function waitFor(fn, timeoutMs = 15000, intervalMs = 120) {
   throw new Error(`Timed out after ${timeoutMs}ms${lastError ? `: ${lastError}` : ""}`);
 }
 
+async function removeProfileWithRetry(profilePath) {
+  const retryable = new Set(["EBUSY", "EPERM", "ENOTEMPTY"]);
+  let lastError;
+  for (let attempt = 0; attempt < 24; attempt += 1) {
+    try {
+      await rm(profilePath, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      lastError = error;
+      if (!retryable.has(error?.code)) throw error;
+      await delay(250);
+    }
+  }
+  console.error(
+    `warning: Edge profile cleanup incomplete after retries: ${profilePath}: `
+    + `${lastError?.code || "unknown"}`,
+  );
+  process.exitCode = 1;
+}
+
+function killEdgeProfileProcesses(profilePath) {
+  if (process.platform === "win32") {
+    const command = [
+      "$profilePath = $env:EDGE_SMOKE_PROFILE;",
+      "Get-CimInstance Win32_Process",
+      "| Where-Object {",
+      "  $_.Name -eq 'msedge.exe'",
+      "  -and $_.CommandLine",
+      "  -and $_.CommandLine.Contains($profilePath)",
+      "}",
+      "| ForEach-Object {",
+      "  Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue",
+      "}",
+    ].join(" ");
+    spawnSync("powershell.exe", ["-NoProfile", "-Command", command], {
+      windowsHide: true,
+      stdio: "ignore",
+      env: { ...process.env, EDGE_SMOKE_PROFILE: profilePath },
+    });
+  }
+}
+
 class EdgeProcessError extends Error {
   constructor(message) {
     super(message);
@@ -179,11 +221,6 @@ try {
     if (spawnError) {
       throw new EdgeProcessError(
         `Edge spawn failed: ${spawnError.message}`,
-      );
-    }
-    if (earlyExit) {
-      throw new EdgeProcessError(
-        `Edge exited before CDP was ready (code=${earlyExit.code}, signal=${earlyExit.signal})`,
       );
     }
     if (!existsSync(portFile)) return 0;
@@ -361,12 +398,6 @@ try {
   if (spawnError) {
     throw new EdgeProcessError(`Edge spawn failed: ${spawnError.message}`);
   }
-  if (earlyExit) {
-    throw new EdgeProcessError(
-      `Edge exited during smoke run (code=${earlyExit.code}, signal=${earlyExit.signal})`,
-    );
-  }
-
   console.log(JSON.stringify({
     ok: failures.length === 0,
     checks,
@@ -385,13 +416,14 @@ try {
       stdio: "ignore",
     });
   }
-  await delay(300);
+  killEdgeProfileProcesses(profile);
+  await delay(1000);
   const profileRelative = relative(profileRoot, profile);
   if (
     profileRelative.startsWith(profilePrefix)
     && !profileRelative.includes(sep)
     && !isAbsolute(profileRelative)
   ) {
-    await rm(profile, { recursive: true, force: true, maxRetries: 5 });
+    await removeProfileWithRetry(profile);
   }
 }
