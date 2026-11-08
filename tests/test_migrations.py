@@ -118,6 +118,81 @@ class MigrationTests(unittest.TestCase):
             finally:
                 upgraded.close()
 
+    def test_schema_15_adds_usage_missing_fields_idempotently(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "usage-v14.sqlite"
+            connection = sqlite3.connect(path)
+            connection.executescript(
+                """
+                CREATE TABLE schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                );
+                INSERT INTO schema_migrations(version, applied_at)
+                VALUES (14, '2026-11-08T00:00:00Z');
+                CREATE TABLE cluster_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    goal_id TEXT NOT NULL,
+                    task_id TEXT,
+                    kind TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    thread_id TEXT,
+                    log_path TEXT NOT NULL,
+                    output_path TEXT NOT NULL,
+                    started_at TEXT NOT NULL
+                );
+                INSERT INTO cluster_jobs(
+                    job_id, goal_id, kind, role, status,
+                    log_path, output_path, started_at
+                ) VALUES (
+                    'J-OLD', 'G-OLD', 'worker', 'team_worker', 'completed',
+                    'old.log', 'old.out', '2026-11-08T00:00:00Z'
+                );
+                PRAGMA user_version = 14;
+                """
+            )
+            connection.commit()
+            connection.close()
+
+            upgraded = connect(path)
+            try:
+                old = upgraded.execute(
+                    """
+                    SELECT usage_missing_fields
+                    FROM cluster_jobs WHERE job_id = 'J-OLD'
+                    """
+                ).fetchone()
+                self.assertEqual(old["usage_missing_fields"], "[]")
+                self.assertEqual(
+                    upgraded.execute("PRAGMA user_version").fetchone()[0],
+                    15,
+                )
+            finally:
+                upgraded.close()
+
+            reopened = connect(path)
+            try:
+                versions = [
+                    row["version"]
+                    for row in reopened.execute(
+                        """
+                        SELECT version FROM schema_migrations
+                        ORDER BY version
+                        """
+                    ).fetchall()
+                ]
+                self.assertEqual(versions, [14, 15])
+                columns = {
+                    row["name"]
+                    for row in reopened.execute(
+                        "PRAGMA table_info(cluster_jobs)"
+                    ).fetchall()
+                }
+                self.assertIn("usage_missing_fields", columns)
+            finally:
+                reopened.close()
+
     def test_archived_goal_done_tasks_are_backfilled_once(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "backfill.sqlite"

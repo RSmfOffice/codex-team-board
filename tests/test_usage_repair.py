@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from codex_team.config import Settings
+from codex_team.cluster import _parse_codex_log
 from codex_team.db import SCHEMA_VERSION, connect, utc_now
 from codex_team.mcp import (
     _guard_tool_call,
@@ -18,7 +19,9 @@ from codex_team.service import TeamService
 from codex_team.usage import (
     cache_hit_rate,
     usage_from_exec_log,
+    usage_has_cost_evidence,
     usage_is_cost_complete,
+    usage_missing_fields,
 )
 from codex_team.usage_backfill import backfill_exec_usage
 
@@ -89,6 +92,67 @@ class UsageRepairTests(unittest.TestCase):
     def test_missing_usage_is_not_reported_as_zero(self) -> None:
         self.assertIsNone(cache_hit_rate({}))
         self.assertFalse(usage_is_cost_complete({}))
+        self.assertFalse(
+            usage_has_cost_evidence({"modelContextWindow": 200})
+        )
+        explicit_zero = {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+        }
+        self.assertTrue(usage_has_cost_evidence(explicit_zero))
+        self.assertTrue(usage_is_cost_complete(explicit_zero))
+        self.assertEqual(
+            usage_missing_fields(explicit_zero),
+            [
+                "cache_write_input_tokens",
+                "reasoning_output_tokens",
+                "context_tokens",
+                "model_context_window",
+            ],
+        )
+        derived_without_explicit_input = {
+            "cached_input_tokens": 2,
+            "uncached_input_tokens": 3,
+            "output_tokens": 0,
+        }
+        self.assertFalse(usage_is_cost_complete(derived_without_explicit_input))
+        self.assertIn(
+            "input_tokens",
+            usage_missing_fields(derived_without_explicit_input),
+        )
+
+    def test_partial_exec_log_preserves_missing_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "partial.jsonl"
+            log.write_text(
+                json.dumps(
+                    {
+                        "type": "turn.completed",
+                        "usage": {"input_tokens": 0},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            usage = usage_from_exec_log(log)
+            parsed = _parse_codex_log(log)
+        self.assertTrue(usage_has_cost_evidence(usage))
+        self.assertFalse(usage_is_cost_complete(usage))
+        self.assertEqual(usage["input_tokens"], 0)
+        self.assertIsNone(usage["cached_input_tokens"])
+        self.assertIsNone(usage["output_tokens"])
+        self.assertIn(
+            "cached_input_tokens",
+            usage["usage_missing_fields"],
+        )
+        self.assertIn("output_tokens", usage["usage_missing_fields"])
+        self.assertEqual(parsed["usage_source"], "turn.completed.usage")
+        self.assertEqual(parsed["telemetry_complete"], 0)
+        self.assertIn(
+            "cached_input_tokens",
+            json.loads(parsed["usage_missing_fields"]),
+        )
 
     def test_schema_and_backfill_are_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -164,6 +228,7 @@ class UsageRepairTests(unittest.TestCase):
                     "reasoning_output_tokens",
                     "usage_source",
                     "telemetry_complete",
+                    "usage_missing_fields",
                 }
                 <= columns
             )
@@ -185,6 +250,7 @@ class UsageRepairTests(unittest.TestCase):
             self.assertEqual(row["uncached_input_tokens"], 30)
             self.assertEqual(row["output_tokens"], 12)
             self.assertEqual(row["telemetry_complete"], 1)
+            self.assertEqual(row["usage_missing_fields"], "[]")
 
     def test_mcp_access_modes_and_allowed_roots(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

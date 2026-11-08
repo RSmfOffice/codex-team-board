@@ -23,7 +23,7 @@ from .scheduling import (
     MAX_GOAL_WORKER_CAPACITY,
     env_int,
 )
-from .usage import cache_hit_rate
+from .usage import JOB_USAGE_FIELDS, cache_hit_rate
 
 TERMINAL_STATUSES = frozenset({"done", "canceled"})
 ACTIVE_STATUSES = frozenset({"ready", "running", "review", "blocked"})
@@ -110,6 +110,30 @@ class TeamService:
                 "uncached": uncached_input_tokens,
             }
         )
+
+    @staticmethod
+    def _project_unknown_usage(job: dict[str, Any]) -> None:
+        try:
+            parsed = json.loads(str(job.get("usage_missing_fields") or "[]"))
+        except (TypeError, ValueError):
+            parsed = []
+        missing = (
+            {
+                field
+                for field in parsed
+                if isinstance(field, str) and field in JOB_USAGE_FIELDS
+            }
+            if isinstance(parsed, list)
+            else set()
+        )
+        if not job.get("usage_source") and not missing:
+            missing.update(
+                field
+                for field in JOB_USAGE_FIELDS
+                if not int(job.get(field) or 0)
+            )
+        for field in missing:
+            job[field] = None
 
     @staticmethod
     def _root(path: str | Path) -> Path:
@@ -782,22 +806,7 @@ class TeamService:
             cluster_goals = [dict(row) for row in goal_rows]
             cluster_jobs = [dict(row) for row in job_rows]
             for job in cluster_jobs:
-                usage_fields = (
-                    "input_tokens",
-                    "cached_input_tokens",
-                    "uncached_input_tokens",
-                    "cache_write_input_tokens",
-                    "output_tokens",
-                    "reasoning_output_tokens",
-                    "first_input_tokens",
-                    "first_cached_input_tokens",
-                    "first_uncached_input_tokens",
-                    "context_tokens",
-                )
-                if not job.get("usage_source"):
-                    for field in usage_fields:
-                        if not int(job.get(field) or 0):
-                            job[field] = None
+                self._project_unknown_usage(job)
                 job["cache_hit_rate"] = self._cache_hit_rate(
                     job.get("input_tokens"),
                     job.get("cached_input_tokens"),
@@ -1005,6 +1014,7 @@ class TeamService:
             ).fetchall()
             active_jobs = [dict(row) for row in active_job_rows]
             for job in active_jobs:
+                self._project_unknown_usage(job)
                 job["cache_hit_rate"] = self._cache_hit_rate(
                     job.get("input_tokens"),
                     job.get("cached_input_tokens"),

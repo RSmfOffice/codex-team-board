@@ -33,7 +33,14 @@ from .scheduling import (
     env_int,
 )
 from .service import TeamError, TeamService
-from .usage import normalize_usage, usage_from_exec_log, usage_is_cost_complete
+from .usage import (
+    JOB_USAGE_FIELDS,
+    normalize_usage,
+    usage_from_exec_log,
+    usage_has_any_evidence,
+    usage_has_cost_evidence,
+    usage_is_cost_complete,
+)
 from .worktrees import WorktreeManager
 
 TERMINAL_GOAL_STATUSES = frozenset({"completed", "failed"})
@@ -3452,14 +3459,14 @@ Do not return raw logs or a full transcript.
             log_state = _app_usage_state_from_log(current_job.get("log_path"))
             if log_state:
                 usage_state.update(log_state)
-            elif not _usage_state_has_evidence(usage_state):
+            elif not _usage_has_any_evidence(usage_state.get("usage")):
                 return False
 
             usage = self._app_job_usage(
                 {**current_job, **dict(job)},
                 usage_state,
             )
-            if not _usage_has_evidence(usage):
+            if not _usage_has_any_evidence(usage):
                 return False
             existing_nonzero = any(
                 int(current_job.get(field) or 0) > 0
@@ -3483,6 +3490,12 @@ Do not return raw logs or a full transcript.
                 return False
 
             telemetry_complete = usage_is_cost_complete(usage)
+            usage_source = (
+                "app_server.token_usage"
+                if _usage_has_evidence(usage)
+                else None
+            )
+            missing_fields = _usage_missing_fields_json(usage)
             with self.team.connection() as connection:
                 updated = connection.execute(
                     """
@@ -3507,16 +3520,19 @@ Do not return raw logs or a full transcript.
                             ?, model_context_window
                         ),
                         cache_write_input_tokens = COALESCE(
-                            NULLIF(?, 0), cache_write_input_tokens
+                            ?, cache_write_input_tokens
                         ),
                         reasoning_output_tokens = COALESCE(
-                            NULLIF(?, 0), reasoning_output_tokens
+                            ?, reasoning_output_tokens
                         ),
                         usage_source = COALESCE(?, usage_source),
                         telemetry_complete = CASE
                             WHEN ? THEN 1
                             ELSE telemetry_complete
-                        END
+                        END,
+                        usage_missing_fields = COALESCE(
+                            ?, usage_missing_fields
+                        )
                     WHERE job_id = ? AND status IN ('starting', 'running')
                     """,
                     (
@@ -3531,8 +3547,9 @@ Do not return raw logs or a full transcript.
                         usage.get("model_context_window"),
                         usage.get("cache_write_input_tokens"),
                         usage.get("reasoning_output_tokens"),
-                        "app_server.token_usage",
+                        usage_source,
                         int(telemetry_complete),
+                        missing_fields,
                         job_id,
                     ),
                 )
@@ -3603,61 +3620,136 @@ Do not return raw logs or a full transcript.
                     int(agent["prior_output_tokens"] or 0),
                 )
 
-        def number(mapping: Mapping[str, Any], name: str) -> int:
-            try:
-                return max(0, int(mapping.get(name, 0) or 0))
-            except (TypeError, ValueError):
-                return 0
-
-        def turn_values(
+        def snapshot_values(
             cumulative: Mapping[str, Any],
             last_present: bool,
             per_turn: Mapping[str, Any],
-        ) -> tuple[int, int, int, int]:
-            if last_present:
-                input_count = number(per_turn, "input")
-                cached_count = min(number(per_turn, "cached"), input_count)
-                output_count = number(per_turn, "output")
-                context_count = number(per_turn, "context")
+            *,
+            subtract_baseline: bool,
+        ) -> tuple[
+            int | None,
+            int | None,
+            int | None,
+            int | None,
+            int | None,
+            int | None,
+        ]:
+            cumulative_values = normalize_usage(cumulative)
+            per_turn_values = normalize_usage(per_turn)
+
+            def has_cost(values: Mapping[str, Any]) -> bool:
+                return any(
+                    values.get(field) is not None
+                    for field in (
+                        "input_tokens",
+                        "cached_input_tokens",
+                        "uncached_input_tokens",
+                        "cache_write_input_tokens",
+                        "output_tokens",
+                        "reasoning_output_tokens",
+                    )
+                )
+
+            use_per_turn = (
+                not has_cost(cumulative_values)
+                and last_present
+                and (
+                    has_cost(per_turn_values)
+                    or (
+                        not usage_has_any_evidence(cumulative)
+                        and usage_has_any_evidence(per_turn)
+                    )
+                )
+            )
+            selected = per_turn_values if use_per_turn else cumulative_values
+            fallback = cumulative_values if use_per_turn else per_turn_values
+
+            input_count = selected.get("input_tokens")
+            cached_count = selected.get("cached_input_tokens")
+            output_count = selected.get("output_tokens")
+            if use_per_turn or not subtract_baseline:
+                baseline_input_count = 0
+                baseline_cached_count = 0
+                baseline_output_count = 0
             else:
+                baseline_input_count = baseline_input
+                baseline_cached_count = baseline_cached
+                baseline_output_count = baseline_output
+            if input_count is not None:
                 input_count = max(
                     0,
-                    number(cumulative, "input") - baseline_input,
+                    input_count - baseline_input_count,
                 )
-                cached_count = min(
-                    max(0, number(cumulative, "cached") - baseline_cached),
-                    input_count,
+            if cached_count is not None:
+                cached_count = max(
+                    0,
+                    cached_count - baseline_cached_count,
                 )
+                if input_count is not None:
+                    cached_count = min(cached_count, input_count)
+            if output_count is not None:
                 output_count = max(
                     0,
-                    number(cumulative, "output") - baseline_output,
+                    output_count - baseline_output_count,
                 )
-                context_count = number(cumulative, "context")
-            return input_count, cached_count, output_count, context_count
+            context_count = selected.get("context_tokens")
+            if context_count is None:
+                context_count = fallback.get("context_tokens")
+            cache_write = selected.get("cache_write_input_tokens")
+            if cache_write is None:
+                cache_write = fallback.get("cache_write_input_tokens")
+            reasoning_output = selected.get("reasoning_output_tokens")
+            if reasoning_output is None:
+                reasoning_output = fallback.get("reasoning_output_tokens")
+            return (
+                input_count,
+                cached_count,
+                output_count,
+                context_count,
+                cache_write,
+                reasoning_output,
+            )
 
-        input_tokens, cached_tokens, output_tokens, context_tokens = turn_values(
+        (
+            input_tokens,
+            cached_tokens,
+            output_tokens,
+            context_tokens,
+            cache_write,
+            reasoning_output,
+        ) = snapshot_values(
             total,
-            not _usage_has_evidence(total)
-            and isinstance(last_value, Mapping),
+            isinstance(last_value, Mapping),
             last,
+            subtract_baseline=True,
         )
-        first_input, first_cached, _, _ = turn_values(
+        (
+            first_input,
+            first_cached,
+            _,
+            _,
+            _,
+            _,
+        ) = snapshot_values(
             first_total,
-            not _usage_has_evidence(first_total)
-            and isinstance(first_last_value, Mapping),
+            isinstance(first_last_value, Mapping),
             first_last,
+            subtract_baseline=True,
         )
-        raw_window = usage.get(
-            "modelContextWindow",
-            total.get("modelContextWindow"),
-        )
-        cache_write = number(
-            last if isinstance(last_value, Mapping) else total,
-            "cache_write",
-        )
-        reasoning_output = number(
-            last if isinstance(last_value, Mapping) else total,
-            "reasoning",
+        raw_window = next(
+            (
+                value
+                for value in (
+                    usage.get("modelContextWindow"),
+                    usage.get("model_context_window"),
+                    total.get("modelContextWindow"),
+                    total.get("model_context_window"),
+                    last.get("modelContextWindow"),
+                    last.get("model_context_window"),
+                )
+                if value is not None
+            ),
+            None,
         )
         try:
             model_window = (
@@ -3670,11 +3762,19 @@ Do not return raw logs or a full transcript.
         return {
             "input_tokens": input_tokens,
             "cached_input_tokens": cached_tokens,
-            "uncached_input_tokens": input_tokens - cached_tokens,
+            "uncached_input_tokens": (
+                input_tokens - cached_tokens
+                if input_tokens is not None and cached_tokens is not None
+                else None
+            ),
             "output_tokens": output_tokens,
             "first_input_tokens": first_input,
             "first_cached_input_tokens": first_cached,
-            "first_uncached_input_tokens": first_input - first_cached,
+            "first_uncached_input_tokens": (
+                first_input - first_cached
+                if first_input is not None and first_cached is not None
+                else None
+            ),
             "context_tokens": context_tokens,
             "model_context_window": model_window,
             "cache_write_input_tokens": cache_write,
@@ -3765,8 +3865,9 @@ Do not return raw logs or a full transcript.
             )
             process_error = forced_error or parsed.get("error", "")
         usage = self._app_job_usage(job, app_state) if app_server_runtime else parsed
+        usage_missing_fields = _usage_missing_fields_json(usage)
         if app_server_runtime:
-            usage_has_evidence = _app_usage_state_has_evidence(job, app_state)
+            usage_has_evidence = _usage_has_evidence(usage)
             usage_source = (
                 "cluster_agents.last_usage+runtime_raw_turn"
                 if usage_has_evidence
@@ -3798,7 +3899,7 @@ Do not return raw logs or a full transcript.
                         first_uncached_input_tokens = ?, context_tokens = ?,
                         model_context_window = ?, cache_write_input_tokens = ?,
                         reasoning_output_tokens = ?, usage_source = ?,
-                        telemetry_complete = ?
+                        telemetry_complete = ?, usage_missing_fields = ?
                     WHERE job_id = ?
                     """,
                     (
@@ -3816,10 +3917,11 @@ Do not return raw logs or a full transcript.
                         usage.get("first_uncached_input_tokens") or 0,
                         usage.get("context_tokens") or 0,
                         usage.get("model_context_window"),
-                        usage.get("cache_write_input_tokens"),
-                        usage.get("reasoning_output_tokens"),
+                        usage.get("cache_write_input_tokens") or 0,
+                        usage.get("reasoning_output_tokens") or 0,
                         usage_source,
                         int(telemetry_complete),
+                        usage_missing_fields,
                         job["job_id"],
                     ),
                 )
@@ -3865,7 +3967,7 @@ Do not return raw logs or a full transcript.
                     first_uncached_input_tokens = ?, context_tokens = ?,
                     model_context_window = ?, cache_write_input_tokens = ?,
                     reasoning_output_tokens = ?, usage_source = ?,
-                    telemetry_complete = ?
+                    telemetry_complete = ?, usage_missing_fields = ?
                 WHERE job_id = ?
                 """,
                 (
@@ -3883,10 +3985,11 @@ Do not return raw logs or a full transcript.
                     usage.get("first_uncached_input_tokens") or 0,
                     usage.get("context_tokens") or 0,
                     usage.get("model_context_window"),
-                    usage.get("cache_write_input_tokens"),
-                    usage.get("reasoning_output_tokens"),
+                    usage.get("cache_write_input_tokens") or 0,
+                    usage.get("reasoning_output_tokens") or 0,
                     usage_source,
                     int(telemetry_complete),
+                    usage_missing_fields,
                     job["job_id"],
                 ),
             )
@@ -4231,6 +4334,7 @@ def _parse_codex_log(path: Path) -> dict[str, Any]:
         "usage_source": usage_record.get("usage_source"),
         "telemetry_complete": usage_is_cost_complete(usage),
     }
+    result["usage_missing_fields"] = _usage_missing_fields_json(result)
     try:
         with path.open("r", encoding="utf-8", errors="replace") as stream:
             for line in stream:
@@ -4256,8 +4360,19 @@ def _parse_codex_log(path: Path) -> dict[str, Any]:
 
 
 def _usage_has_evidence(value: Mapping[str, Any] | None) -> bool:
-    normalized = normalize_usage(value)
-    return any(item is not None for item in normalized.values())
+    return usage_has_cost_evidence(value)
+
+
+def _usage_has_any_evidence(value: Mapping[str, Any] | None) -> bool:
+    return usage_has_any_evidence(value)
+
+
+def _usage_missing_fields_json(usage: Mapping[str, Any] | None) -> str:
+    values = usage if isinstance(usage, Mapping) else {}
+    missing = sorted(
+        field for field in JOB_USAGE_FIELDS if values.get(field) is None
+    )
+    return json.dumps(missing, ensure_ascii=False, separators=(",", ":"))
 
 
 def _usage_state_has_evidence(state: Mapping[str, Any] | None) -> bool:
@@ -4302,7 +4417,7 @@ def _app_usage_state_from_log(path: Any) -> dict[str, Any] | None:
                 if event.get("event") != "token_usage":
                     continue
                 usage = event.get("usage")
-                if not isinstance(usage, Mapping) or not _usage_has_evidence(
+                if not isinstance(usage, Mapping) or not _usage_has_any_evidence(
                     usage
                 ):
                     continue

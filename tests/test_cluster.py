@@ -1680,6 +1680,147 @@ class ClusterSchedulerTests(unittest.TestCase):
                 manager._reconcile_jobs()
                 assert_unknown(timeout_job, "failed")
 
+    def test_app_server_usage_preserves_field_level_unknowns(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            repo = _repo(base, "field-usage")
+            project = team.init_project(repo)
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime=StubAppServerRuntime(),
+                runtime_mode="app_server",
+            )
+            events = _ClusterAppServerEvents(manager)
+            goal = manager.create_goal(
+                repo,
+                objective="Preserve field-level App Server usage",
+            )
+
+            def complete_with_usage(label: str, usage: dict) -> tuple[dict, dict]:
+                task = team.create_task(
+                    repo,
+                    title=f"{label} usage",
+                    description="Exercise field-level usage presence.",
+                    acceptance="Persist observed fields and mark absent ones unknown.",
+                    kind="read",
+                    owner_role="team_explorer",
+                    goal_id=goal["goal_id"],
+                )
+                job = manager._dispatch_worker(
+                    manager.get_goal(goal["goal_id"]),
+                    team.get_task(task["task_id"]),
+                )
+                events.on_token_usage_updated(
+                    job["thread_id"],
+                    job["turn_id"],
+                    usage,
+                )
+                events.on_turn_completed(
+                    job["thread_id"],
+                    job["turn_id"],
+                    {"id": job["turn_id"], "status": "completed"},
+                )
+                with team.connection() as connection:
+                    connection.execute(
+                        """
+                        UPDATE tasks
+                        SET status = 'review', updated_at = ?,
+                            version = version + 1
+                        WHERE task_id = ?
+                        """,
+                        (utc_now(), task["task_id"]),
+                    )
+                manager._reconcile_jobs()
+                with team.connection(write=False) as connection:
+                    row = dict(
+                        connection.execute(
+                            """
+                            SELECT input_tokens, cached_input_tokens,
+                                   uncached_input_tokens, output_tokens,
+                                   context_tokens, model_context_window,
+                                   usage_source, telemetry_complete,
+                                   usage_missing_fields
+                            FROM cluster_jobs
+                            WHERE job_id = ?
+                            """,
+                            (job["job_id"],),
+                        ).fetchone()
+                    )
+                dashboard_job = next(
+                    item
+                    for item in team.dashboard_snapshot(
+                        project["project_id"]
+                    )["cluster_jobs"]
+                    if item["job_id"] == job["job_id"]
+                )
+                return row, dashboard_job
+
+            partial, partial_dashboard = complete_with_usage(
+                "Partial",
+                {
+                    "total": {"input": 120, "context": 140},
+                    "last": {"input": 20, "context": 40},
+                    "modelContextWindow": 200,
+                },
+            )
+            self.assertEqual(partial["input_tokens"], 120)
+            self.assertIsNotNone(partial["usage_source"])
+            self.assertEqual(partial["telemetry_complete"], 0)
+            self.assertEqual(partial["model_context_window"], 200)
+            self.assertTrue(
+                {
+                    "cached_input_tokens",
+                    "uncached_input_tokens",
+                    "output_tokens",
+                }.issubset(json.loads(partial["usage_missing_fields"]))
+            )
+            self.assertEqual(partial_dashboard["input_tokens"], 120)
+            self.assertEqual(partial_dashboard["context_tokens"], 140)
+            self.assertIsNone(partial_dashboard["cached_input_tokens"])
+            self.assertIsNone(partial_dashboard["uncached_input_tokens"])
+            self.assertIsNone(partial_dashboard["output_tokens"])
+            self.assertIsNone(partial_dashboard["cache_hit_rate"])
+
+            metadata, metadata_dashboard = complete_with_usage(
+                "Metadata only",
+                {
+                    "total": {},
+                    "last": {},
+                    "modelContextWindow": 200,
+                },
+            )
+            self.assertIsNone(metadata["usage_source"])
+            self.assertEqual(metadata["telemetry_complete"], 0)
+            self.assertEqual(metadata["model_context_window"], 200)
+            self.assertTrue(
+                {
+                    "input_tokens",
+                    "cached_input_tokens",
+                    "output_tokens",
+                }.issubset(json.loads(metadata["usage_missing_fields"]))
+            )
+            self.assertIsNone(metadata_dashboard["input_tokens"])
+            self.assertIsNone(metadata_dashboard["cached_input_tokens"])
+            self.assertIsNone(metadata_dashboard["output_tokens"])
+            self.assertEqual(metadata_dashboard["model_context_window"], 200)
+
+            explicit_zero, zero_dashboard = complete_with_usage(
+                "Explicit zero",
+                {
+                    "total": {"input": 0, "cached": 0, "output": 0},
+                    "last": {"input": 0, "cached": 0, "output": 0},
+                },
+            )
+            self.assertIsNotNone(explicit_zero["usage_source"])
+            self.assertEqual(explicit_zero["telemetry_complete"], 1)
+            self.assertEqual(zero_dashboard["input_tokens"], 0)
+            self.assertEqual(zero_dashboard["cached_input_tokens"], 0)
+            self.assertEqual(zero_dashboard["uncached_input_tokens"], 0)
+            self.assertEqual(zero_dashboard["output_tokens"], 0)
+
     @unittest.skipUnless(
         os.environ.get("CODEX_TEAM_REAL_APP_SERVER_TEST") == "1",
         "set CODEX_TEAM_REAL_APP_SERVER_TEST=1 to run the installed App Server",
