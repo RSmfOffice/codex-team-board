@@ -3554,17 +3554,17 @@ Do not return raw logs or a full transcript.
             return value if isinstance(value, Mapping) else {}
 
         usage = values(state.get("usage"))
-        nested_usage = "total" in usage or "last" in usage
-        total = values(usage.get("total")) if nested_usage else usage
+        total = (
+            values(usage.get("total"))
+            if "total" in usage
+            else usage
+        )
         last_value = usage.get("last")
         last = values(last_value)
         first_usage = values(state.get("first_usage")) or usage
-        first_nested_usage = (
-            "total" in first_usage or "last" in first_usage
-        )
         first_total = (
             values(first_usage.get("total"))
-            if first_nested_usage
+            if "total" in first_usage
             else first_usage
         )
         first_last_value = first_usage.get("last")
@@ -3637,12 +3637,14 @@ Do not return raw logs or a full transcript.
 
         input_tokens, cached_tokens, output_tokens, context_tokens = turn_values(
             total,
-            isinstance(last_value, Mapping),
+            not _usage_has_evidence(total)
+            and isinstance(last_value, Mapping),
             last,
         )
         first_input, first_cached, _, _ = turn_values(
             first_total,
-            isinstance(first_last_value, Mapping),
+            not _usage_has_evidence(first_total)
+            and isinstance(first_last_value, Mapping),
             first_last,
         )
         raw_window = usage.get(

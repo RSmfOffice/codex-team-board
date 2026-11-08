@@ -1262,7 +1262,7 @@ class ClusterSchedulerTests(unittest.TestCase):
                     repo,
                     title=f"Usage turn {index}",
                     description="Exercise cumulative thread token usage.",
-                    acceptance="Only the current turn's tokens are recorded.",
+                    acceptance="Only the current job's cumulative tokens are recorded.",
                     kind="read",
                     owner_role="team_explorer",
                     goal_id=goal["goal_id"],
@@ -1279,17 +1279,33 @@ class ClusterSchedulerTests(unittest.TestCase):
                 {
                     "status": "completed",
                     "usage": {
-                        "input": 100,
-                        "cached": 50,
-                        "output": 60,
-                        "context": 70,
+                        "total": {
+                            "input": 100,
+                            "cached": 50,
+                            "output": 60,
+                            "context": 70,
+                        },
+                        "last": {
+                            "input": 20,
+                            "cached": 10,
+                            "output": 12,
+                            "context": 34,
+                        },
                         "modelContextWindow": 200,
                     },
                     "first_usage": {
-                        "input": 100,
-                        "cached": 50,
-                        "output": 60,
-                        "context": 70,
+                        "total": {
+                            "input": 25,
+                            "cached": 12,
+                            "output": 15,
+                            "context": 40,
+                        },
+                        "last": {
+                            "input": 20,
+                            "cached": 10,
+                            "output": 12,
+                            "context": 34,
+                        },
                         "modelContextWindow": 200,
                     },
                 }
@@ -1320,17 +1336,33 @@ class ClusterSchedulerTests(unittest.TestCase):
                 {
                     "status": "completed",
                     "usage": {
-                        "input": 180,
-                        "cached": 80,
-                        "output": 90,
-                        "context": 70,
+                        "total": {
+                            "input": 180,
+                            "cached": 80,
+                            "output": 90,
+                            "context": 70,
+                        },
+                        "last": {
+                            "input": 40,
+                            "cached": 8,
+                            "output": 20,
+                            "context": 35,
+                        },
                         "modelContextWindow": 200,
                     },
                     "first_usage": {
-                        "input": 150,
-                        "cached": 65,
-                        "output": 75,
-                        "context": 70,
+                        "total": {
+                            "input": 150,
+                            "cached": 65,
+                            "output": 75,
+                            "context": 66,
+                        },
+                        "last": {
+                            "input": 30,
+                            "cached": 12,
+                            "output": 18,
+                            "context": 33,
+                        },
                         "modelContextWindow": 200,
                     },
                 }
@@ -1382,6 +1414,28 @@ class ClusterSchedulerTests(unittest.TestCase):
             self.assertEqual(nested_fallback["cached_input_tokens"], 35)
             self.assertEqual(nested_fallback["uncached_input_tokens"], 45)
             self.assertEqual(nested_fallback["output_tokens"], 30)
+            last_fallback = manager._app_job_usage(
+                {
+                    "job_id": "J-LAST",
+                    "agent_id": agent["agent_id"],
+                },
+                {
+                    "usage": {
+                        "total": {},
+                        "last": {
+                            "input": 45,
+                            "cached": 5,
+                            "output": 7,
+                            "context": 52,
+                        },
+                        "modelContextWindow": 200,
+                    }
+                },
+            )
+            self.assertEqual(last_fallback["input_tokens"], 45)
+            self.assertEqual(last_fallback["cached_input_tokens"], 5)
+            self.assertEqual(last_fallback["uncached_input_tokens"], 40)
+            self.assertEqual(last_fallback["output_tokens"], 7)
             clamped = manager._app_job_usage(
                 dict(second_job),
                 {
@@ -1393,6 +1447,115 @@ class ClusterSchedulerTests(unittest.TestCase):
                 },
             )
             self.assertEqual(clamped["output_tokens"], 0)
+
+    def test_app_server_job_usage_uses_final_total_across_token_events(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            repo = _repo(base, "multi-usage-events")
+            team.init_project(repo)
+            runtime = StubAppServerRuntime()
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime=runtime,
+                runtime_mode="app_server",
+            )
+            events = _ClusterAppServerEvents(manager)
+            goal = manager.create_goal(
+                repo,
+                objective="Accumulate token usage across tool calls",
+            )
+            task = team.create_task(
+                repo,
+                title="Multiple usage events",
+                description="Emit cumulative usage after each model call.",
+                acceptance="The job records the final cumulative total.",
+                kind="read",
+                owner_role="team_explorer",
+                goal_id=goal["goal_id"],
+            )
+            job = manager._dispatch_worker(
+                manager.get_goal(goal["goal_id"]),
+                team.get_task(task["task_id"]),
+            )
+            events.on_token_usage_updated(
+                job["thread_id"],
+                job["turn_id"],
+                {
+                    "total": {
+                        "input": 120,
+                        "cached": 20,
+                        "output": 30,
+                        "context": 150,
+                    },
+                    "last": {
+                        "input": 50,
+                        "cached": 5,
+                        "output": 10,
+                        "context": 60,
+                    },
+                    "modelContextWindow": 200,
+                },
+            )
+            events.on_token_usage_updated(
+                job["thread_id"],
+                job["turn_id"],
+                {
+                    "total": {
+                        "input": 150,
+                        "cached": 25,
+                        "output": 34,
+                        "context": 184,
+                    },
+                    "last": {
+                        "input": 60,
+                        "cached": 6,
+                        "output": 12,
+                        "context": 72,
+                    },
+                    "modelContextWindow": 200,
+                },
+            )
+            with manager._app_state_lock:
+                manager.app_turns[job["job_id"]]["status"] = "completed"
+            with team.connection() as connection:
+                connection.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'review', updated_at = ?, version = version + 1
+                    WHERE task_id = ?
+                    """,
+                    (utc_now(), task["task_id"]),
+                )
+            manager._reconcile_jobs()
+
+            with team.connection(write=False) as connection:
+                persisted = connection.execute(
+                    """
+                    SELECT input_tokens, cached_input_tokens,
+                           uncached_input_tokens, output_tokens,
+                           first_input_tokens, first_cached_input_tokens,
+                           first_uncached_input_tokens, context_tokens,
+                           model_context_window, telemetry_complete
+                    FROM cluster_jobs
+                    WHERE job_id = ?
+                    """,
+                    (job["job_id"],),
+                ).fetchone()
+            self.assertEqual(persisted["input_tokens"], 150)
+            self.assertEqual(persisted["cached_input_tokens"], 25)
+            self.assertEqual(persisted["uncached_input_tokens"], 125)
+            self.assertEqual(persisted["output_tokens"], 34)
+            self.assertEqual(persisted["first_input_tokens"], 120)
+            self.assertEqual(persisted["first_cached_input_tokens"], 20)
+            self.assertEqual(persisted["first_uncached_input_tokens"], 100)
+            self.assertEqual(persisted["context_tokens"], 184)
+            self.assertEqual(persisted["model_context_window"], 200)
+            self.assertEqual(persisted["telemetry_complete"], 1)
 
     @unittest.skipUnless(
         os.environ.get("CODEX_TEAM_REAL_APP_SERVER_TEST") == "1",
@@ -2841,14 +3004,14 @@ class ClusterSchedulerTests(unittest.TestCase):
                     (usage_job["job_id"],),
                 ).fetchone()
             self.assertEqual(persisted["status"], "interrupted")
-            self.assertEqual(persisted["input_tokens"], 60)
-            self.assertEqual(persisted["cached_input_tokens"], 6)
-            self.assertEqual(persisted["uncached_input_tokens"], 54)
-            self.assertEqual(persisted["output_tokens"], 12)
-            self.assertEqual(persisted["first_input_tokens"], 50)
-            self.assertEqual(persisted["first_cached_input_tokens"], 5)
-            self.assertEqual(persisted["first_uncached_input_tokens"], 45)
-            self.assertEqual(persisted["context_tokens"], 72)
+            self.assertEqual(persisted["input_tokens"], 150)
+            self.assertEqual(persisted["cached_input_tokens"], 25)
+            self.assertEqual(persisted["uncached_input_tokens"], 125)
+            self.assertEqual(persisted["output_tokens"], 34)
+            self.assertEqual(persisted["first_input_tokens"], 120)
+            self.assertEqual(persisted["first_cached_input_tokens"], 20)
+            self.assertEqual(persisted["first_uncached_input_tokens"], 100)
+            self.assertEqual(persisted["context_tokens"], 184)
             self.assertEqual(persisted["model_context_window"], 200)
             self.assertEqual(
                 persisted["usage_source"],
@@ -2862,8 +3025,8 @@ class ClusterSchedulerTests(unittest.TestCase):
                 for job in dashboard["cluster_jobs"]
                 if job["job_id"] == usage_job["job_id"]
             )
-            self.assertEqual(dashboard_job["input_tokens"], 60)
-            self.assertEqual(dashboard_job["output_tokens"], 12)
+            self.assertEqual(dashboard_job["input_tokens"], 150)
+            self.assertEqual(dashboard_job["output_tokens"], 34)
 
             missing_goal = manager.create_goal(
                 repo,
@@ -2972,7 +3135,7 @@ class ClusterSchedulerTests(unittest.TestCase):
                 repo,
                 title="Complete normally",
                 description="Normal completion still records token usage.",
-                acceptance="Normal completion usage is unchanged.",
+                acceptance="Normal completion records the cumulative total.",
                 kind="read",
                 owner_role="team_explorer",
                 goal_id=completed_goal["goal_id"],
@@ -3028,9 +3191,9 @@ class ClusterSchedulerTests(unittest.TestCase):
                     (completed_job["job_id"],),
                 ).fetchone()
             self.assertEqual(completed["status"], "completed")
-            self.assertEqual(completed["input_tokens"], 40)
-            self.assertEqual(completed["cached_input_tokens"], 4)
-            self.assertEqual(completed["output_tokens"], 8)
+            self.assertEqual(completed["input_tokens"], 100)
+            self.assertEqual(completed["cached_input_tokens"], 10)
+            self.assertEqual(completed["output_tokens"], 20)
             self.assertEqual(completed["telemetry_complete"], 1)
 
     def test_daemon_restart_marks_app_server_turn_lost_and_recovers_task(self) -> None:
