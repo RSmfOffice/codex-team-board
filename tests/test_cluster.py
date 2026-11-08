@@ -1557,6 +1557,129 @@ class ClusterSchedulerTests(unittest.TestCase):
             self.assertEqual(persisted["model_context_window"], 200)
             self.assertEqual(persisted["telemetry_complete"], 1)
 
+    def test_app_server_terminal_jobs_without_usage_evidence_are_unknown(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            repo = _repo(base, "missing-terminal-usage")
+            project = team.init_project(repo)
+            runtime = StubAppServerRuntime()
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime=runtime,
+                runtime_mode="app_server",
+            )
+            goal = manager.create_goal(
+                repo,
+                objective="Terminal jobs without usage evidence",
+            )
+            usage_fields = (
+                "input_tokens",
+                "cached_input_tokens",
+                "uncached_input_tokens",
+                "cache_write_input_tokens",
+                "output_tokens",
+                "reasoning_output_tokens",
+                "first_input_tokens",
+                "first_cached_input_tokens",
+                "first_uncached_input_tokens",
+                "context_tokens",
+            )
+
+            def dispatch(label: str) -> tuple[dict, dict]:
+                task = team.create_task(
+                    repo,
+                    title=f"{label} without usage",
+                    description="No App Server token usage event is emitted.",
+                    acceptance="Unknown usage remains unknown.",
+                    kind="read",
+                    owner_role="team_explorer",
+                    goal_id=goal["goal_id"],
+                )
+                job = manager._dispatch_worker(
+                    manager.get_goal(goal["goal_id"]),
+                    team.get_task(task["task_id"]),
+                )
+                return job, task
+
+            def assert_unknown(job: dict, expected_status: str) -> None:
+                with team.connection(write=False) as connection:
+                    persisted = connection.execute(
+                        """
+                        SELECT status, usage_source, telemetry_complete,
+                               model_context_window,
+                               input_tokens, cached_input_tokens,
+                               uncached_input_tokens,
+                               cache_write_input_tokens, output_tokens,
+                               reasoning_output_tokens, first_input_tokens,
+                               first_cached_input_tokens,
+                               first_uncached_input_tokens, context_tokens
+                        FROM cluster_jobs
+                        WHERE job_id = ?
+                        """,
+                        (job["job_id"],),
+                    ).fetchone()
+                self.assertEqual(persisted["status"], expected_status)
+                self.assertIsNone(persisted["usage_source"])
+                self.assertEqual(persisted["telemetry_complete"], 0)
+                self.assertIsNone(persisted["model_context_window"])
+                for field in usage_fields:
+                    self.assertEqual(persisted[field], 0, field)
+
+                dashboard = team.dashboard_snapshot(project["project_id"])
+                dashboard_job = next(
+                    item
+                    for item in dashboard["cluster_jobs"]
+                    if item["job_id"] == job["job_id"]
+                )
+                self.assertIsNone(dashboard_job["usage_source"])
+                self.assertEqual(dashboard_job["telemetry_complete"], 0)
+                self.assertIsNone(dashboard_job["model_context_window"])
+                self.assertIsNone(dashboard_job["cache_hit_rate"])
+                for field in usage_fields:
+                    self.assertIsNone(dashboard_job[field], field)
+
+            with self.subTest(terminal="completed"):
+                completed_job, completed_task = dispatch("Completed")
+                with manager._app_state_lock:
+                    manager.app_turns[completed_job["job_id"]][
+                        "status"
+                    ] = "completed"
+                with team.connection() as connection:
+                    connection.execute(
+                        """
+                        UPDATE tasks
+                        SET status = 'review', updated_at = ?,
+                            version = version + 1
+                        WHERE task_id = ?
+                        """,
+                        (utc_now(), completed_task["task_id"]),
+                    )
+                manager._reconcile_jobs()
+                assert_unknown(completed_job, "completed")
+
+            with self.subTest(terminal="failed"):
+                failed_job, _ = dispatch("Failed")
+                with manager._app_state_lock:
+                    manager.app_turns[failed_job["job_id"]].update(
+                        {
+                            "status": "failed",
+                            "error": {"message": "turn failed without usage"},
+                        }
+                    )
+                manager._reconcile_jobs()
+                assert_unknown(failed_job, "failed")
+
+            with self.subTest(terminal="timeout"):
+                timeout_job, _ = dispatch("Timed out")
+                manager.worker_timeout_seconds = -1
+                manager._reconcile_jobs()
+                assert_unknown(timeout_job, "failed")
+
     @unittest.skipUnless(
         os.environ.get("CODEX_TEAM_REAL_APP_SERVER_TEST") == "1",
         "set CODEX_TEAM_REAL_APP_SERVER_TEST=1 to run the installed App Server",
