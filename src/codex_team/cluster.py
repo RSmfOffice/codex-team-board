@@ -325,7 +325,8 @@ class ClusterManager:
             "continuity_reason",
             limit=2000,
         )
-        project = self.team.init_project(repo)
+        project = self.team.register_project(repo)
+        self.team._ensure_project_active(project)
         goal_id = self._new_id("G")
         effective_workstream = requested_workstream or goal_id
         now = utc_now()

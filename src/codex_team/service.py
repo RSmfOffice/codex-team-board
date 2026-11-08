@@ -375,7 +375,11 @@ class TeamService:
 
         agents_path = root / "AGENTS.md"
         existing = agents_path.read_text(encoding="utf-8") if agents_path.exists() else ""
-        block = _agents_block(project["project_id"], max_threads)
+        block = _agents_block(
+            project["project_id"],
+            max_threads,
+            self.settings.project_root / "templates" / "PROJECT_AGENTS.md",
+        )
         updated = _replace_managed_block(
             existing,
             "CODEX_TEAM_BOARD",
@@ -2052,46 +2056,13 @@ def _replace_managed_block(text: str, name: str, block: str) -> str:
     return block.strip()
 
 
-def _agents_block(project_id: str, max_threads: int) -> str:
-    return f"""<!-- CODEX_TEAM_BOARD:START -->
-## Codex 团队协作策略
-
-- 项目 ID：`{project_id}`。所有协作任务都通过 `codexTeamBoard` MCP 管理，
-  不以聊天记忆或临时 Markdown TODO 作为共享状态。
-- 主 Agent 是唯一 Lead：负责创建任务、分配角色和 worktree、最终 Review、
-  集成测试、合并和标记 `done`。子 Agent 不得自行批准任务。
-- 处理已标记团队项目时，Lead 必须先调用 `team_list_tasks` 检查现有任务、依赖和
-  Review 状态；能恢复已有任务时不得重复创建。
-- 子 Agent 返回后，Lead 必须调用 `team_get_task` / `team_get_task_events` 验证
-  `claimed_by`、`claimed` 和 `submitted`（或 `blocked`）事件。没有状态落板的
-  Agent 回复不视为交付，必须重试或标记失败。
-- 已完成的子 Agent thread 不得用 follow-up 开启另一个任务；新材料和新审查必须
-  创建新 thread。60 秒未 claim 应提醒，5 分钟无 heartbeat 应标记异常。
-- 只读探索使用 `team_explorer`，写入使用 `team_worker`，独立审查使用
-  `team_reviewer`。当前 Codex 版本不能自动加载角色 TOML 时，先调用
-  `team_role_prompt(repo_root=...)`，把返回的角色 Prompt 作为子 Agent 的 spawn prompt。
-- 每个 `write` 任务必须有独立 Git worktree 和 `codex/team/<task-id>-<slug>`
-  分支。先调用 `team_create_worktree`，再调用 `team_claim_task`。
-- 创建 worktree 前主 checkout 必须干净并位于命名分支；初始化产生的
-  `AGENTS.md` 和 `.codex` 文件应先提交，确保 Worker 能看到团队规范。
-- 一个 worktree 同一时间只能有一个 writer。不要并行修改同一文件；若任务必然
-  触碰同一文件，应拆分阶段或串行执行。
-- Worker 领取任务后必须保存返回的 `claim_token`，定期发送 heartbeat，并在提交
-  时附上 commit、变更文件、行为摘要、测试命令与结果、风险和待决问题。
-- Worker 只能把任务提交到 `review`，不能直接改为 `done`。只有 Lead 或人工
-  验收者可以调用 `team_review_task`。
-- 两个以上模块共享状态时，必须先声明字段名、单位、合法区间、枚举、更新者和
-  消费方，并至少有一条真实生产者到真实消费者的一体化测试。
-- 主 Agent 合并前必须检查 diff、依赖、测试和任务审阅记录；合并后运行集成测试，
-  再关闭任务。
-- 接手或验收任务前使用 `team_get_task_events` 检查认领、进度、提交和 Review
-  事件，不能只看最终状态。
-- 在团队项目中，凡是非平凡开发任务（会修改文件、跨多个步骤或预计超过 5 分钟），
-  主 Agent 必须在第一次编辑或创建 worktree 前调用 `team_cluster_ensure`，
-  确保项目已有但仅有一个 planning/active cluster goal。已有目标时复用，不重复
-  创建；paused goal 不得自动恢复。纯问答和无需修改文件的单次只读检查可跳过。
-- `team_cluster_start` 只用于明确新建目标。常驻 `teamd` 负责 Lead resume/重建、
-  Worker 自动重试和 lease 回收；不得手工重复 spawn 同一 goal 的 Agent。
-  `supervised` 模式在 Review 阶段暂停等待人工决定。
-- 推荐最大并发线程数：{max_threads}。只有任务文件范围互不重叠时才提高并发。
-<!-- CODEX_TEAM_BOARD:END -->"""
+def _agents_block(
+    project_id: str,
+    max_threads: int,
+    template_path: Path,
+) -> str:
+    template = template_path.read_text(encoding="utf-8")
+    return template.strip().format(
+        project_id=project_id,
+        max_threads=max_threads,
+    )

@@ -333,6 +333,8 @@ class TeamFlowTests(unittest.TestCase):
         self.assertEqual(after.count("CODEX_TEAM_BOARD:START"), 1)
         self.assertEqual(after.count("CODEX_TEAM_BOARD:END"), 1)
         self.assertIn("推荐最大并发线程数：2", after)
+        self.assertIn("team_goal_set_checkpoint", after)
+        self.assertIn("Explorer、Reviewer 和 Worker 默认 fresh", after)
         self.assertIn("team_get_task_events", after)
         self.assertIn("主 checkout 必须干净", after)
         self.assertNotEqual(before, "")

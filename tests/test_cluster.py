@@ -2978,6 +2978,32 @@ class ClusterSchedulerTests(unittest.TestCase):
                 prompt.index("## Thread Scope"),
             )
 
+    def test_create_goal_does_not_rewrite_project_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            repo = _repo(base, "goal-policy")
+            project = team.init_project(repo)
+            agents_path = repo / "AGENTS.md"
+            before = agents_path.read_bytes()
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime_mode="exec",
+            )
+            with patch.object(
+                team,
+                "init_project",
+                side_effect=AssertionError("create_goal must not re-init project"),
+            ):
+                goal = manager.create_goal(
+                    repo,
+                    objective="Do not rewrite policy",
+                )
+            self.assertEqual(goal["project_id"], project["project_id"])
+            self.assertEqual(agents_path.read_bytes(), before)
+
     def test_lead_board_digest_bounds_completed_history(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
