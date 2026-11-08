@@ -11,6 +11,10 @@ from typing import Any, Iterator, Mapping
 from .db import connect, connect_readonly, utc_now
 
 
+# Bump whenever stable thread instructions or context architecture change.
+CURRENT_AGENT_PROFILE = "v0.5"
+
+
 class AgentPoolError(RuntimeError):
     pass
 
@@ -186,6 +190,7 @@ class AgentPool:
         display_name = self._require_text(display_name, "display_name")
         model = self._normalize_model(model)
         model_provider = self._normalize_model(model_provider)
+        profile = CURRENT_AGENT_PROFILE
         now = utc_now()
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -208,6 +213,7 @@ class AgentPool:
                     existing["project_id"],
                     existing["role"],
                     existing["workstream_key"],
+                    existing["profile"],
                     existing["model"],
                     existing["model_provider"],
                 )
@@ -215,6 +221,7 @@ class AgentPool:
                     project_id,
                     role,
                     workstream_key,
+                    profile,
                     model,
                     model_provider,
                 )
@@ -228,9 +235,9 @@ class AgentPool:
                 """
                 INSERT INTO cluster_agents(
                     agent_id, project_id, role, workstream_key, display_name,
-                    thread_id, status, model, model_provider, last_loaded_at,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 'idle', ?, ?, ?, ?, ?)
+                    thread_id, profile, status, model, model_provider,
+                    last_loaded_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?, ?, ?, ?)
                 """,
                 (
                     agent_id,
@@ -239,6 +246,7 @@ class AgentPool:
                     workstream_key,
                     display_name,
                     thread_id,
+                    profile,
                     model,
                     model_provider,
                     now,
@@ -256,6 +264,7 @@ class AgentPool:
                     "role": role,
                     "workstream_key": workstream_key,
                     "thread_id": thread_id,
+                    "profile": profile,
                     "model": model,
                     "model_provider": model_provider,
                 },
@@ -368,7 +377,7 @@ class AgentPool:
                 SELECT *
                 FROM cluster_agents
                 WHERE project_id = ? AND role = ? AND workstream_key = ?
-                  AND model = ? AND model_provider = ?
+                  AND profile = ? AND model = ? AND model_provider = ?
                   AND status IN ({", ".join("?" for _ in self.IDLE_STATUSES)})
                   AND archived_at IS NULL
                   AND reset_requested_at IS NULL
@@ -388,6 +397,7 @@ class AgentPool:
                     project_id,
                     role,
                     workstream_key,
+                    CURRENT_AGENT_PROFILE,
                     model,
                     model_provider,
                     *self.IDLE_STATUSES,
@@ -424,6 +434,7 @@ class AgentPool:
                     "continuity_mode": continuity_mode,
                     "task_kind": task_kind,
                     "workstream_key": workstream_key,
+                    "profile": CURRENT_AGENT_PROFILE,
                 },
                 created_at=now,
             )
