@@ -69,7 +69,7 @@ class AppServerRPCError(AppServerError):
         super().__init__(f"{method} failed ({code}): {message}")
 
 
-class TokenBreakdown(TypedDict):
+class TokenBreakdown(TypedDict, total=False):
     """One normalized App Server usage bucket."""
 
     input: int
@@ -195,21 +195,47 @@ def _non_negative_int(value: Any) -> int:
     return max(0, number)
 
 
+def _optional_non_negative_int(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return max(0, number)
+
+
 def _map_usage_bucket(value: Any) -> TokenBreakdown | None:
     if not isinstance(value, Mapping):
         return None
-    input_tokens = _non_negative_int(value.get("inputTokens"))
-    cached_tokens = min(
-        _non_negative_int(value.get("cachedInputTokens")),
-        input_tokens,
+    mapped: TokenBreakdown = {}
+    input_tokens = _optional_non_negative_int(value.get("inputTokens"))
+    if input_tokens is not None:
+        mapped["input"] = input_tokens
+
+    cached_tokens = _optional_non_negative_int(
+        value.get("cachedInputTokens")
     )
-    return {
-        "input": input_tokens,
-        "cached": cached_tokens,
-        "uncached": input_tokens - cached_tokens,
-        "output": _non_negative_int(value.get("outputTokens")),
-        "context": _non_negative_int(value.get("totalTokens")),
-    }
+    if cached_tokens is not None:
+        if input_tokens is not None:
+            cached_tokens = min(cached_tokens, input_tokens)
+        mapped["cached"] = cached_tokens
+
+    uncached_tokens = _optional_non_negative_int(
+        value.get("uncachedInputTokens")
+    )
+    if uncached_tokens is not None:
+        mapped["uncached"] = uncached_tokens
+    elif input_tokens is not None and cached_tokens is not None:
+        mapped["uncached"] = input_tokens - cached_tokens
+
+    output_tokens = _optional_non_negative_int(value.get("outputTokens"))
+    if output_tokens is not None:
+        mapped["output"] = output_tokens
+    context_tokens = _optional_non_negative_int(value.get("totalTokens"))
+    if context_tokens is not None:
+        mapped["context"] = context_tokens
+    return mapped
 
 
 def map_token_usage(payload: Mapping[str, Any]) -> TokenUsage:

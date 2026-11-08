@@ -430,7 +430,7 @@ class AppServerRuntimeTests(unittest.TestCase):
         self.assertFalse(runtime.health()["running"])
         runtime.stop()
 
-    def test_token_mapping_is_exact_and_clamps_uncached(self) -> None:
+    def test_token_mapping_preserves_presence_and_explicit_zero(self) -> None:
         usage = map_token_usage(
             {
                 "total": {
@@ -450,13 +450,8 @@ class AppServerRuntimeTests(unittest.TestCase):
                     "cached": 3,
                     "uncached": 0,
                     "output": 2,
-                    "context": 0,
                 },
                 "last": {
-                    "input": 0,
-                    "cached": 0,
-                    "uncached": 0,
-                    "output": 0,
                     "context": 5,
                 },
                 "modelContextWindow": None,
@@ -474,6 +469,53 @@ class AppServerRuntimeTests(unittest.TestCase):
         )
         self.assertIsNone(missing_last["last"])
         self.assertEqual(missing_last["total"]["uncached"], 8)
+
+        cached_and_uncached = map_token_usage(
+            {
+                "total": {
+                    "cachedInputTokens": 4,
+                    "uncachedInputTokens": 8,
+                    "outputTokens": 3,
+                    "totalTokens": 12,
+                }
+            }
+        )
+        self.assertNotIn("input", cached_and_uncached["total"])
+        self.assertEqual(cached_and_uncached["total"]["cached"], 4)
+        self.assertEqual(cached_and_uncached["total"]["uncached"], 8)
+        self.assertEqual(cached_and_uncached["total"]["output"], 3)
+
+        empty_last = map_token_usage(
+            {
+                "total": {},
+                "last": {},
+                "modelContextWindow": 200,
+            }
+        )
+        self.assertEqual(empty_last["total"], {})
+        self.assertEqual(empty_last["last"], {})
+        self.assertEqual(empty_last["modelContextWindow"], 200)
+
+        explicit_zero = map_token_usage(
+            {
+                "total": {
+                    "inputTokens": 0,
+                    "cachedInputTokens": 0,
+                    "outputTokens": 0,
+                    "totalTokens": 0,
+                }
+            }
+        )
+        self.assertEqual(
+            explicit_zero["total"],
+            {
+                "input": 0,
+                "cached": 0,
+                "uncached": 0,
+                "output": 0,
+                "context": 0,
+            },
+        )
 
 
 if __name__ == "__main__":
