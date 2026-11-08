@@ -29,6 +29,10 @@
   消费方，并至少有一条真实生产者到真实消费者的一体化测试。
 - 主 Agent 合并前必须检查 diff、依赖、测试和任务审阅记录；合并后运行集成测试，
   再关闭任务。
+- 主 Agent 在阶段边界调用 `team_goal_set_checkpoint`，只记录持久决策、完成项、
+  测试、风险、已否决方案和下一步；不得复制原始日志或完整 transcript。
+- 主 Agent 默认延续同一 workstream；Explorer、Reviewer 和 Worker 默认 fresh，
+  只有显式 `continuity_mode=reuse` 才复用 thread。
 - 接手或验收任务前使用 `team_get_task_events` 检查认领、进度、提交和 Review
   事件，不能只看最终状态。
 - 在团队项目中，凡是非平凡开发任务（会修改文件、跨多个步骤或预计超过 5 分钟），
