@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import queue
 import shutil
 import subprocess
 import sys
@@ -10,6 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -86,6 +88,33 @@ def _wait_for(predicate, timeout: float = 3.0) -> None:
             return
         time.sleep(0.01)
     raise AssertionError("condition was not met before timeout")
+
+
+def _deliver_token_usage(
+    events: AppServerEvents,
+    thread_id: str,
+    turn_id: str,
+    token_usage: Mapping[str, object],
+) -> None:
+    """Route a usage notification through the production mapping callback."""
+
+    runtime = AppServerRuntime(command=["unused"], event_handler=events)
+    event_queue: queue.Queue = queue.Queue()
+    runtime._event_queue = event_queue
+    runtime._dispatch_notification(
+        "thread/tokenUsage/updated",
+        {
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "tokenUsage": token_usage,
+        },
+    )
+    event = event_queue.get_nowait()
+    runtime._invoke_event_handler(
+        event.callback_name,
+        event.params,
+        **event.kwargs,
+    )
 
 
 class StubAppServerRuntime:
@@ -1713,7 +1742,8 @@ class ClusterSchedulerTests(unittest.TestCase):
                     manager.get_goal(goal["goal_id"]),
                     team.get_task(task["task_id"]),
                 )
-                events.on_token_usage_updated(
+                _deliver_token_usage(
+                    events,
                     job["thread_id"],
                     job["turn_id"],
                     usage,
@@ -1761,8 +1791,14 @@ class ClusterSchedulerTests(unittest.TestCase):
             partial, partial_dashboard = complete_with_usage(
                 "Partial",
                 {
-                    "total": {"input": 120, "context": 140},
-                    "last": {"input": 20, "context": 40},
+                    "total": {
+                        "inputTokens": 120,
+                        "totalTokens": 140,
+                    },
+                    "last": {
+                        "inputTokens": 20,
+                        "totalTokens": 40,
+                    },
                     "modelContextWindow": 200,
                 },
             )
@@ -1807,11 +1843,75 @@ class ClusterSchedulerTests(unittest.TestCase):
             self.assertIsNone(metadata_dashboard["output_tokens"])
             self.assertEqual(metadata_dashboard["model_context_window"], 200)
 
+            last_empty, last_empty_dashboard = complete_with_usage(
+                "Last empty",
+                {
+                    "total": {
+                        "inputTokens": 9,
+                        "cachedInputTokens": 2,
+                        "outputTokens": 4,
+                        "totalTokens": 13,
+                    },
+                    "last": {},
+                    "modelContextWindow": 200,
+                },
+            )
+            self.assertEqual(last_empty["input_tokens"], 9)
+            self.assertEqual(last_empty["cached_input_tokens"], 2)
+            self.assertEqual(last_empty["uncached_input_tokens"], 7)
+            self.assertEqual(last_empty["output_tokens"], 4)
+            self.assertEqual(last_empty["telemetry_complete"], 1)
+            self.assertEqual(last_empty_dashboard["input_tokens"], 9)
+            self.assertEqual(last_empty_dashboard["context_tokens"], 13)
+
+            cached_uncached, cached_uncached_dashboard = complete_with_usage(
+                "Cached uncached only",
+                {
+                    "total": {
+                        "cachedInputTokens": 30,
+                        "uncachedInputTokens": 50,
+                        "outputTokens": 10,
+                        "totalTokens": 80,
+                    },
+                    "last": {},
+                },
+            )
+            self.assertEqual(cached_uncached["telemetry_complete"], 0)
+            self.assertIn(
+                "input_tokens",
+                json.loads(cached_uncached["usage_missing_fields"]),
+            )
+            self.assertIsNone(cached_uncached_dashboard["input_tokens"])
+            self.assertEqual(
+                cached_uncached_dashboard["cached_input_tokens"],
+                30,
+            )
+            self.assertEqual(
+                cached_uncached_dashboard["uncached_input_tokens"],
+                50,
+            )
+            self.assertEqual(cached_uncached_dashboard["output_tokens"], 10)
+
+            unknown, unknown_dashboard = complete_with_usage(
+                "Unknown",
+                {},
+            )
+            self.assertIsNone(unknown["usage_source"])
+            self.assertEqual(unknown["telemetry_complete"], 0)
+            self.assertIsNone(unknown_dashboard["input_tokens"])
+            self.assertIsNone(unknown_dashboard["cached_input_tokens"])
+            self.assertIsNone(unknown_dashboard["output_tokens"])
+
             explicit_zero, zero_dashboard = complete_with_usage(
                 "Explicit zero",
                 {
-                    "total": {"input": 0, "cached": 0, "output": 0},
-                    "last": {"input": 0, "cached": 0, "output": 0},
+                    "total": {
+                        "inputTokens": 0,
+                        "cachedInputTokens": 0,
+                        "outputTokens": 0,
+                        "totalTokens": 0,
+                    },
+                    "last": {},
                 },
             )
             self.assertIsNotNone(explicit_zero["usage_source"])
@@ -1820,6 +1920,167 @@ class ClusterSchedulerTests(unittest.TestCase):
             self.assertEqual(zero_dashboard["cached_input_tokens"], 0)
             self.assertEqual(zero_dashboard["uncached_input_tokens"], 0)
             self.assertEqual(zero_dashboard["output_tokens"], 0)
+
+    def test_partial_app_usage_quarantines_thread_before_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            repo = _repo(base, "partial-baseline-reuse")
+            project = team.init_project(repo)
+            runtime = StubAppServerRuntime()
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime=runtime,
+                runtime_mode="app_server",
+            )
+            events = _ClusterAppServerEvents(manager)
+            goal = manager.create_goal(
+                repo,
+                objective="Quarantine partial usage baselines",
+                workstream_key="partial-baseline",
+                continuity_reason="two related turns",
+            )
+            tasks = [
+                team.create_task(
+                    repo,
+                    title=f"Baseline turn {index}",
+                    description="Exercise usage presence before thread reuse.",
+                    acceptance="Incomplete baselines cannot be reused.",
+                    kind="read",
+                    owner_role="team_explorer",
+                    goal_id=goal["goal_id"],
+                    continuity_mode="reuse",
+                )
+                for index in (1, 2)
+            ]
+
+            def finish(
+                job: dict,
+                task: dict,
+                usage: Mapping[str, object],
+            ) -> None:
+                _deliver_token_usage(
+                    events,
+                    job["thread_id"],
+                    job["turn_id"],
+                    usage,
+                )
+                events.on_turn_completed(
+                    job["thread_id"],
+                    job["turn_id"],
+                    {"id": job["turn_id"], "status": "completed"},
+                )
+                with team.connection() as connection:
+                    connection.execute(
+                        """
+                        UPDATE tasks
+                        SET status = 'review', updated_at = ?,
+                            version = version + 1
+                        WHERE task_id = ?
+                        """,
+                        (utc_now(), task["task_id"]),
+                    )
+                manager._reconcile_jobs()
+
+            first = manager._dispatch_worker(
+                manager.get_goal(goal["goal_id"]),
+                team.get_task(tasks[0]["task_id"]),
+            )
+            finish(
+                first,
+                tasks[0],
+                {
+                    "total": {
+                        "cachedInputTokens": 11,
+                        "uncachedInputTokens": 13,
+                        "outputTokens": 7,
+                        "totalTokens": 24,
+                    },
+                    "last": {},
+                },
+            )
+            with team.connection(write=False) as connection:
+                first_job = dict(
+                    connection.execute(
+                        """
+                        SELECT agent_id, usage_missing_fields,
+                               telemetry_complete
+                        FROM cluster_jobs
+                        WHERE job_id = ?
+                        """,
+                        (first["job_id"],),
+                    ).fetchone()
+                )
+                first_agent = dict(
+                    connection.execute(
+                        """
+                        SELECT status, reset_requested_at
+                        FROM cluster_agents
+                        WHERE agent_id = ?
+                        """,
+                        (first_job["agent_id"],),
+                    ).fetchone()
+                )
+            self.assertEqual(first_job["telemetry_complete"], 0)
+            self.assertIn(
+                "input_tokens",
+                json.loads(first_job["usage_missing_fields"]),
+            )
+            self.assertEqual(first_agent["status"], "failed")
+            self.assertIsNotNone(first_agent["reset_requested_at"])
+
+            second = manager._dispatch_worker(
+                manager.get_goal(goal["goal_id"]),
+                team.get_task(tasks[1]["task_id"]),
+            )
+            self.assertNotEqual(second["thread_id"], first["thread_id"])
+            self.assertEqual(runtime.resume_threads, [])
+            finish(
+                second,
+                tasks[1],
+                {
+                    "total": {
+                        "inputTokens": 40,
+                        "cachedInputTokens": 10,
+                        "outputTokens": 6,
+                        "totalTokens": 46,
+                    },
+                    "last": {},
+                },
+            )
+            with team.connection(write=False) as connection:
+                second_job = dict(
+                    connection.execute(
+                        """
+                        SELECT agent_id, input_tokens,
+                               cached_input_tokens, output_tokens,
+                               telemetry_complete
+                        FROM cluster_jobs
+                        WHERE job_id = ?
+                        """,
+                        (second["job_id"],),
+                    ).fetchone()
+                )
+                second_agent = dict(
+                    connection.execute(
+                        """
+                        SELECT status, reset_requested_at,
+                               total_input_tokens
+                        FROM cluster_agents
+                        WHERE agent_id = ?
+                        """,
+                        (second_job["agent_id"],),
+                    ).fetchone()
+                )
+            self.assertEqual(second_job["input_tokens"], 40)
+            self.assertEqual(second_job["cached_input_tokens"], 10)
+            self.assertEqual(second_job["output_tokens"], 6)
+            self.assertEqual(second_job["telemetry_complete"], 1)
+            self.assertEqual(second_agent["status"], "stored")
+            self.assertIsNone(second_agent["reset_requested_at"])
+            self.assertEqual(second_agent["total_input_tokens"], 40)
 
     @unittest.skipUnless(
         os.environ.get("CODEX_TEAM_REAL_APP_SERVER_TEST") == "1",
@@ -2116,6 +2377,20 @@ class ClusterSchedulerTests(unittest.TestCase):
             )
             self.assertEqual(runtime.resume_threads, [])
             self.assertNotEqual(first["thread_id"], legacy["thread_id"])
+            _deliver_token_usage(
+                _ClusterAppServerEvents(manager),
+                first["thread_id"],
+                first["turn_id"],
+                {
+                    "total": {
+                        "inputTokens": 10,
+                        "cachedInputTokens": 2,
+                        "outputTokens": 3,
+                        "totalTokens": 13,
+                    },
+                    "last": {},
+                },
+            )
             manager.app_turns[first["job_id"]]["status"] = "completed"
             manager._reconcile_jobs()
 
@@ -2979,6 +3254,20 @@ class ClusterSchedulerTests(unittest.TestCase):
                 continuity_reason="same feature staged work",
             )
             first_job = manager._dispatch_lead(first, [])
+            _deliver_token_usage(
+                _ClusterAppServerEvents(manager),
+                first_job["thread_id"],
+                first_job["turn_id"],
+                {
+                    "total": {
+                        "inputTokens": 10,
+                        "cachedInputTokens": 2,
+                        "outputTokens": 3,
+                        "totalTokens": 13,
+                    },
+                    "last": {},
+                },
+            )
             manager.app_turns[first_job["job_id"]]["status"] = "completed"
             manager._reconcile_jobs()
             first_goal = manager.get_goal(first["goal_id"])

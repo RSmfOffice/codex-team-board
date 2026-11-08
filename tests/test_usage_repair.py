@@ -154,6 +154,30 @@ class UsageRepairTests(unittest.TestCase):
             json.loads(parsed["usage_missing_fields"]),
         )
 
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "derived.jsonl"
+            log.write_text(
+                json.dumps(
+                    {
+                        "type": "turn.completed",
+                        "usage": {
+                            "cached_input_tokens": 2,
+                            "uncached_input_tokens": 3,
+                            "output_tokens": 0,
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            derived = _parse_codex_log(log)
+        self.assertEqual(derived["input_tokens"], 5)
+        self.assertFalse(derived["telemetry_complete"])
+        self.assertIn(
+            "input_tokens",
+            json.loads(derived["usage_missing_fields"]),
+        )
+
     def test_schema_and_backfill_are_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)

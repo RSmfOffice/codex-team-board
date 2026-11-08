@@ -36,6 +36,7 @@ from .service import TeamError, TeamService
 from .usage import (
     JOB_USAGE_FIELDS,
     normalize_usage,
+    usage_field_is_present,
     usage_from_exec_log,
     usage_has_any_evidence,
     usage_has_cost_evidence,
@@ -3489,7 +3490,7 @@ Do not return raw logs or a full transcript.
             if existing_nonzero and not recovered_nonzero:
                 return False
 
-            telemetry_complete = usage_is_cost_complete(usage)
+            telemetry_complete = _usage_is_telemetry_complete(usage)
             usage_source = (
                 "app_server.token_usage"
                 if _usage_has_evidence(usage)
@@ -3561,7 +3562,7 @@ Do not return raw logs or a full transcript.
         self,
         job: Mapping[str, Any],
         state: Mapping[str, Any],
-    ) -> dict[str, int | None]:
+    ) -> dict[str, Any]:
         if not _usage_state_has_evidence(state):
             log_state = _app_usage_state_from_log(job.get("log_path"))
             if log_state:
@@ -3633,6 +3634,7 @@ Do not return raw logs or a full transcript.
             int | None,
             int | None,
             int | None,
+            frozenset[str],
         ]:
             cumulative_values = normalize_usage(cumulative)
             per_turn_values = normalize_usage(per_turn)
@@ -3661,6 +3663,8 @@ Do not return raw logs or a full transcript.
                     )
                 )
             )
+            selected_raw = per_turn if use_per_turn else cumulative
+            fallback_raw = cumulative if use_per_turn else per_turn
             selected = per_turn_values if use_per_turn else cumulative_values
             fallback = cumulative_values if use_per_turn else per_turn_values
 
@@ -3701,6 +3705,33 @@ Do not return raw logs or a full transcript.
             reasoning_output = selected.get("reasoning_output_tokens")
             if reasoning_output is None:
                 reasoning_output = fallback.get("reasoning_output_tokens")
+            present_fields = {
+                field
+                for field in (
+                    "input_tokens",
+                    "cached_input_tokens",
+                    "output_tokens",
+                )
+                if usage_field_is_present(selected_raw, field)
+            }
+            for field in (
+                "context_tokens",
+                "cache_write_input_tokens",
+                "reasoning_output_tokens",
+            ):
+                if (
+                    usage_field_is_present(selected_raw, field)
+                    or usage_field_is_present(fallback_raw, field)
+                ):
+                    present_fields.add(field)
+            if usage_field_is_present(
+                selected_raw,
+                "uncached_input_tokens",
+            ) or {
+                "input_tokens",
+                "cached_input_tokens",
+            }.issubset(present_fields):
+                present_fields.add("uncached_input_tokens")
             return (
                 input_count,
                 cached_count,
@@ -3708,6 +3739,7 @@ Do not return raw logs or a full transcript.
                 context_count,
                 cache_write,
                 reasoning_output,
+                frozenset(present_fields),
             )
 
         (
@@ -3717,6 +3749,7 @@ Do not return raw logs or a full transcript.
             context_tokens,
             cache_write,
             reasoning_output,
+            present_fields,
         ) = snapshot_values(
             total,
             isinstance(last_value, Mapping),
@@ -3730,6 +3763,7 @@ Do not return raw logs or a full transcript.
             _,
             _,
             _,
+            first_present_fields,
         ) = snapshot_values(
             first_total,
             isinstance(first_last_value, Mapping),
@@ -3759,7 +3793,18 @@ Do not return raw logs or a full transcript.
             )
         except (TypeError, ValueError):
             model_window = None
-        return {
+        if model_window is not None:
+            present_fields = present_fields | {"model_context_window"}
+        output_present_fields = set(present_fields)
+        for final_field, snapshot_field in (
+            ("first_input_tokens", "input_tokens"),
+            ("first_cached_input_tokens", "cached_input_tokens"),
+            ("first_uncached_input_tokens", "uncached_input_tokens"),
+        ):
+            if snapshot_field in first_present_fields:
+                output_present_fields.add(final_field)
+
+        result: dict[str, Any] = {
             "input_tokens": input_tokens,
             "cached_input_tokens": cached_tokens,
             "uncached_input_tokens": (
@@ -3780,6 +3825,29 @@ Do not return raw logs or a full transcript.
             "cache_write_input_tokens": cache_write,
             "reasoning_output_tokens": reasoning_output,
         }
+        missing_fields = tuple(
+            field
+            for field in JOB_USAGE_FIELDS
+            if (
+                field not in output_present_fields
+                or result.get(field) is None
+            )
+        )
+        result["usage_present_fields"] = tuple(
+            sorted(output_present_fields)
+        )
+        result["usage_missing_fields"] = missing_fields
+        result["telemetry_complete"] = all(
+            field in output_present_fields
+            and result.get(field) is not None
+            for field in (
+                "input_tokens",
+                "cached_input_tokens",
+                "uncached_input_tokens",
+                "output_tokens",
+            )
+        )
+        return result
 
     def _finalize_app_agent(
         self,
@@ -3799,7 +3867,7 @@ Do not return raw logs or a full transcript.
         agent_id = str(job.get("agent_id") or "")
         if agent_id and not agent_already_failed:
             usage = self._app_job_usage(job, state)
-            if success:
+            if success and _usage_is_telemetry_complete(usage):
                 try:
                     self.agent_pool.release(
                         agent_id,
@@ -3811,8 +3879,13 @@ Do not return raw logs or a full transcript.
             else:
                 self._failed_agent_for_job(
                     job,
-                    self._app_turn_error(state) or "App Server turn failed",
-                    needs_reset=needs_reset,
+                    (
+                        self._app_turn_error(state)
+                        if not success
+                        else "App Server usage incomplete; thread baseline quarantined"
+                    )
+                    or "App Server turn failed",
+                    needs_reset=needs_reset or success,
                 )
         with self._app_state_lock:
             job_id = str(job.get("job_id"))
@@ -3874,11 +3947,13 @@ Do not return raw logs or a full transcript.
                 else None
             )
             telemetry_complete = (
-                usage_is_cost_complete(usage) if usage_has_evidence else False
+                _usage_is_telemetry_complete(usage)
+                if usage_has_evidence
+                else False
             )
         else:
             usage_source = parsed.get("usage_source")
-            telemetry_complete = usage_is_cost_complete(usage)
+            telemetry_complete = _usage_is_telemetry_complete(usage)
         if job["kind"] == "worker":
             task = self.team.get_task(job["task_id"])
             worker_ok = task["status"] in {"review", "done", "blocked"}
@@ -4332,9 +4407,9 @@ def _parse_codex_log(path: Path) -> dict[str, Any]:
             else usage["uncached_input_tokens"]
         ),
         "usage_source": usage_record.get("usage_source"),
-        "telemetry_complete": usage_is_cost_complete(usage),
     }
-    result["usage_missing_fields"] = _usage_missing_fields_json(result)
+    present_fields: set[str] = set()
+    first_present_fields: set[str] | None = None
     try:
         with path.open("r", encoding="utf-8", errors="replace") as stream:
             for line in stream:
@@ -4349,6 +4424,25 @@ def _parse_codex_log(path: Path) -> dict[str, Any]:
                     result["thread_id"] = item.get("thread_id")
                 elif event_type == "turn.completed":
                     result["completed"] = True
+                    event_usage = item.get("usage")
+                    if isinstance(event_usage, Mapping):
+                        event_fields = {
+                            field
+                            for field in (
+                                "input_tokens",
+                                "cached_input_tokens",
+                                "uncached_input_tokens",
+                                "cache_write_input_tokens",
+                                "output_tokens",
+                                "reasoning_output_tokens",
+                                "context_tokens",
+                                "model_context_window",
+                            )
+                            if usage_field_is_present(event_usage, field)
+                        }
+                        present_fields.update(event_fields)
+                        if first_present_fields is None:
+                            first_present_fields = set(event_fields)
                 elif event_type in {"turn.failed", "error"}:
                     error = item.get("error") or item.get("message")
                     if isinstance(error, dict):
@@ -4356,6 +4450,44 @@ def _parse_codex_log(path: Path) -> dict[str, Any]:
                     result["error"] = str(error or event_type)
     except OSError:
         result["error"] = "log unreadable"
+    if (
+        "uncached_input_tokens" in present_fields
+        or {
+            "input_tokens",
+            "cached_input_tokens",
+        }.issubset(present_fields)
+    ):
+        present_fields.add("uncached_input_tokens")
+    output_present_fields = set(present_fields)
+    first_present_fields = first_present_fields or set()
+    if (
+        "uncached_input_tokens" in first_present_fields
+        or {
+            "input_tokens",
+            "cached_input_tokens",
+        }.issubset(first_present_fields)
+    ):
+        first_present_fields.add("uncached_input_tokens")
+    for final_field, snapshot_field in (
+        ("first_input_tokens", "input_tokens"),
+        ("first_cached_input_tokens", "cached_input_tokens"),
+        ("first_uncached_input_tokens", "uncached_input_tokens"),
+    ):
+        if snapshot_field in first_present_fields:
+            output_present_fields.add(final_field)
+    result["usage_present_fields"] = tuple(sorted(output_present_fields))
+    result["usage_missing_fields"] = ()
+    result["telemetry_complete"] = all(
+        field in output_present_fields
+        and result.get(field) is not None
+        for field in (
+            "input_tokens",
+            "cached_input_tokens",
+            "uncached_input_tokens",
+            "output_tokens",
+        )
+    )
+    result["usage_missing_fields"] = _usage_missing_fields_json(result)
     return result
 
 
@@ -4367,10 +4499,49 @@ def _usage_has_any_evidence(value: Mapping[str, Any] | None) -> bool:
     return usage_has_any_evidence(value)
 
 
+def _usage_is_telemetry_complete(
+    usage: Mapping[str, Any] | None,
+) -> bool:
+    if isinstance(usage, Mapping):
+        declared = usage.get("telemetry_complete")
+        if isinstance(declared, bool):
+            return declared
+    return usage_is_cost_complete(usage)
+
+
 def _usage_missing_fields_json(usage: Mapping[str, Any] | None) -> str:
     values = usage if isinstance(usage, Mapping) else {}
+    declared = values.get("usage_missing_fields")
+    declared_missing = (
+        {
+            field
+            for field in declared
+            if isinstance(field, str) and field in JOB_USAGE_FIELDS
+        }
+        if isinstance(declared, (list, tuple, set, frozenset))
+        else set()
+    )
+    present = values.get("usage_present_fields")
+    present_fields = (
+        {
+            field
+            for field in present
+            if isinstance(field, str) and field in JOB_USAGE_FIELDS
+        }
+        if isinstance(present, (list, tuple, set, frozenset))
+        else None
+    )
     missing = sorted(
-        field for field in JOB_USAGE_FIELDS if values.get(field) is None
+        field
+        for field in JOB_USAGE_FIELDS
+        if (
+            field in declared_missing
+            or values.get(field) is None
+            or (
+                present_fields is not None
+                and field not in present_fields
+            )
+        )
     )
     return json.dumps(missing, ensure_ascii=False, separators=(",", ":"))
 
