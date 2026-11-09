@@ -997,6 +997,25 @@ class TeamService:
             tasks = [dict(row) for row in task_rows]
             task_ids = [task["task_id"] for task in tasks]
             blocked_by: dict[str, list[dict[str, Any]]] = {task_id: [] for task_id in task_ids}
+            archived_project_ids = {
+                str(project["project_id"])
+                for project in projects
+                if project.get("archived_at")
+            }
+            archived_goal_ids = {
+                str(goal["goal_id"])
+                for goal in cluster_goals
+                if goal.get("archived_at")
+            }
+
+            def is_historical_task(task: dict[str, Any]) -> bool:
+                if task.get("archived_at"):
+                    return True
+                if str(task.get("project_id")) in archived_project_ids:
+                    return True
+                goal_id = task.get("goal_id")
+                return bool(goal_id and str(goal_id) in archived_goal_ids)
+
             if task_ids:
                 placeholders = ",".join("?" for _ in task_ids)
                 dependency_rows = connection.execute(
@@ -1161,12 +1180,16 @@ class TeamService:
                 )
             tasks_by_goal: dict[str, list[dict[str, Any]]] = {}
             for task in tasks:
+                if is_historical_task(task):
+                    continue
                 goal_id = task.get("goal_id")
                 if goal_id:
                     tasks_by_goal.setdefault(str(goal_id), []).append(task)
             goal_states: dict[str, dict[str, Any]] = {}
             attention_count = 0
             for task in tasks:
+                if is_historical_task(task):
+                    continue
                 goal_id = task.get("goal_id")
                 if not goal_id:
                     if (
@@ -1215,6 +1238,9 @@ class TeamService:
             for goal in cluster_goals:
                 state = goal_states.get(goal["goal_id"], {})
                 goal_status = goal["status"]
+                is_historical_goal = bool(goal.get("archived_at")) or (
+                    str(goal["project_id"]) in archived_project_ids
+                )
                 has_active_job = goal["goal_id"] in active_goal_ids
                 has_blocked = bool(state.get("has_blocked"))
                 has_review = bool(state.get("has_review"))
@@ -1225,6 +1251,16 @@ class TeamService:
                 goal["attention_task_count"] = int(
                     state.get("attention_task_count", 0)
                 )
+                if is_historical_goal:
+                    goal["health"] = "archived"
+                    goal["next_action"] = "none"
+                    goal["attention_task_count"] = 0
+                    goal["active_job_count"] = 0
+                    goal["heartbeat_age_seconds"] = 0
+                    goal["heartbeat_state"] = "idle"
+                    goal["queue_reason"] = "none"
+                    goal["estimated_wait_seconds"] = 0
+                    continue
                 if (
                     goal_status == "failed"
                     or has_blocked
@@ -1456,6 +1492,7 @@ class TeamService:
                         task["claim_wait_seconds"]
                         for task in tasks
                         if task["status"] == "ready"
+                        and not is_historical_task(task)
                     ),
                     default=0,
                 ),

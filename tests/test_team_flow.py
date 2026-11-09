@@ -1350,6 +1350,103 @@ class TeamFlowTests(unittest.TestCase):
             "inspect_failed_goal",
         )
 
+    def test_archived_failed_goal_is_historical_not_actionable(self) -> None:
+        manager = ClusterManager(
+            self.settings,
+            team=self.team,
+            worktrees=self.worktrees,
+        )
+        goal = manager.create_goal(
+            self.repo,
+            objective="Keep an archived failure for audit only",
+            autonomy="auto",
+        )
+        manager.set_goal_status(goal["goal_id"], "failed", reason="historical failure")
+        task = self.team.create_task(
+            self.repo,
+            title="Blocked historical task",
+            description="Must not remain actionable after its goal is archived.",
+            acceptance="visible only as history",
+            kind="read",
+            owner_role="team_explorer",
+            goal_id=goal["goal_id"],
+        )
+        self.team.block_task(
+            task["task_id"],
+            actor="worker",
+            reason="preserved for audit",
+        )
+
+        manager.set_goal_archived(goal["goal_id"], True)
+        active = self.team.dashboard_snapshot()
+        archived = self.team.dashboard_snapshot(include_archived=True)
+
+        self.assertNotIn(
+            goal["goal_id"],
+            {item["goal_id"] for item in active["cluster_goals"]},
+        )
+        archived_goal = next(
+            item
+            for item in archived["cluster_goals"]
+            if item["goal_id"] == goal["goal_id"]
+        )
+        self.assertEqual(archived_goal["status"], "failed")
+        self.assertEqual(archived_goal["health"], "archived")
+        self.assertEqual(archived_goal["next_action"], "none")
+        self.assertEqual(archived_goal["attention_task_count"], 0)
+        self.assertEqual(archived_goal["queue_reason"], "none")
+        self.assertEqual(archived["cluster_summary"]["goals_failed"], 1)
+        self.assertEqual(archived["cluster_summary"]["attention_count"], 0)
+
+    def test_archived_project_tasks_are_historical_without_task_archive(self) -> None:
+        manager = ClusterManager(
+            self.settings,
+            team=self.team,
+            worktrees=self.worktrees,
+        )
+        project = self.team.register_project(self.repo)
+        goal = manager.create_goal(
+            self.repo,
+            objective="Archive a failed project as history",
+            autonomy="auto",
+        )
+        manager.set_goal_status(goal["goal_id"], "failed", reason="historical failure")
+        task = self.team.create_task(
+            self.repo,
+            title="Legacy blocked task",
+            description="Its task archive flag stays null when the project is archived.",
+            acceptance="historical task is not actionable",
+            kind="read",
+            owner_role="team_explorer",
+            goal_id=goal["goal_id"],
+        )
+        self.team.block_task(
+            task["task_id"],
+            actor="worker",
+            reason="preserved for audit",
+        )
+
+        self.team.set_project_archived(project["project_id"], True)
+        self.assertIsNone(self.team.get_task(task["task_id"])["archived_at"])
+        self.assertIsNone(manager.get_goal(goal["goal_id"])["archived_at"])
+        active = self.team.dashboard_snapshot()
+        archived = self.team.dashboard_snapshot(include_archived=True)
+
+        self.assertNotIn(
+            goal["goal_id"],
+            {item["goal_id"] for item in active["cluster_goals"]},
+        )
+        archived_goal = next(
+            item
+            for item in archived["cluster_goals"]
+            if item["goal_id"] == goal["goal_id"]
+        )
+        self.assertEqual(archived_goal["status"], "failed")
+        self.assertEqual(archived_goal["health"], "archived")
+        self.assertEqual(archived_goal["next_action"], "none")
+        self.assertEqual(archived_goal["attention_task_count"], 0)
+        self.assertEqual(archived["cluster_summary"]["attention_count"], 0)
+
     def test_dashboard_cluster_capacity_queue_and_heartbeat_diagnostics(self) -> None:
         manager = ClusterManager(
             self.settings,
