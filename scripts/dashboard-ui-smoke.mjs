@@ -61,6 +61,12 @@ expectText(app, "/api/projects", "app.js");
 expectText(app, "data.cluster_summary", "app.js");
 expectText(app, "goal?.health", "app.js");
 expectText(app, "goal?.next_action", "app.js");
+expectText(
+  between(app, "const labels = {", "const statusLabels = {"),
+  'archived: "已归档"',
+  "app.js goal health labels",
+);
+expectText(app, 'if (value === "none") return "无";', "app.js");
 expectText(app, 'allLabel: "选择目标项目"', "app.js");
 expectPattern(
   app,

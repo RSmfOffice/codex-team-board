@@ -404,6 +404,7 @@ function goalHealth(goal) {
     error: "异常",
     failed: "失败",
     degraded: "降级",
+    archived: "已归档",
   };
   const statusLabels = {
     planning: "规划中",
@@ -435,6 +436,7 @@ function nextActionText(goal) {
     };
     return fallbacks[goal?.status] || "—";
   }
+  if (value === "none") return "无";
   if (Array.isArray(value)) {
     return value
       .map((item) => nextActionText({ next_action: item }))
