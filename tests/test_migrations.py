@@ -118,7 +118,7 @@ class MigrationTests(unittest.TestCase):
             finally:
                 upgraded.close()
 
-    def test_schema_16_keeps_usage_presence_and_archive_migrations_idempotent(self) -> None:
+    def test_schema_17_keeps_usage_presence_and_archive_migrations_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "usage-v14.sqlite"
             connection = sqlite3.connect(path)
@@ -166,7 +166,7 @@ class MigrationTests(unittest.TestCase):
                 self.assertEqual(old["usage_missing_fields"], "[]")
                 self.assertEqual(
                     upgraded.execute("PRAGMA user_version").fetchone()[0],
-                    16,
+                    17,
                 )
             finally:
                 upgraded.close()
@@ -182,7 +182,7 @@ class MigrationTests(unittest.TestCase):
                         """
                     ).fetchall()
                 ]
-                self.assertEqual(versions, [14, 16])
+                self.assertEqual(versions, [14, 17])
                 columns = {
                     row["name"]
                     for row in reopened.execute(
@@ -190,8 +190,72 @@ class MigrationTests(unittest.TestCase):
                     ).fetchall()
                 }
                 self.assertIn("usage_missing_fields", columns)
+                goal_columns = {
+                    row["name"]
+                    for row in reopened.execute(
+                        "PRAGMA table_info(cluster_goals)"
+                    ).fetchall()
+                }
+                self.assertTrue(
+                    {
+                        "stall_ticks",
+                        "stall_signature",
+                        "stalled_at",
+                    }
+                    <= goal_columns
+                )
             finally:
                 reopened.close()
+
+    def test_schema_17_goal_stall_columns_migrate_idempotently(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "goal-stall-migration.sqlite"
+            connection = connect(path)
+            connection.close()
+            connection = sqlite3.connect(path)
+            try:
+                connection.execute(
+                    "ALTER TABLE cluster_goals DROP COLUMN stalled_at"
+                )
+                connection.execute(
+                    "ALTER TABLE cluster_goals DROP COLUMN stall_signature"
+                )
+                connection.execute(
+                    "ALTER TABLE cluster_goals DROP COLUMN stall_ticks"
+                )
+                connection.execute(
+                    "DELETE FROM schema_migrations WHERE version = 17"
+                )
+                connection.execute("PRAGMA user_version = 16")
+                connection.commit()
+            finally:
+                connection.close()
+
+            for _ in range(2):
+                upgraded = connect(path)
+                try:
+                    columns = {
+                        row["name"]
+                        for row in upgraded.execute(
+                            "PRAGMA table_info(cluster_goals)"
+                        ).fetchall()
+                    }
+                    self.assertTrue(
+                        {
+                            "stall_ticks",
+                            "stall_signature",
+                            "stalled_at",
+                        }
+                        <= columns
+                    )
+                    self.assertEqual(
+                        upgraded.execute(
+                            "PRAGMA user_version"
+                        ).fetchone()[0],
+                        SCHEMA_VERSION,
+                    )
+                finally:
+                    upgraded.close()
 
     def test_archived_goal_done_tasks_are_backfilled_once(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

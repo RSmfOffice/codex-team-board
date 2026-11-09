@@ -405,6 +405,7 @@ function goalHealth(goal) {
     failed: "失败",
     degraded: "降级",
     archived: "已归档",
+    stalled: "已停滞",
   };
   const statusLabels = {
     planning: "规划中",
@@ -437,6 +438,7 @@ function nextActionText(goal) {
     return fallbacks[goal?.status] || "—";
   }
   if (value === "none") return "无";
+  if (value === "inspect_stalled_goal") return "检查停滞原因";
   if (Array.isArray(value)) {
     return value
       .map((item) => nextActionText({ next_action: item }))

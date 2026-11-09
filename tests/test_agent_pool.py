@@ -222,7 +222,7 @@ class AgentPoolTests(unittest.TestCase):
         path = Path(self.temporary.name) / "profile-migration.sqlite"
         now = utc_now()
         with closing(connect(path)) as connection:
-            self.assertEqual(SCHEMA_VERSION, 16)
+            self.assertEqual(SCHEMA_VERSION, 17)
             connection.execute("ALTER TABLE cluster_agents DROP COLUMN profile")
             connection.execute(
                 "DELETE FROM schema_migrations WHERE version = ?",

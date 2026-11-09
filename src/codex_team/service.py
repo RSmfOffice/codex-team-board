@@ -1251,6 +1251,10 @@ class TeamService:
                 goal["attention_task_count"] = int(
                     state.get("attention_task_count", 0)
                 )
+                is_stalled_goal = (
+                    goal_status == "paused"
+                    and bool(goal.get("stalled_at"))
+                )
                 if is_historical_goal:
                     goal["health"] = "archived"
                     goal["next_action"] = "none"
@@ -1261,7 +1265,9 @@ class TeamService:
                     goal["queue_reason"] = "none"
                     goal["estimated_wait_seconds"] = 0
                     continue
-                if (
+                if is_stalled_goal:
+                    goal["health"] = "stalled"
+                elif (
                     goal_status == "failed"
                     or has_blocked
                     or has_critical_wait
@@ -1279,7 +1285,9 @@ class TeamService:
                     goal["health"] = "planning"
                 else:
                     goal["health"] = "healthy"
-                if goal_status == "failed":
+                if is_stalled_goal:
+                    goal["next_action"] = "inspect_stalled_goal"
+                elif goal_status == "failed":
                     goal["next_action"] = "inspect_failed_goal"
                 elif goal_status == "paused":
                     goal["next_action"] = "resume_or_cancel_goal"
@@ -2082,7 +2090,7 @@ class TeamService:
     ) -> list[dict[str, Any]]:
         rows = connection.execute(
             """
-            SELECT t.task_id, t.title, t.status
+            SELECT t.task_id, t.title, t.status, t.archived_at
             FROM task_dependencies d
             JOIN tasks t ON t.task_id = d.depends_on
             WHERE d.task_id = ? AND t.status != 'done'

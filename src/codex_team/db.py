@@ -5,7 +5,7 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
@@ -97,6 +97,9 @@ CREATE TABLE IF NOT EXISTS cluster_goals (
     continuity_reason TEXT NOT NULL DEFAULT '',
     checkpoint_summary TEXT NOT NULL DEFAULT '',
     checkpoint_updated_at TEXT,
+    stall_ticks INTEGER NOT NULL DEFAULT 0,
+    stall_signature TEXT NOT NULL DEFAULT '',
+    stalled_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     completed_at TEXT,
@@ -280,6 +283,9 @@ CLUSTER_GOAL_MIGRATION_COLUMNS = {
     "continuity_reason": "TEXT NOT NULL DEFAULT ''",
     "checkpoint_summary": "TEXT NOT NULL DEFAULT ''",
     "checkpoint_updated_at": "TEXT",
+    "stall_ticks": "INTEGER NOT NULL DEFAULT 0",
+    "stall_signature": "TEXT NOT NULL DEFAULT ''",
+    "stalled_at": "TEXT",
 }
 
 CLUSTER_JOB_MIGRATION_COLUMNS = {

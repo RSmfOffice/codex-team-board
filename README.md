@@ -879,6 +879,15 @@ WebUI 的 `global_capacity` 是 active goal 数乘以每 goal Worker 容量；Le
 如果系统安全阀低于多个 goal 的实际进程总数，安全阀优先并启用公平轮转；未达到
 安全阀时，各 goal 可在自己的 Worker 配额内独立推进。
 
+若依赖任务已经 `canceled` 或归档，依赖它的任务会转为 `blocked`，记录
+`dependency_invalidated`，并在同一轮调度中交给 Lead 处理，不会继续显示为
+永久 `dependency_wait`。
+
+`CODEX_TEAM_GOAL_STALL_TICKS` 控制 goal 停滞保护，默认 `6` 个 tick。planning/active
+goal 在没有活动 job、没有有效外部 lease、行为签名连续不变达到阈值时，会自动转为
+paused，写入 `goal_stalled` 和 `inspect_stalled_goal` 健康提示；人工恢复 goal 时
+停滞计数会清零。
+
 ### 长任务与心跳
 
 - Worker 最近一次 `claimed`、`heartbeat` 或 `progress` 事件超过 5 分钟后，记录

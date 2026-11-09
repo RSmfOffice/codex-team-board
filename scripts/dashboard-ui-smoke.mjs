@@ -66,7 +66,17 @@ expectText(
   'archived: "已归档"',
   "app.js goal health labels",
 );
+expectText(
+  between(app, "const labels = {", "const statusLabels = {"),
+  'stalled: "已停滞"',
+  "app.js stalled health label",
+);
 expectText(app, 'if (value === "none") return "无";', "app.js");
+expectText(
+  app,
+  'if (value === "inspect_stalled_goal") return "检查停滞原因";',
+  "app.js stalled next action",
+);
 expectText(app, 'allLabel: "选择目标项目"', "app.js");
 expectPattern(
   app,

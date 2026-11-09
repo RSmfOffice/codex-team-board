@@ -2,6 +2,20 @@
 
 本项目遵循语义化版本。
 
+## [Unreleased]
+
+### Fixed
+
+- canceled 或已归档依赖不再把下游任务永久留在 `dependency_wait`；下游任务会转为
+  blocked，并通过 `dependency_invalidated` 自动交给 Lead 处理。
+- planning/active goal 在无活动 job 且行为签名长期不变时，由停滞看门狗自动暂停，
+  避免依赖环或调度异常造成无声挂起。
+
+### Database
+
+- schema 升级到 17，`cluster_goals` 新增 `stall_ticks`、`stall_signature` 和
+  `stalled_at`，用于跨 daemon 重启保留停滞检测状态。
+
 ## [0.5.0] - 2026-11-08
 
 ### Changed

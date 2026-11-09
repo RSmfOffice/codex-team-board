@@ -23,6 +23,7 @@ from .processes import pid_is_running
 from .redaction import redact_sensitive_text
 from .scheduling import (
     DEFAULT_GLOBAL_JOB_CAPACITY,
+    DEFAULT_GOAL_STALL_TICKS,
     DEFAULT_GOAL_WORKER_CAPACITY,
     DEFAULT_HEARTBEAT_CRITICAL_SECONDS,
     DEFAULT_HEARTBEAT_WARNING_SECONDS,
@@ -291,6 +292,12 @@ class ClusterManager:
                 "CODEX_TEAM_HEARTBEAT_CRITICAL_SECONDS",
                 DEFAULT_HEARTBEAT_CRITICAL_SECONDS,
             ),
+        )
+        self.goal_stall_ticks = env_int(
+            "CODEX_TEAM_GOAL_STALL_TICKS",
+            DEFAULT_GOAL_STALL_TICKS,
+            minimum=2,
+            maximum=100,
         )
         self.lead_cooldown_seconds = max(0.0, float(lead_cooldown_seconds))
         self.processes: dict[str, subprocess.Popen[str]] = {}
@@ -626,6 +633,15 @@ class ClusterManager:
                 """,
                 (status, utc_now(), completed_at, reason, goal_id),
             )
+            if status == "active":
+                connection.execute(
+                    """
+                    UPDATE cluster_goals
+                    SET stall_ticks = 0, stall_signature = '', stalled_at = NULL
+                    WHERE goal_id = ?
+                    """,
+                    (goal_id,),
+                )
             self._event(
                 connection,
                 goal_id,
@@ -1047,6 +1063,7 @@ class ClusterManager:
             if self._prepare_goal(goal):
                 schedulable.append(goal)
         scheduled = self._schedule_goals(schedulable)
+        self._check_goal_stalls(goals, scheduled)
         return {"tick_at": utc_now(), "scheduled": scheduled, "goals": len(goals)}
 
     def _sync_project_agent_archive(self) -> None:
@@ -1085,6 +1102,8 @@ class ClusterManager:
         goal_id = goal["goal_id"]
         root = Path(goal["root_path"])
         tasks = self.team.list_tasks(root, goal_id=goal_id, include_done=True)
+        if self._block_invalid_dependencies(goal_id, tasks):
+            tasks = self.team.list_tasks(root, goal_id=goal_id, include_done=True)
         active_workers = self._active_worker_jobs(goal_id)
         active_lead = self._active_lead_job(goal_id)
         if (
@@ -1115,6 +1134,245 @@ class ClusterManager:
                         reason="worker lease expired without an active job",
                     )
         return True
+
+    def _block_invalid_dependencies(
+        self,
+        goal_id: str,
+        tasks: list[dict[str, Any]],
+    ) -> bool:
+        changed = False
+        for task in tasks:
+            if task["status"] not in {"ready", "backlog"}:
+                continue
+            invalid = [
+                dependency
+                for dependency in task.get("blocked_by") or []
+                if dependency.get("status") == "canceled"
+                or dependency.get("archived_at")
+            ]
+            if not invalid:
+                continue
+            details = ", ".join(
+                f"{dependency['task_id']}({dependency.get('status') or 'unknown'})"
+                for dependency in invalid
+            )
+            reason = f"dependency unavailable: {details}"
+            try:
+                self.team.block_task(
+                    str(task["task_id"]),
+                    actor="teamd",
+                    reason=reason,
+                )
+            except TeamError:
+                continue
+            with self.team.connection() as connection:
+                self._event(
+                    connection,
+                    goal_id,
+                    "dependency_invalidated",
+                    "teamd",
+                    {
+                        "task_id": task["task_id"],
+                        "dependencies": invalid,
+                        "reason": reason,
+                    },
+                )
+            changed = True
+        return changed
+
+    def _check_goal_stalls(
+        self,
+        goals: list[dict[str, Any]],
+        scheduled: list[dict[str, Any]],
+    ) -> None:
+        scheduled_goal_ids = {
+            str(job.get("goal_id"))
+            for job in scheduled
+            if job.get("goal_id")
+        }
+        global_active_jobs = self._active_job_count()
+        for candidate in goals:
+            goal = self.get_goal(str(candidate["goal_id"]))
+            if goal["status"] not in {"planning", "active"}:
+                continue
+            goal_id = str(goal["goal_id"])
+            active_goal_jobs = self._active_goal_job_count(goal_id)
+            if (
+                goal_id in scheduled_goal_ids
+                or active_goal_jobs > 0
+                or global_active_jobs >= self.max_jobs
+            ):
+                self._reset_goal_stall(goal_id)
+                continue
+            tasks = self.team.list_tasks(
+                goal["root_path"],
+                goal_id=goal_id,
+                include_done=True,
+            )
+            if any(
+                task["status"] == "running"
+                and not task.get("lease_expired")
+                for task in tasks
+            ):
+                self._reset_goal_stall(goal_id)
+                continue
+            if any(
+                dependency.get("status") in {"running", "review", "blocked"}
+                for task in tasks
+                for dependency in task.get("blocked_by") or []
+            ):
+                self._reset_goal_stall(goal_id)
+                continue
+            signature = self._goal_stall_signature(goal, tasks)
+            previous_signature = str(goal.get("stall_signature") or "")
+            previous_ticks = int(goal.get("stall_ticks") or 0)
+            stall_ticks = (
+                previous_ticks + 1
+                if previous_signature == signature
+                else 1
+            )
+            if stall_ticks >= self.goal_stall_ticks:
+                self._pause_stalled_goal(
+                    goal,
+                    tasks,
+                    signature,
+                    stall_ticks,
+                    active_goal_jobs=active_goal_jobs,
+                    global_active_jobs=global_active_jobs,
+                )
+                continue
+            with self.team.connection() as connection:
+                connection.execute(
+                    """
+                    UPDATE cluster_goals
+                    SET stall_ticks = ?, stall_signature = ?, stalled_at = NULL
+                    WHERE goal_id = ? AND status IN ('planning', 'active')
+                    """,
+                    (stall_ticks, signature, goal_id),
+                )
+
+    @staticmethod
+    def _goal_stall_signature(
+        goal: Mapping[str, Any],
+        tasks: list[dict[str, Any]],
+    ) -> str:
+        payload = {
+            "goal": {
+                "status": goal.get("status"),
+                "lead_generation": goal.get("lead_generation"),
+                "lead_ticks": goal.get("lead_ticks"),
+                "checkpoint_updated_at": goal.get("checkpoint_updated_at"),
+            },
+            "tasks": [
+                {
+                    "task_id": task.get("task_id"),
+                    "status": task.get("status"),
+                    "version": task.get("version"),
+                    "claimed_by": task.get("claimed_by"),
+                    "lease_until": task.get("lease_until"),
+                    "blocked_by": task.get("blocked_by") or [],
+                }
+                for task in sorted(
+                    tasks,
+                    key=lambda item: str(item.get("task_id") or ""),
+                )
+            ],
+        }
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _reset_goal_stall(self, goal_id: str) -> None:
+        with self.team.connection() as connection:
+            connection.execute(
+                """
+                UPDATE cluster_goals
+                SET stall_ticks = 0, stall_signature = '', stalled_at = NULL
+                WHERE goal_id = ?
+                  AND (
+                    stall_ticks != 0
+                    OR stall_signature != ''
+                    OR stalled_at IS NOT NULL
+                  )
+                """,
+                (goal_id,),
+            )
+
+    def _pause_stalled_goal(
+        self,
+        goal: Mapping[str, Any],
+        tasks: list[dict[str, Any]],
+        signature: str,
+        stall_ticks: int,
+        *,
+        active_goal_jobs: int,
+        global_active_jobs: int,
+    ) -> None:
+        now = utc_now()
+        reason = (
+            "goal stalled: no schedulable progress for "
+            f"{stall_ticks} consecutive ticks"
+        )
+        counts: dict[str, int] = {}
+        for task in tasks:
+            status = str(task.get("status") or "unknown")
+            counts[status] = counts.get(status, 0) + 1
+        with self.team.connection() as connection:
+            updated = connection.execute(
+                """
+                UPDATE cluster_goals
+                SET status = 'paused', stall_ticks = ?, stall_signature = ?,
+                    stalled_at = ?, last_error = ?, updated_at = ?
+                WHERE goal_id = ? AND status IN ('planning', 'active')
+                """,
+                (
+                    stall_ticks,
+                    signature,
+                    now,
+                    reason,
+                    now,
+                    goal["goal_id"],
+                ),
+            )
+            if updated.rowcount == 0:
+                return
+            self._event(
+                connection,
+                str(goal["goal_id"]),
+                "goal_stalled",
+                "teamd",
+                {
+                    "stall_ticks": stall_ticks,
+                    "signature": signature,
+                    "task_counts": counts,
+                    "active_goal_jobs": active_goal_jobs,
+                    "global_active_jobs": global_active_jobs,
+                    "reason": reason,
+                },
+            )
+            self._event(
+                connection,
+                str(goal["goal_id"]),
+                "goal_status",
+                "teamd",
+                {"status": "paused", "reason": reason},
+            )
+
+    def _active_goal_job_count(self, goal_id: str) -> int:
+        with self.team.connection(write=False) as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS active_jobs
+                FROM cluster_jobs
+                WHERE goal_id = ? AND status IN ('starting', 'running')
+                """,
+                (goal_id,),
+            ).fetchone()
+        return int(row["active_jobs"])
 
     def _schedule_goals(self, goals: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not goals:

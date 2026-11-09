@@ -780,6 +780,152 @@ class ClusterSchedulerTests(unittest.TestCase):
             self.assertIn("worker_claim_conflict", event_types)
             self.assertNotIn("worker_recovered", event_types)
 
+    def test_canceled_dependency_blocks_task_and_escalates_to_lead(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            repo = _repo(base, "canceled-dependency")
+            runtime = StubAppServerRuntime()
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime=runtime,
+                runtime_mode="app_server",
+                lead_cooldown_seconds=0,
+            )
+            goal = manager.create_goal(
+                repo,
+                objective="Recover from a canceled dependency",
+                autonomy="auto",
+            )
+            dependency = team.create_task(
+                repo,
+                title="Canceled dependency",
+                description="Will be canceled before dispatch.",
+                acceptance="Dependency is no longer needed.",
+                kind="read",
+                owner_role="team_explorer",
+                goal_id=goal["goal_id"],
+            )
+            dependent = team.create_task(
+                repo,
+                title="Dependent task",
+                description="Must be escalated instead of waiting forever.",
+                acceptance="Task becomes blocked and Lead is dispatched.",
+                kind="read",
+                owner_role="team_explorer",
+                goal_id=goal["goal_id"],
+                depends_on=[dependency["task_id"]],
+            )
+            team.cancel_task(
+                dependency["task_id"],
+                actor="lead",
+                reason="dependency replaced",
+            )
+
+            manager.tick()
+
+            blocked = team.get_task(dependent["task_id"])
+            self.assertEqual(blocked["status"], "blocked")
+            self.assertIn("dependency unavailable", blocked["blocker"])
+            result = manager.get_goal(goal["goal_id"])
+            lead_jobs = [job for job in result["jobs"] if job["kind"] == "lead"]
+            self.assertEqual(len(lead_jobs), 1)
+            event_types = {
+                event["event_type"]
+                for event in result["events"]
+            }
+            self.assertIn("dependency_invalidated", event_types)
+
+    def test_goal_stall_watchdog_pauses_cycle_and_resume_resets_counter(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            repo = _repo(base, "goal-stall-cycle")
+            runtime = StubAppServerRuntime()
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime=runtime,
+                runtime_mode="app_server",
+                lead_cooldown_seconds=0,
+            )
+            manager.goal_stall_ticks = 2
+            goal = manager.create_goal(
+                repo,
+                objective="Detect a dependency cycle stall",
+                autonomy="auto",
+            )
+            manager.set_goal_status(goal["goal_id"], "active")
+            first = team.create_task(
+                repo,
+                title="Cycle A",
+                description="Part of a manually inserted cycle.",
+                acceptance="Cycle is detected.",
+                kind="read",
+                owner_role="team_explorer",
+                goal_id=goal["goal_id"],
+            )
+            second = team.create_task(
+                repo,
+                title="Cycle B",
+                description="Part of a manually inserted cycle.",
+                acceptance="Cycle is detected.",
+                kind="read",
+                owner_role="team_explorer",
+                goal_id=goal["goal_id"],
+            )
+            with team.connection() as connection:
+                connection.executemany(
+                    """
+                    INSERT INTO task_dependencies(task_id, depends_on)
+                    VALUES (?, ?)
+                    """,
+                    (
+                        (first["task_id"], second["task_id"]),
+                        (second["task_id"], first["task_id"]),
+                    ),
+                )
+
+            manager.tick()
+            still_active = manager.get_goal(goal["goal_id"])
+            self.assertEqual(still_active["status"], "active")
+            self.assertEqual(still_active["stall_ticks"], 1)
+            manager.tick()
+
+            stalled = manager.get_goal(goal["goal_id"])
+            self.assertEqual(stalled["status"], "paused")
+            self.assertEqual(stalled["stall_ticks"], 2)
+            self.assertIsNotNone(stalled["stalled_at"])
+            self.assertIn("goal stalled", stalled["last_error"])
+            event_types = {
+                event["event_type"]
+                for event in stalled["events"]
+            }
+            self.assertIn("goal_stalled", event_types)
+            snapshot = team.dashboard_snapshot(
+                goal["project_id"],
+                include_archived=True,
+            )
+            card = next(
+                item
+                for item in snapshot["cluster_goals"]
+                if item["goal_id"] == goal["goal_id"]
+            )
+            self.assertEqual(card["health"], "stalled")
+            self.assertEqual(card["next_action"], "inspect_stalled_goal")
+
+            resumed = manager.set_goal_status(
+                goal["goal_id"],
+                "active",
+                reason="manual retry after inspecting stall",
+            )
+            self.assertEqual(resumed["stall_ticks"], 0)
+            self.assertEqual(resumed["stall_signature"], "")
+            self.assertIsNone(resumed["stalled_at"])
+
     def test_each_goal_gets_three_workers_without_a_shared_four_job_pool(
         self,
     ) -> None:
