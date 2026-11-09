@@ -180,6 +180,8 @@ class AgentPool:
         model: str,
         model_provider: str,
         display_name: str,
+        *,
+        profile: str | None = None,
     ) -> dict[str, Any]:
         project_id = self._require_text(project_id, "project_id")
         role = self._require_text(role, "role").lower()
@@ -190,7 +192,9 @@ class AgentPool:
         display_name = self._require_text(display_name, "display_name")
         model = self._normalize_model(model)
         model_provider = self._normalize_model(model_provider)
-        profile = CURRENT_AGENT_PROFILE
+        profile = str(profile or CURRENT_AGENT_PROFILE).strip()
+        if not profile:
+            raise AgentPoolError("profile must not be empty")
         now = utc_now()
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -311,6 +315,10 @@ class AgentPool:
                 project_id,
                 workstream_key,
             )
+        if role == "team_explorer" and task_kind == "read":
+            return True
+        if role == "team_reviewer" and task_kind == "review":
+            return True
         return False
 
     @staticmethod
@@ -334,6 +342,8 @@ class AgentPool:
         task_kind: str,
         model: str,
         model_provider: str,
+        *,
+        profile: str | None = None,
     ) -> dict[str, Any] | None:
         project_id = self._require_text(project_id, "project_id")
         role = self._require_text(role, "role").lower()
@@ -351,6 +361,9 @@ class AgentPool:
             raise AgentPoolError(f"unsupported task_kind: {task_kind}")
         model = self._normalize_model(model)
         model_provider = self._normalize_model(model_provider)
+        expected_profile = str(profile or CURRENT_AGENT_PROFILE).strip()
+        if not expected_profile:
+            raise AgentPoolError("profile must not be empty")
         context_reuse_ratio = self._context_reuse_ratio()
         now = utc_now()
         with self._connection() as connection:
@@ -387,8 +400,8 @@ class AgentPool:
                     OR context_tokens <= model_context_window * ?
                   )
                 ORDER BY
-                    CASE WHEN last_used_at IS NULL THEN 0 ELSE 1 END,
-                    last_used_at ASC,
+                    CASE WHEN last_used_at IS NULL THEN 1 ELSE 0 END,
+                    last_used_at DESC,
                     created_at ASC,
                     agent_id ASC
                 LIMIT 1
@@ -397,7 +410,7 @@ class AgentPool:
                     project_id,
                     role,
                     workstream_key,
-                    CURRENT_AGENT_PROFILE,
+                    expected_profile,
                     model,
                     model_provider,
                     *self.IDLE_STATUSES,
@@ -434,7 +447,7 @@ class AgentPool:
                     "continuity_mode": continuity_mode,
                     "task_kind": task_kind,
                     "workstream_key": workstream_key,
-                    "profile": CURRENT_AGENT_PROFILE,
+                    "profile": expected_profile,
                 },
                 created_at=now,
             )

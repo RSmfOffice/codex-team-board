@@ -289,7 +289,24 @@ class UsageRepairTests(unittest.TestCase):
                 self.assertEqual(_visible_tool_definitions(), [])
             with patch.dict(
                 os.environ,
-                {"CODEX_TEAM_MCP_ACCESS": "read_only"},
+                {
+                    "CODEX_TEAM_MCP_ACCESS": "read_only",
+                    "CODEX_TEAM_MCP_SURFACE": "core",
+                },
+                clear=False,
+            ):
+                names = {
+                    tool["name"] for tool in _visible_tool_definitions()
+                }
+                self.assertEqual({"team_read"}, names)
+                with self.assertRaisesRegex(Exception, "read-only"):
+                    _guard_tool_call("team_create_task", {})
+            with patch.dict(
+                os.environ,
+                {
+                    "CODEX_TEAM_MCP_ACCESS": "read_only",
+                    "CODEX_TEAM_MCP_SURFACE": "legacy",
+                },
                 clear=False,
             ):
                 names = {
@@ -297,13 +314,12 @@ class UsageRepairTests(unittest.TestCase):
                 }
                 self.assertIn("team_status", names)
                 self.assertNotIn("team_create_task", names)
-                with self.assertRaisesRegex(Exception, "read-only"):
-                    _guard_tool_call("team_create_task", {})
             with patch.dict(
                 os.environ,
                 {
                     "CODEX_TEAM_MCP_ACCESS": "full",
                     "CODEX_TEAM_ALLOWED_ROOTS": str(root),
+                    "CODEX_TEAM_MCP_SURFACE": "legacy",
                 },
                 clear=False,
             ):

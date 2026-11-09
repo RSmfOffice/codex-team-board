@@ -19,6 +19,8 @@ from unittest.mock import patch
 from codex_team.cluster import (
     _ClusterAppServerEvents,
     ClusterManager,
+    LEAD_DEVELOPER_INSTRUCTIONS,
+    _agent_cache_profile,
     _redact_sensitive_file,
     _redact_sensitive_log,
     _stable_developer_instructions,
@@ -2036,6 +2038,7 @@ class ClusterSchedulerTests(unittest.TestCase):
                     kind="read",
                     owner_role="team_explorer",
                     goal_id=goal["goal_id"],
+                    continuity_mode="fresh",
                 )
                 job = manager._dispatch_worker(
                     manager.get_goal(goal["goal_id"]),
@@ -2644,6 +2647,11 @@ class ClusterSchedulerTests(unittest.TestCase):
                 workstream_key="profile-workstream",
             )
             pool = AgentPool(settings)
+            _, current_profile = _agent_cache_profile(
+                goal,
+                "lead",
+                LEAD_DEVELOPER_INSTRUCTIONS,
+            )
             legacy = pool.register_thread(
                 project["project_id"],
                 "lead",
@@ -2652,6 +2660,7 @@ class ClusterSchedulerTests(unittest.TestCase):
                 manager.model,
                 manager.model_provider,
                 "legacy profile lead",
+                profile=current_profile,
             )
             with team.connection() as connection:
                 connection.execute(
@@ -2702,7 +2711,7 @@ class ClusterSchedulerTests(unittest.TestCase):
             )
             self.assertEqual(old_agent["status"], "idle")
             self.assertEqual(old_agent["profile"], "legacy")
-            self.assertEqual(current_agent["profile"], CURRENT_AGENT_PROFILE)
+            self.assertEqual(current_agent["profile"], current_profile)
 
             second = manager._dispatch_lead(
                 manager.get_goal(goal["goal_id"]),
@@ -2732,6 +2741,11 @@ class ClusterSchedulerTests(unittest.TestCase):
                 workstream_key="resume-workstream",
             )
             pool = AgentPool(settings)
+            _, current_profile = _agent_cache_profile(
+                goal,
+                "lead",
+                LEAD_DEVELOPER_INSTRUCTIONS,
+            )
             old_agent = pool.register_thread(
                 project["project_id"],
                 "lead",
@@ -2740,6 +2754,7 @@ class ClusterSchedulerTests(unittest.TestCase):
                 manager.model,
                 manager.model_provider,
                 "stale lead",
+                profile=current_profile,
             )
             with team.connection() as connection:
                 connection.execute(
@@ -3353,6 +3368,11 @@ class ClusterSchedulerTests(unittest.TestCase):
                 ),
             )
             pool = AgentPool(settings)
+            _, current_profile = _agent_cache_profile(
+                goal,
+                "lead",
+                LEAD_DEVELOPER_INSTRUCTIONS,
+            )
             old_agent = pool.register_thread(
                 project["project_id"],
                 "lead",
@@ -3361,6 +3381,7 @@ class ClusterSchedulerTests(unittest.TestCase):
                 manager.model,
                 manager.model_provider,
                 "stale generation lead",
+                profile=current_profile,
             )
             with team.connection() as connection:
                 connection.execute(
@@ -4455,6 +4476,45 @@ class ClusterSchedulerTests(unittest.TestCase):
                 )
             self.assertEqual(goal["project_id"], project["project_id"])
             self.assertEqual(agents_path.read_bytes(), before)
+
+    def test_ensure_goal_does_not_initialize_or_rewrite_project_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            repo = _repo(base, "ensure-goal-policy")
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime_mode="exec",
+            )
+            with patch.object(
+                team,
+                "init_project",
+                side_effect=AssertionError("ensure_goal must not initialize project"),
+            ):
+                first = manager.ensure_goal(
+                    repo,
+                    objective="Create a goal without prompt-file writes",
+                )
+            self.assertTrue(first["created"])
+            self.assertFalse((repo / "AGENTS.md").exists())
+
+            project = team.register_project(repo)
+            agents_path = repo / "AGENTS.md"
+            agents_path.write_text("stable policy\n", encoding="utf-8")
+            before = agents_path.read_bytes()
+            with patch.object(
+                team,
+                "init_project",
+                side_effect=AssertionError("ensure_goal must not re-init project"),
+            ):
+                second = manager.ensure_goal(
+                    repo,
+                    objective="Reuse the same goal without writing policy",
+                )
+            self.assertEqual(project["project_id"], second["goal"]["project_id"])
+            self.assertEqual(before, agents_path.read_bytes())
 
     def test_lead_board_digest_bounds_completed_history(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

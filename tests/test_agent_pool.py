@@ -49,6 +49,7 @@ class AgentPoolTests(unittest.TestCase):
         model: str = "model-a",
         model_provider: str = "provider-a",
         display_name: str | None = None,
+        profile: str | None = None,
     ) -> dict[str, Any]:
         return self.pool.register_thread(
             project_id,
@@ -58,6 +59,7 @@ class AgentPoolTests(unittest.TestCase):
             model,
             model_provider,
             display_name or f"{role} {workstream_key}",
+            profile=profile,
         )
 
     def seed_runtime_references(self, project_id: str = "P1") -> None:
@@ -133,34 +135,34 @@ class AgentPoolTests(unittest.TestCase):
         self.assertEqual(selected_worker["agent_id"], worker["agent_id"])
 
         explorer = self.register(role="team_explorer", thread_id="explorer-auto")
-        self.assertIsNone(
-            self.pool.select_agent(
-                "P1",
-                "team_explorer",
-                "main",
-                "auto",
-                "read",
-                "model-a",
-                "provider-a",
-            )
+        selected_explorer = self.pool.select_agent(
+            "P1",
+            "team_explorer",
+            "main",
+            "auto",
+            "read",
+            "model-a",
+            "provider-a",
         )
+        self.assertEqual(selected_explorer["agent_id"], explorer["agent_id"])
+        self.pool.release(selected_explorer["agent_id"], {"input": 1, "cached": 1})
         selected_explorer = self.pool.select_agent(
             "P1", "team_explorer", "main", "reuse", "read", "model-a", "provider-a"
         )
         self.assertEqual(selected_explorer["agent_id"], explorer["agent_id"])
 
         reviewer = self.register(role="team_reviewer", thread_id="reviewer-auto")
-        self.assertIsNone(
-            self.pool.select_agent(
-                "P1",
-                "team_reviewer",
-                "main",
-                "auto",
-                "review",
-                "model-a",
-                "provider-a",
-            )
+        selected_reviewer = self.pool.select_agent(
+            "P1",
+            "team_reviewer",
+            "main",
+            "auto",
+            "review",
+            "model-a",
+            "provider-a",
         )
+        self.assertEqual(selected_reviewer["agent_id"], reviewer["agent_id"])
+        self.pool.release(selected_reviewer["agent_id"], {"input": 1, "cached": 1})
         selected_reviewer = self.pool.select_agent(
             "P1", "team_reviewer", "main", "reuse", "review", "model-a", "provider-a"
         )
@@ -348,7 +350,7 @@ class AgentPoolTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(row["profile"], "legacy")
 
-    def test_selects_least_recently_used_idle_agent(self) -> None:
+    def test_selects_most_recently_used_idle_agent_then_falls_back(self) -> None:
         older = self.register(thread_id="older")
         newer = self.register(thread_id="newer")
         with closing(connect(self.db_path)) as connection:
@@ -364,12 +366,12 @@ class AgentPoolTests(unittest.TestCase):
         first = self.pool.select_agent(
             "P1", "team_explorer", "main", "reuse", "read", "model-a", "provider-a"
         )
-        self.assertEqual(first["agent_id"], older["agent_id"])
-        self.pool.release(first["agent_id"], {"input": 1, "cached": 0})
+        self.assertEqual(first["agent_id"], newer["agent_id"])
         second = self.pool.select_agent(
             "P1", "team_explorer", "main", "reuse", "read", "model-a", "provider-a"
         )
-        self.assertEqual(second["agent_id"], newer["agent_id"])
+        self.assertEqual(second["agent_id"], older["agent_id"])
+        self.pool.release(first["agent_id"], {"input": 1, "cached": 0})
 
     def test_context_threshold_forces_a_fresh_thread(self) -> None:
         agent = self.register(thread_id="high-context")
@@ -411,6 +413,36 @@ class AgentPoolTests(unittest.TestCase):
                 "model-a",
                 "provider-a",
             )
+        self.assertEqual(selected["agent_id"], agent["agent_id"])
+
+    def test_exact_cache_profile_is_required_for_reuse(self) -> None:
+        agent = self.register(
+            role="team_explorer",
+            thread_id="profile-stable",
+            profile="cache;v1",
+        )
+        self.assertIsNone(
+            self.pool.select_agent(
+                "P1",
+                "team_explorer",
+                "main",
+                "reuse",
+                "read",
+                "model-a",
+                "provider-a",
+                profile="cache;v2",
+            )
+        )
+        selected = self.pool.select_agent(
+            "P1",
+            "team_explorer",
+            "main",
+            "reuse",
+            "read",
+            "model-a",
+            "provider-a",
+            profile="cache;v1",
+        )
         self.assertEqual(selected["agent_id"], agent["agent_id"])
 
     def test_concurrent_selection_reserves_only_one_agent(self) -> None:

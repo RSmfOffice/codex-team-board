@@ -17,6 +17,7 @@ from . import __version__
 from .agent_home import service_codex_home, sync_agent_codex_home
 from .agent_pool import AgentPool, AgentPoolError
 from .app_server import AppServerEvents, AppServerRuntime
+from .cache_contract import agent_cache_profile
 from .config import Settings
 from .db import connect, connect_readonly, utc_now
 from .processes import pid_is_running
@@ -111,6 +112,19 @@ def _stable_developer_instructions(
 This identity is stable for the Agent thread. The current goal, assignment,
 board state, and task-specific instructions arrive in the turn input.
 """
+
+
+def _agent_cache_profile(
+    goal: Mapping[str, Any],
+    role: str,
+    instructions: str,
+) -> tuple[str, str]:
+    stable_instructions = _stable_developer_instructions(goal, role, instructions)
+    profile = agent_cache_profile(
+        stable_instructions,
+        policy_path=Path(goal["root_path"]) / "AGENTS.md",
+    )
+    return stable_instructions, profile
 
 
 def _clip_text(value: object, limit: int) -> str:
@@ -345,7 +359,7 @@ class ClusterManager:
             limit=2000,
         )
         project = self.team.register_project(repo)
-        self.team._ensure_project_active(project)
+        self.team.ensure_project_active(project)
         goal_id = self._new_id("G")
         effective_workstream = requested_workstream or goal_id
         now = utc_now()
@@ -418,7 +432,8 @@ class ClusterManager:
             "continuity_reason",
             limit=2000,
         )
-        project = self.team.init_project(repo)
+        project = self.team.register_project(repo)
+        self.team.ensure_project_active(project)
         now = utc_now()
         created = False
         with self.team.connection() as connection:
@@ -2909,7 +2924,7 @@ Do not return raw logs or a full transcript.
         runtime = self.runtime
         if runtime is None:
             raise ClusterError("App Server runtime is not configured")
-        developer_instructions = _stable_developer_instructions(
+        developer_instructions, cache_profile = _agent_cache_profile(
             goal,
             role,
             developer_instructions,
@@ -2929,6 +2944,7 @@ Do not return raw logs or a full transcript.
                 task_kind,
                 self.model,
                 self.model_provider,
+                profile=cache_profile,
             )
             if agent is not None:
                 try:
@@ -3018,6 +3034,7 @@ Do not return raw logs or a full transcript.
                     self.model,
                     self.model_provider,
                     f"{role} {workstream_key}",
+                    profile=cache_profile,
                 )
             agent = self.agent_pool.mark_busy(
                 str(agent["agent_id"]),

@@ -9,7 +9,7 @@ import subprocess
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Mapping
 
 from .agent_pool import AgentPool, AgentPoolError
 from .config import Settings
@@ -171,6 +171,11 @@ class TeamService:
                 (project_id,),
             ).fetchone()
         return dict(row)
+
+    def ensure_project_active(self, project: Mapping[str, Any]) -> None:
+        """Reject archived projects without mutating prompt-loaded files."""
+
+        self._ensure_project_active(dict(project))
 
     def project_for_repo(self, repo: str | Path) -> dict[str, Any]:
         return self.register_project(repo)
