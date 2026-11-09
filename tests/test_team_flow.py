@@ -949,8 +949,17 @@ class TeamFlowTests(unittest.TestCase):
         canceled = self.team.create_task(
             self.repo,
             title="Canceled task",
-            description="Only done tasks cascade.",
-            acceptance="remains unarchived",
+            description="Canceled tasks cascade with their goal.",
+            acceptance="archived and restored by goal",
+            kind="read",
+            owner_role="team_explorer",
+            goal_id=goal["goal_id"],
+        )
+        blocked = self.team.create_task(
+            self.repo,
+            title="Blocked task",
+            description="Blocked tasks cascade with their goal.",
+            acceptance="hidden from active board",
             kind="read",
             owner_role="team_explorer",
             goal_id=goal["goal_id"],
@@ -975,6 +984,15 @@ class TeamFlowTests(unittest.TestCase):
                 """,
                 (now, now, canceled["task_id"]),
             )
+            connection.execute(
+                """
+                UPDATE tasks
+                SET status = 'blocked', blocker = 'fixture blocker',
+                    updated_at = ?, version = version + 1
+                WHERE task_id = ?
+                """,
+                (now, blocked["task_id"]),
+            )
         self.team.set_task_archived(manually_archived["task_id"], True)
         persistent_agent = manager.agent_pool.register_thread(
             goal["project_id"],
@@ -995,14 +1013,24 @@ class TeamFlowTests(unittest.TestCase):
             self.team.get_task(manually_archived["task_id"])["archived_by_goal"],
             0,
         )
-        self.assertIsNone(
-            self.team.get_task(canceled["task_id"])["archived_at"]
-        )
+        for task_id in (canceled["task_id"], blocked["task_id"]):
+            task_after_archive = self.team.get_task(task_id)
+            self.assertIsNotNone(task_after_archive["archived_at"])
+            self.assertEqual(task_after_archive["archived_by_goal"], 1)
         goal_detail = manager.get_goal(goal["goal_id"])
         self.assertIn(
             cascaded["task_id"],
             {task["task_id"] for task in goal_detail["tasks"]},
         )
+        with self.team.connection() as connection:
+            connection.execute(
+                """
+                UPDATE tasks
+                SET archived_at = NULL, updated_at = ?, version = version + 1
+                WHERE task_id = ?
+                """,
+                (utc_now(), blocked["task_id"]),
+            )
         active = self.team.dashboard_snapshot()
         visible = self.team.dashboard_snapshot(include_archived=True)
         self.assertNotIn(
@@ -1013,6 +1041,15 @@ class TeamFlowTests(unittest.TestCase):
             goal["goal_id"],
             {item["goal_id"] for item in visible["cluster_goals"]},
         )
+        self.assertEqual(active["cluster_summary"]["blocked_tasks"], 0)
+        active_task_ids = {
+            task["task_id"] for task in active["tasks"]
+        }
+        visible_task_ids = {
+            task["task_id"] for task in visible["tasks"]
+        }
+        self.assertNotIn(blocked["task_id"], active_task_ids)
+        self.assertIn(blocked["task_id"], visible_task_ids)
         mcp = TeamMcpServer(self.settings)
         visible_tasks = mcp.call_tool(
             "team_list_tasks",
@@ -1034,8 +1071,16 @@ class TeamFlowTests(unittest.TestCase):
             cascaded["task_id"],
             {task["task_id"] for task in visible_tasks},
         )
+        self.assertNotIn(
+            blocked["task_id"],
+            {task["task_id"] for task in visible_tasks},
+        )
         self.assertIn(
             cascaded["task_id"],
+            {task["task_id"] for task in archived_tasks},
+        )
+        self.assertIn(
+            blocked["task_id"],
             {task["task_id"] for task in archived_tasks},
         )
         agent_after_archive = next(
@@ -1056,6 +1101,10 @@ class TeamFlowTests(unittest.TestCase):
         manual_after_restore = self.team.get_task(manually_archived["task_id"])
         self.assertIsNotNone(manual_after_restore["archived_at"])
         self.assertEqual(manual_after_restore["archived_by_goal"], 0)
+        for task_id in (canceled["task_id"], blocked["task_id"]):
+            restored_task = self.team.get_task(task_id)
+            self.assertIsNone(restored_task["archived_at"])
+            self.assertEqual(restored_task["archived_by_goal"], 0)
         cascade_events = [
             event["event_type"]
             for event in self.team.get_task_events(cascaded["task_id"])["events"]

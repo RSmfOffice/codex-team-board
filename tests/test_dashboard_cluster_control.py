@@ -118,13 +118,13 @@ class DashboardClusterControlTests(unittest.TestCase):
         try:
             self.assertEqual(
                 connection.execute("PRAGMA user_version").fetchone()[0],
-                15,
+                16,
             )
             self.assertEqual(
                 connection.execute(
                     "SELECT MAX(version) FROM schema_migrations"
                 ).fetchone()[0],
-                15,
+                16,
             )
             connection.execute("PRAGMA user_version = 7")
             connection.execute(
@@ -137,7 +137,7 @@ class DashboardClusterControlTests(unittest.TestCase):
             health = self.get("/api/health")
             board = self.get("/api/board")
 
-        self.assertEqual(health["schema_version"], 15)
+        self.assertEqual(health["schema_version"], 16)
         self.assertEqual(
             health["cluster_runtime"],
             {

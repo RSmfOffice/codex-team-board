@@ -5,7 +5,7 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
@@ -418,6 +418,7 @@ def _upgrade_schema(connection: sqlite3.Connection) -> None:
         """
     )
     _backfill_goal_archive_tasks(connection)
+    _backfill_goal_archive_all_tasks(connection)
 
 
 def _backfill_goal_archive_tasks(connection: sqlite3.Connection) -> None:
@@ -450,6 +451,61 @@ def _backfill_goal_archive_tasks(connection: sqlite3.Connection) -> None:
                 updated_at = ?, version = version + 1
             WHERE task_id = ? AND status = 'done'
               AND archived_at IS NULL
+            """,
+            (now, now, task_id),
+        )
+        if updated.rowcount != 1:
+            continue
+        connection.execute(
+            """
+            INSERT INTO task_events(
+                task_id, event_type, actor, data_json, created_at
+            ) VALUES (?, 'archived_by_goal', 'schema-migration', ?, ?)
+            """,
+            (
+                task_id,
+                json.dumps(
+                    {"goal_id": goal_id},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                now,
+            ),
+        )
+    connection.execute(
+        "INSERT INTO metadata(key, value) VALUES (?, ?)",
+        (marker, now),
+    )
+
+
+def _backfill_goal_archive_all_tasks(connection: sqlite3.Connection) -> None:
+    marker = "goal_archive_all_tasks_backfill_v16"
+    exists = connection.execute(
+        "SELECT 1 FROM metadata WHERE key = ?",
+        (marker,),
+    ).fetchone()
+    if exists is not None:
+        return
+    now = utc_now()
+    rows = connection.execute(
+        """
+        SELECT t.task_id, t.goal_id
+        FROM tasks t
+        JOIN cluster_goals g ON g.goal_id = t.goal_id
+        WHERE t.archived_at IS NULL
+          AND g.archived_at IS NOT NULL
+        ORDER BY t.task_id
+        """
+    ).fetchall()
+    for row in rows:
+        task_id = str(row["task_id"])
+        goal_id = str(row["goal_id"])
+        updated = connection.execute(
+            """
+            UPDATE tasks
+            SET archived_at = ?, archived_by_goal = 1,
+                updated_at = ?, version = version + 1
+            WHERE task_id = ? AND archived_at IS NULL
             """,
             (now, now, task_id),
         )

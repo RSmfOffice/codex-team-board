@@ -661,11 +661,16 @@ class TeamService:
             parameters.append(goal_id)
         if not include_archived:
             where.append("t.archived_at IS NULL")
+            where.append(
+                "(g.goal_id IS NULL OR g.archived_at IS NULL)"
+            )
         with self.connection(write=False) as connection:
             rows = connection.execute(
                 f"""
                 SELECT t.*, p.name AS project_name, p.root_path
-                FROM tasks t JOIN projects p ON p.project_id = t.project_id
+                FROM tasks t
+                JOIN projects p ON p.project_id = t.project_id
+                LEFT JOIN cluster_goals g ON g.goal_id = t.goal_id
                 WHERE {' AND '.join(where)}
                 ORDER BY
                     CASE t.status
@@ -757,6 +762,11 @@ class TeamService:
                 goal_archive_filter = (
                     "" if include_archived else "AND g.archived_at IS NULL"
                 )
+                task_goal_filter = (
+                    ""
+                    if include_archived
+                    else "AND (tg.goal_id IS NULL OR tg.archived_at IS NULL)"
+                )
                 goal_rows = connection.execute(
                     f"""
                     SELECT g.*, p.name AS project_name, p.root_path
@@ -783,6 +793,11 @@ class TeamService:
                     ""
                     if include_archived
                     else "WHERE p.archived_at IS NULL AND g.archived_at IS NULL"
+                )
+                task_goal_filter = (
+                    ""
+                    if include_archived
+                    else "AND (tg.goal_id IS NULL OR tg.archived_at IS NULL)"
                 )
                 goal_rows = connection.execute(
                     f"""
@@ -897,9 +912,12 @@ class TeamService:
                 task_rows = connection.execute(
                     f"""
                     SELECT t.*, p.name AS project_name, p.root_path
-                    FROM tasks t JOIN projects p ON p.project_id = t.project_id
+                    FROM tasks t
+                    JOIN projects p ON p.project_id = t.project_id
+                    LEFT JOIN cluster_goals tg ON tg.goal_id = t.goal_id
                     WHERE t.project_id = ?
                     {task_archive_filter}
+                    {task_goal_filter}
                     ORDER BY
                         CASE t.status
                             WHEN 'running' THEN 0
@@ -938,10 +956,13 @@ class TeamService:
                 task_rows = connection.execute(
                     f"""
                     SELECT t.*, p.name AS project_name, p.root_path
-                    FROM tasks t JOIN projects p ON p.project_id = t.project_id
+                    FROM tasks t
+                    JOIN projects p ON p.project_id = t.project_id
+                    LEFT JOIN cluster_goals tg ON tg.goal_id = t.goal_id
                     WHERE t.status != 'canceled'
                     {archive_filter}
                     {task_archive_filter}
+                    {task_goal_filter}
                     ORDER BY
                         CASE t.status
                             WHEN 'running' THEN 0

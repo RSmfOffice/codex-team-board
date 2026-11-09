@@ -46,6 +46,9 @@
   页面整理职责，不会切断 Agent 的持久上下文。
 - partial/unknown usage 的成功 App Server job 会隔离对应 Agent thread，避免
   未知 baseline 污染后续复用任务的成本归属。
+- 归档 goal 会级联归档其全部未单独归档子任务，包括 blocked、review 和
+  canceled；恢复 goal 时只恢复这些级联任务。默认 Board 和 MCP 查询同时按
+  goal 归档状态兜底过滤历史残留。
 
 ## [0.4.2] - 2026-11-08
 

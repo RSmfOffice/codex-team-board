@@ -755,8 +755,7 @@ class ClusterManager:
                     """
                     SELECT task_id
                     FROM tasks
-                    WHERE goal_id = ? AND status = 'done'
-                      AND archived_at IS NULL
+                    WHERE goal_id = ? AND archived_at IS NULL
                     ORDER BY task_id
                     """,
                     (goal_id,),
@@ -768,8 +767,7 @@ class ClusterManager:
                         UPDATE tasks
                         SET archived_at = ?, archived_by_goal = 1,
                             updated_at = ?, version = version + 1
-                        WHERE task_id = ? AND status = 'done'
-                          AND archived_at IS NULL
+                        WHERE task_id = ? AND archived_at IS NULL
                         """,
                         (now, now, task_id),
                     )
@@ -798,8 +796,7 @@ class ClusterManager:
                     """
                     SELECT task_id
                     FROM tasks
-                    WHERE goal_id = ? AND status = 'done'
-                      AND archived_by_goal = 1
+                    WHERE goal_id = ? AND archived_by_goal = 1
                     ORDER BY task_id
                     """,
                     (goal_id,),
@@ -811,8 +808,7 @@ class ClusterManager:
                         UPDATE tasks
                         SET archived_at = NULL, archived_by_goal = 0,
                             updated_at = ?, version = version + 1
-                        WHERE task_id = ? AND status = 'done'
-                          AND archived_by_goal = 1
+                        WHERE task_id = ? AND archived_by_goal = 1
                         """,
                         (now, task_id),
                     )

@@ -118,7 +118,7 @@ class MigrationTests(unittest.TestCase):
             finally:
                 upgraded.close()
 
-    def test_schema_15_adds_usage_missing_fields_idempotently(self) -> None:
+    def test_schema_16_keeps_usage_presence_and_archive_migrations_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "usage-v14.sqlite"
             connection = sqlite3.connect(path)
@@ -166,7 +166,7 @@ class MigrationTests(unittest.TestCase):
                 self.assertEqual(old["usage_missing_fields"], "[]")
                 self.assertEqual(
                     upgraded.execute("PRAGMA user_version").fetchone()[0],
-                    15,
+                    16,
                 )
             finally:
                 upgraded.close()
@@ -182,7 +182,7 @@ class MigrationTests(unittest.TestCase):
                         """
                     ).fetchall()
                 ]
-                self.assertEqual(versions, [14, 15])
+                self.assertEqual(versions, [14, 16])
                 columns = {
                     row["name"]
                     for row in reopened.execute(
@@ -230,8 +230,24 @@ class MigrationTests(unittest.TestCase):
                     (now, now),
                 )
                 connection.execute(
+                    """
+                    INSERT INTO tasks(
+                        task_id, project_id, goal_id, title, description,
+                        acceptance, kind, status, priority, owner_role,
+                        blocker, created_at, updated_at
+                    ) VALUES ('T2', 'P1', 'G1', 'Blocked task', 'Description',
+                              'Acceptance', 'read', 'blocked', 2,
+                              'team_explorer', 'fixture blocker', ?, ?)
+                    """,
+                    (now, now),
+                )
+                connection.execute(
                     "DELETE FROM metadata WHERE key = ?",
                     ("goal_archive_done_backfill_v11",),
+                )
+                connection.execute(
+                    "DELETE FROM metadata WHERE key = ?",
+                    ("goal_archive_all_tasks_backfill_v16",),
                 )
                 connection.commit()
             finally:
@@ -239,34 +255,40 @@ class MigrationTests(unittest.TestCase):
 
             upgraded = connect(path)
             try:
-                task = upgraded.execute(
+                tasks = upgraded.execute(
                     """
-                    SELECT archived_at, archived_by_goal
-                    FROM tasks WHERE task_id = 'T1'
+                    SELECT task_id, archived_at, archived_by_goal
+                    FROM tasks WHERE task_id IN ('T1', 'T2')
+                    ORDER BY task_id
                     """
-                ).fetchone()
-                self.assertIsNotNone(task["archived_at"])
-                self.assertEqual(task["archived_by_goal"], 1)
+                ).fetchall()
+                for task in tasks:
+                    self.assertIsNotNone(task["archived_at"])
+                    self.assertEqual(task["archived_by_goal"], 1)
                 events = [
                     row["event_type"]
                     for row in upgraded.execute(
                         """
                         SELECT event_type FROM task_events
-                        WHERE task_id = 'T1'
-                        ORDER BY event_id
+                        WHERE task_id IN ('T1', 'T2')
+                        ORDER BY task_id, event_id
                         """
                     ).fetchall()
                 ]
-                self.assertEqual(events, ["archived_by_goal"])
+                self.assertEqual(
+                    events,
+                    ["archived_by_goal", "archived_by_goal"],
+                )
             finally:
                 upgraded.close()
 
             reopened = connect(path)
             try:
                 event_count = reopened.execute(
-                    "SELECT COUNT(*) FROM task_events WHERE task_id = 'T1'"
+                    "SELECT COUNT(*) FROM task_events "
+                    "WHERE task_id IN ('T1', 'T2')"
                 ).fetchone()[0]
-                self.assertEqual(event_count, 1)
+                self.assertEqual(event_count, 2)
             finally:
                 reopened.close()
 
