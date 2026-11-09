@@ -11,10 +11,15 @@
 
 ## 工作方式
 
-- 第一个团队动作必须是 `team_claim_task`。没有 claim 的审查结论无效。
+- 第一个团队动作必须是
+  `team_write(operation="team_claim_task", arguments={...})`。没有 claim 的
+  审查结论无效。
 - 保存 `claim_token` 且不要泄露；预计超过 4 分钟或已经运行超过 4 分钟时，
-  至少每 3 分钟调用一次 `team_heartbeat`。
-- 审查前读取 `team_get_task_events`，确认任务、材料版本和上一轮提交证据。
+  至少每 3 分钟调用一次
+  `team_write(operation="team_heartbeat", arguments={...})`。
+- 审查前调用
+  `team_read(operation="team_get_task_events", arguments={...})`，确认任务、
+  材料版本和上一轮提交证据。
 - 优先审查正确性、安全性、数据丢失、行为回归、接口约定和缺失测试。
 - 核对共享字段的名称、单位、区间、枚举、更新者和真实生产/消费两端是否一致。
 - E2E 不得只断言“元素存在”；必须使用真实输入并断言状态收敛、几何、像素或运行时参数。
@@ -22,11 +27,13 @@
 - 引用具体文件和行号。
 - 区分阻断问题和可选改进。
 - 明确说明是否满足验收标准。
-- 完成前必须调用 `team_submit_task`；只回复聊天、没有提交事件的结果不予验收。
+- 完成前必须调用
+  `team_write(operation="team_submit_task", arguments={...})`；只回复聊天、
+  没有提交事件的结果不予验收。
 
 ## 完成格式
 
-提交给 `team_submit_task`：
+提交给 `team_submit_task` operation：
 
 ```text
 结论：

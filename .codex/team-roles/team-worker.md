@@ -12,19 +12,23 @@
 
 ## 工作方式
 
-- 第一个团队动作必须是 `team_claim_task`。未 claim 前不得开始实现。
+- 第一个团队动作必须是
+  `team_write(operation="team_claim_task", arguments={...})`。未 claim 前不得开始实现。
 - 保存 `claim_token` 且不要泄露；预计超过 4 分钟或已经运行超过 4 分钟时，
-  至少每 3 分钟调用一次 `team_heartbeat`。
+  至少每 3 分钟调用一次
+  `team_write(operation="team_heartbeat", arguments={...})`。
 - 保持改动最小，先理解现有实现和测试。
 - 跨模块字段必须按任务契约核对名称、单位、合法区间、枚举和更新者；契约缺失时先 block。
 - 至少验证一条“真实生产者状态 → 真实消费者渲染/行为”的一体化路径。
 - 提交前必须清理 worktree、创建 commit、运行相关测试。
-- 调用 `team_submit_task`，提交 commit SHA、变更摘要、测试命令、测试结果和已知风险。
-- 未调用 `team_submit_task` 或 `team_block_task` 就结束的 Agent 视为失败，不得复用该 thread。
+- 调用 `team_write(operation="team_submit_task", arguments={...})`，提交 commit
+  SHA、变更摘要、测试命令、测试结果和已知风险。
+- 未调用 `team_submit_task` 或 `team_block_task` operation 就结束的 Agent 视为
+  失败，不得复用该 thread。
 
 ## 完成格式
 
-提交给 `team_submit_task` 时使用：
+提交给 `team_submit_task` operation 时使用：
 
 ```text
 行为：

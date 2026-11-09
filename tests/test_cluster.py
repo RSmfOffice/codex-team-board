@@ -19,6 +19,8 @@ from unittest.mock import patch
 from codex_team.cluster import (
     _ClusterAppServerEvents,
     ClusterManager,
+    LEAD_DEVELOPER_INSTRUCTIONS,
+    _agent_cache_profile,
     _redact_sensitive_file,
     _redact_sensitive_log,
     _stable_developer_instructions,
@@ -1319,6 +1321,27 @@ class ClusterSchedulerTests(unittest.TestCase):
                 ],
             )
 
+    def test_list_goals_without_status_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime_mode="exec",
+            )
+            repo = _repo(base, "list-goals")
+            created = manager.create_goal(
+                repo,
+                objective="Exercise the unfiltered cluster list query",
+            )
+            goals = manager.list_goals()
+            self.assertEqual(
+                [created["goal_id"]],
+                [goal["goal_id"] for goal in goals],
+            )
+
     def test_worker_heartbeat_warning_and_critical_alert_without_kill(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
@@ -2036,6 +2059,7 @@ class ClusterSchedulerTests(unittest.TestCase):
                     kind="read",
                     owner_role="team_explorer",
                     goal_id=goal["goal_id"],
+                    continuity_mode="fresh",
                 )
                 job = manager._dispatch_worker(
                     manager.get_goal(goal["goal_id"]),
@@ -2644,6 +2668,13 @@ class ClusterSchedulerTests(unittest.TestCase):
                 workstream_key="profile-workstream",
             )
             pool = AgentPool(settings)
+            _, current_profile = _agent_cache_profile(
+                goal,
+                "lead",
+                LEAD_DEVELOPER_INSTRUCTIONS,
+                cwd=repo,
+                sandbox_mode="danger-full-access",
+            )
             legacy = pool.register_thread(
                 project["project_id"],
                 "lead",
@@ -2652,6 +2683,7 @@ class ClusterSchedulerTests(unittest.TestCase):
                 manager.model,
                 manager.model_provider,
                 "legacy profile lead",
+                profile=current_profile,
             )
             with team.connection() as connection:
                 connection.execute(
@@ -2702,7 +2734,7 @@ class ClusterSchedulerTests(unittest.TestCase):
             )
             self.assertEqual(old_agent["status"], "idle")
             self.assertEqual(old_agent["profile"], "legacy")
-            self.assertEqual(current_agent["profile"], CURRENT_AGENT_PROFILE)
+            self.assertEqual(current_agent["profile"], current_profile)
 
             second = manager._dispatch_lead(
                 manager.get_goal(goal["goal_id"]),
@@ -2732,6 +2764,13 @@ class ClusterSchedulerTests(unittest.TestCase):
                 workstream_key="resume-workstream",
             )
             pool = AgentPool(settings)
+            _, current_profile = _agent_cache_profile(
+                goal,
+                "lead",
+                LEAD_DEVELOPER_INSTRUCTIONS,
+                cwd=repo,
+                sandbox_mode="danger-full-access",
+            )
             old_agent = pool.register_thread(
                 project["project_id"],
                 "lead",
@@ -2740,6 +2779,7 @@ class ClusterSchedulerTests(unittest.TestCase):
                 manager.model,
                 manager.model_provider,
                 "stale lead",
+                profile=current_profile,
             )
             with team.connection() as connection:
                 connection.execute(
@@ -2775,6 +2815,64 @@ class ClusterSchedulerTests(unittest.TestCase):
             self.assertEqual(job["thread_id"], dispatched["thread_id"])
             log = Path(job["log_path"]).read_text(encoding="utf-8")
             self.assertIn("agent_thread_resume_failed", log)
+
+    def test_non_core_mcp_surface_forces_fresh_agent_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(
+            os.environ,
+            {"CODEX_TEAM_MCP_SURFACE": "legacy"},
+            clear=False,
+        ):
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            repo = _repo(base, "legacy-surface-fresh")
+            project = team.init_project(repo)
+            runtime = StubAppServerRuntime()
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime=runtime,
+                runtime_mode="app_server",
+            )
+            goal = manager.create_goal(
+                repo,
+                objective="Compatibility surface must not reuse",
+                workstream_key="legacy-surface",
+            )
+            _, profile = _agent_cache_profile(
+                goal,
+                "lead",
+                LEAD_DEVELOPER_INSTRUCTIONS,
+                cwd=repo,
+                sandbox_mode="danger-full-access",
+            )
+            pool = AgentPool(settings)
+            old_agent = pool.register_thread(
+                project["project_id"],
+                "lead",
+                "legacy-surface",
+                "old-legacy-surface",
+                manager.model,
+                manager.model_provider,
+                "legacy surface lead",
+                profile=profile,
+            )
+            with team.connection() as connection:
+                connection.execute(
+                    """
+                    UPDATE cluster_goals
+                    SET lead_thread_id = ?, updated_at = ?
+                    WHERE goal_id = ?
+                    """,
+                    (old_agent["thread_id"], utc_now(), goal["goal_id"]),
+                )
+
+            dispatched = manager._dispatch_lead(
+                manager.get_goal(goal["goal_id"]),
+                [],
+            )
+            self.assertEqual([], runtime.resume_threads)
+            self.assertNotEqual(dispatched["thread_id"], old_agent["thread_id"])
 
     def test_lead_context_overflow_retries_once_then_fails_goal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -3353,6 +3451,13 @@ class ClusterSchedulerTests(unittest.TestCase):
                 ),
             )
             pool = AgentPool(settings)
+            _, current_profile = _agent_cache_profile(
+                goal,
+                "lead",
+                LEAD_DEVELOPER_INSTRUCTIONS,
+                cwd=repo,
+                sandbox_mode="danger-full-access",
+            )
             old_agent = pool.register_thread(
                 project["project_id"],
                 "lead",
@@ -3361,6 +3466,7 @@ class ClusterSchedulerTests(unittest.TestCase):
                 manager.model,
                 manager.model_provider,
                 "stale generation lead",
+                profile=current_profile,
             )
             with team.connection() as connection:
                 connection.execute(
@@ -4430,6 +4536,62 @@ class ClusterSchedulerTests(unittest.TestCase):
                 prompt.index("## Thread Scope"),
             )
 
+    def test_agent_cache_profile_tracks_worktree_policy_sandbox_and_surface(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = base / "repo"
+            worktree = base / "worktree"
+            root.mkdir()
+            worktree.mkdir()
+            (root / "AGENTS.md").write_text("root policy", encoding="utf-8")
+            (worktree / "AGENTS.md").write_text(
+                "worktree policy",
+                encoding="utf-8",
+            )
+            goal = {
+                "goal_id": "G-CACHE",
+                "project_id": "P-CACHE",
+                "root_path": str(root),
+                "workstream_key": "cache-profile",
+            }
+            _, root_profile = _agent_cache_profile(
+                goal,
+                "team_worker",
+                "ROLE",
+                sandbox_mode="workspace-write",
+            )
+            _, worktree_profile = _agent_cache_profile(
+                goal,
+                "team_worker",
+                "ROLE",
+                cwd=worktree,
+                sandbox_mode="workspace-write",
+            )
+            _, dangerous_profile = _agent_cache_profile(
+                goal,
+                "team_worker",
+                "ROLE",
+                cwd=worktree,
+                sandbox_mode="danger-full-access",
+            )
+            self.assertNotEqual(root_profile, worktree_profile)
+            self.assertNotEqual(worktree_profile, dangerous_profile)
+            with patch.dict(
+                os.environ,
+                {"CODEX_TEAM_MCP_SURFACE": "legacy"},
+                clear=False,
+            ):
+                _, legacy_profile = _agent_cache_profile(
+                    goal,
+                    "team_worker",
+                    "ROLE",
+                    cwd=worktree,
+                    sandbox_mode="workspace-write",
+                )
+            self.assertNotEqual(worktree_profile, legacy_profile)
+
     def test_create_goal_does_not_rewrite_project_policy(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
@@ -4455,6 +4617,45 @@ class ClusterSchedulerTests(unittest.TestCase):
                 )
             self.assertEqual(goal["project_id"], project["project_id"])
             self.assertEqual(agents_path.read_bytes(), before)
+
+    def test_ensure_goal_does_not_initialize_or_rewrite_project_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            repo = _repo(base, "ensure-goal-policy")
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime_mode="exec",
+            )
+            with patch.object(
+                team,
+                "init_project",
+                side_effect=AssertionError("ensure_goal must not initialize project"),
+            ):
+                first = manager.ensure_goal(
+                    repo,
+                    objective="Create a goal without prompt-file writes",
+                )
+            self.assertTrue(first["created"])
+            self.assertFalse((repo / "AGENTS.md").exists())
+
+            project = team.register_project(repo)
+            agents_path = repo / "AGENTS.md"
+            agents_path.write_text("stable policy\n", encoding="utf-8")
+            before = agents_path.read_bytes()
+            with patch.object(
+                team,
+                "init_project",
+                side_effect=AssertionError("ensure_goal must not re-init project"),
+            ):
+                second = manager.ensure_goal(
+                    repo,
+                    objective="Reuse the same goal without writing policy",
+                )
+            self.assertEqual(project["project_id"], second["goal"]["project_id"])
+            self.assertEqual(before, agents_path.read_bytes())
 
     def test_lead_board_digest_bounds_completed_history(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

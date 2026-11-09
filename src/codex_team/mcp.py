@@ -8,6 +8,14 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from . import __version__
+from .cache_contract import (
+    CORE_TOOL_NAMES,
+    MUTATING_TOOLS,
+    OPERATIONS,
+    READ_OPERATIONS,
+    core_tool_definitions,
+    operation_help,
+)
 from .config import Settings
 from .cluster import ClusterManager, daemon_status as cluster_daemon_status, ensure_daemon
 from .service import TeamError, TeamService
@@ -15,28 +23,6 @@ from .worktrees import WorktreeManager
 
 LOGGER = logging.getLogger("codex_team.mcp")
 PROTOCOL_VERSION = "2025-06-18"
-MUTATING_TOOLS = frozenset(
-    {
-        "team_init_project",
-        "team_create_task",
-        "team_create_worktree",
-        "team_claim_task",
-        "team_heartbeat",
-        "team_update_task",
-        "team_submit_task",
-        "team_block_task",
-        "team_unblock_task",
-        "team_cancel_task",
-        "team_review_task",
-        "team_add_message",
-        "team_cluster_start",
-        "team_cluster_ensure",
-        "team_cluster_control",
-        "team_goal_set_workstream",
-        "team_goal_set_checkpoint",
-        "team_agent_reset",
-    }
-)
 INSTRUCTIONS = (
     "This MCP server is the shared task and worktree source of truth for a Codex team. "
     "For an initialized team project, call team_cluster_ensure before non-trivial development "
@@ -47,6 +33,13 @@ INSTRUCTIONS = (
     "is the only reviewer allowed to mark tasks done. Workers must claim a task, keep its "
     "claim_token private, send heartbeats, and submit to review with commit and test evidence. "
     "Never edit outside an assigned worktree."
+)
+CORE_INSTRUCTIONS = (
+    "This MCP server is the shared Team Board task and worktree source. "
+    "Use only the stable `team_read` and `team_write` tools. Call "
+    "team_read(operation='help') once after initialization to discover the "
+    "available operations and argument names. Keep claim tokens private, never "
+    "edit outside an assigned worktree, and preserve the Lead-only review rules."
 )
 
 
@@ -59,18 +52,73 @@ def _access_mode() -> str:
     return mode
 
 
+def _surface_mode() -> str:
+    mode = os.environ.get("CODEX_TEAM_MCP_SURFACE", "core").strip().lower()
+    if mode not in {"core", "admin", "legacy"}:
+        raise TeamError("CODEX_TEAM_MCP_SURFACE must be core, admin, or legacy")
+    return mode
+
+
+def _instructions_for_surface() -> str:
+    return CORE_INSTRUCTIONS if _surface_mode() == "core" else INSTRUCTIONS
+
+
 def _visible_tool_definitions() -> list[dict[str, Any]]:
     mode = _access_mode()
     if mode == "off":
         return []
-    tools = _tool_definitions()
+    surface = _surface_mode()
+    tools = core_tool_definitions() if surface == "core" else _tool_definitions()
     if mode == "read_only":
+        if surface == "core":
+            return [tool for tool in tools if tool.get("name") == "team_read"]
         return [
             tool
             for tool in tools
             if str(tool.get("name") or "") not in MUTATING_TOOLS
         ]
     return tools
+
+
+def _unwrap_core_call(
+    name: str,
+    arguments: Mapping[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    operation = arguments.get("operation")
+    if not isinstance(operation, str) or not operation.strip():
+        raise TeamError(f"{name}.operation must not be empty")
+    operation = operation.strip()
+    if operation == "help":
+        if name != "team_read":
+            raise TeamError("operation='help' must be called through team_read")
+        return operation, {}
+    if operation not in OPERATIONS:
+        raise TeamError(f"unknown Team Board operation: {operation}")
+    expected_tool = "team_read" if operation in READ_OPERATIONS else "team_write"
+    if name != expected_tool:
+        raise TeamError(
+            f"operation {operation} must be called through {expected_tool}"
+        )
+    raw_arguments = arguments.get("arguments", {})
+    if not isinstance(raw_arguments, dict):
+        raise TeamError("arguments must be an object")
+    return operation, raw_arguments
+
+
+def _normalize_tool_call(
+    name: str,
+    arguments: Mapping[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    surface = _surface_mode()
+    if surface == "core":
+        if name not in CORE_TOOL_NAMES:
+            raise TeamError(
+                f"tool {name} is not exposed by the core Team Board surface"
+            )
+        return _unwrap_core_call(name, arguments)
+    if name in CORE_TOOL_NAMES:
+        raise TeamError(f"tool {name} requires CODEX_TEAM_MCP_SURFACE=core")
+    return name, dict(arguments)
 
 
 def _guard_tool_call(name: str, arguments: Mapping[str, Any]) -> None:
@@ -687,10 +735,17 @@ class TeamMcpServer:
             "protocolVersion": str(params.get("protocolVersion") or PROTOCOL_VERSION),
             "capabilities": {"tools": {"listChanged": False}},
             "serverInfo": {"name": "codex-team-board", "version": __version__},
-            "instructions": INSTRUCTIONS,
+            "instructions": _instructions_for_surface(),
         }
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        if _surface_mode() == "core" and name in CORE_TOOL_NAMES:
+            name, arguments = _unwrap_core_call(name, arguments)
+        if name == "help":
+            return operation_help(
+                _tool_definitions(),
+                include_write=_access_mode() == "full",
+            )
         if name == "team_init_project":
             max_threads = arguments.get("max_threads")
             return self.team.init_project(
@@ -981,8 +1036,14 @@ def _process(server: TeamMcpServer, message: dict[str, Any]) -> dict[str, Any] |
             arguments = params.get("arguments") or {}
             if not isinstance(arguments, dict):
                 raise TeamError("tool arguments must be an object")
-            _guard_tool_call(name, arguments)
-            result = _tool_result(server.call_tool(name, arguments))
+            normalized_name, normalized_arguments = _normalize_tool_call(
+                name,
+                arguments,
+            )
+            _guard_tool_call(normalized_name, normalized_arguments)
+            result = _tool_result(
+                server.call_tool(normalized_name, normalized_arguments)
+            )
         elif method in {"resources/list", "prompts/list"}:
             result = {"resources": []} if method == "resources/list" else {"prompts": []}
         elif method == "logging/setLevel":

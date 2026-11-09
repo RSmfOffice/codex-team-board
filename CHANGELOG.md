@@ -4,6 +4,27 @@
 
 ## [Unreleased]
 
+### Added
+
+- 默认 Team Board MCP 工具面切换为缓存稳定的 `core-v1`：
+  `team_read`/`team_write` 使用固定 schema 和 operation dispatcher，完整
+  细粒度工具保留在 `admin`/`legacy` 工具面。
+- Agent cache profile 绑定 Core 工具 schema、项目 AGENTS 策略和稳定角色
+  instructions；任一版本变化都会禁止旧 thread 复用。
+- Core help 返回完整 operation `inputSchema`，保留类型、默认值、范围、枚举和
+  字段说明。
+
+### Changed
+
+- Explorer 的 read 任务和 Reviewer 的 review 任务可在同一 project/role/
+  workstream/cache profile 下自动复用；Worker 的 auto 策略继续保持 fresh。
+- Agent profile 现绑定实际执行目录的 worktree AGENTS、sandbox mode 和 MCP
+  surface；`admin`/`legacy` 兼容工具面强制 fresh，不复用旧 thread。
+- `cluster ensure` 不再隐式初始化或重写项目 AGENTS、角色模板和 marker；
+  bootstrap/policy 写入必须显式执行。
+- Worker、Explorer 和 Reviewer 的 Markdown/native TOML 模板全部改用
+  `team_read`/`team_write` operation，避免默认 core 工具面与角色指令冲突。
+
 ### Fixed
 
 - canceled 或已归档依赖不再把下游任务永久留在 `dependency_wait`；下游任务会转为

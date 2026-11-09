@@ -17,6 +17,7 @@ from . import __version__
 from .agent_home import service_codex_home, sync_agent_codex_home
 from .agent_pool import AgentPool, AgentPoolError
 from .app_server import AppServerEvents, AppServerRuntime
+from .cache_contract import agent_cache_profile, configured_surface
 from .config import Settings
 from .db import connect, connect_readonly, utc_now
 from .processes import pid_is_running
@@ -62,7 +63,8 @@ WORKER_ACTIVITY_EVENT_TYPES = ("claimed", "heartbeat", "progress")
 RUNTIME_MODES = frozenset({"exec", "app_server"})
 LEAD_DEVELOPER_INSTRUCTIONS = """You are the managed Lead for an automated
 Codex work cluster. Do not spawn subagents; the deterministic teamd dispatcher
-launches Workers. You may use shell tools and codexTeamBoard MCP tools.
+launches Workers. You may use shell tools and the stable codexTeamBoard Core
+tools: team_read(operation="...") and team_write(operation="...").
 
 Use the compact board digest returned in each turn as the current source of
 truth. Request a full task only when its detail is required. If there are
@@ -70,15 +72,18 @@ no tasks, decompose the objective into small, non-overlapping tasks with a goal
 ID, acceptance criteria, dependencies, and owner roles. Use kind write for code
 changes and team_worker; use read for team_explorer.
 
-At phase boundaries, call team_goal_set_checkpoint with a compact structured
-summary containing confirmed decisions, completed work, changed files, tests,
-open risks, rejected approaches, and the next action. Update the checkpoint
-whenever those durable facts change. Do not copy raw logs or full transcripts
-into it.
+At phase boundaries, call
+team_write(operation="team_goal_set_checkpoint", arguments={...}) with a compact
+structured summary containing confirmed decisions, completed work, changed
+files, tests, open risks, rejected approaches, and the next action. Update the
+checkpoint whenever those durable facts change. Do not copy raw logs or full
+transcripts into it.
 
-For review tasks, inspect the diff and team_get_task_events, run tests, merge the
-task branch into its recorded target branch, then call team_review_task with the
-real merge_commit. Do not approve failed or dirty work.
+For review tasks, inspect the diff and call
+team_read(operation="team_get_task_events", arguments={...}), run tests, merge
+the task branch into its recorded target branch, then call
+team_write(operation="team_review_task", arguments={...}) with the real
+merge_commit. Do not approve failed or dirty work.
 
 For blocked tasks, resolve the blocker with a concrete action; unblock, cancel,
 or create a replacement task. Never loop without progress. In supervised mode,
@@ -111,6 +116,30 @@ def _stable_developer_instructions(
 This identity is stable for the Agent thread. The current goal, assignment,
 board state, and task-specific instructions arrive in the turn input.
 """
+
+
+def _agent_cache_profile(
+    goal: Mapping[str, Any],
+    role: str,
+    instructions: str,
+    *,
+    cwd: Path | None = None,
+    sandbox_mode: str = "workspace-write",
+) -> tuple[str, str]:
+    stable_instructions = _stable_developer_instructions(goal, role, instructions)
+    worktree_policy = (cwd / "AGENTS.md") if cwd is not None else None
+    policy_path = (
+        worktree_policy
+        if worktree_policy is not None and worktree_policy.is_file()
+        else Path(goal["root_path"]) / "AGENTS.md"
+    )
+    profile = agent_cache_profile(
+        stable_instructions,
+        policy_path=policy_path,
+        sandbox_mode=sandbox_mode,
+        surface=configured_surface(),
+    )
+    return stable_instructions, profile
 
 
 def _clip_text(value: object, limit: int) -> str:
@@ -345,7 +374,7 @@ class ClusterManager:
             limit=2000,
         )
         project = self.team.register_project(repo)
-        self.team._ensure_project_active(project)
+        self.team.ensure_project_active(project)
         goal_id = self._new_id("G")
         effective_workstream = requested_workstream or goal_id
         now = utc_now()
@@ -418,7 +447,8 @@ class ClusterManager:
             "continuity_reason",
             limit=2000,
         )
-        project = self.team.init_project(repo)
+        project = self.team.register_project(repo)
+        self.team.ensure_project_active(project)
         now = utc_now()
         created = False
         with self.team.connection() as connection:
@@ -580,7 +610,7 @@ class ClusterManager:
                 ).fetchall()
             else:
                 rows = connection.execute(
-                    """
+                    f"""
                     SELECT g.*, p.name AS project_name, p.root_path
                     FROM cluster_goals g JOIN projects p ON p.project_id = g.project_id
                     WHERE 1 = 1
@@ -1780,13 +1810,17 @@ class ClusterManager:
             3000,
         )
         assignment = f"""# Managed Assignment Contract
-Use the `codexTeamBoard` MCP tools. Do not spawn subagents or another team.
-First call `team_claim_task` for the current task using the Actor name below.
+Use the stable codexTeamBoard Core tools. Do not spawn subagents or another team.
+First call `team_write(operation="team_claim_task", arguments={{...}})` for the
+current task using the Actor name below.
 Work only on this task. Keep the claim token private. For jobs that may exceed
-four minutes, call `team_heartbeat` at least every three minutes. If your context
-approaches its limit, commit safe progress, call `team_block_task` with the reason
-`worker-context-near-limit`, and stop. Before exiting, either call
-`team_submit_task` or call `team_block_task` with a precise blocker.
+four minutes, call `team_write(operation="team_heartbeat", arguments={{...}})`
+at least every three minutes. If your context approaches its limit, commit safe
+progress, call `team_write(operation="team_block_task", arguments={{...}})` with
+the reason `worker-context-near-limit`, and stop. Before exiting, either call
+`team_write(operation="team_submit_task", arguments={{...}})` or call
+`team_write(operation="team_block_task", arguments={{...}})` with a precise
+blocker.
 
 Return a compact structured summary:
 - outcome
@@ -1982,8 +2016,8 @@ Do not return raw logs or a full transcript.
             "recent_completed": recent_completed,
             "omitted_completed_count": max(0, len(completed_tasks) - 8),
             "detail_policy": (
-                "This is a compact digest. Use team_get_task and "
-                "team_get_task_events only when full history is needed."
+                "This is a compact digest. Use team_read operation team_get_task "
+                "and team_get_task_events only when full history is needed."
             ),
         }
 
@@ -2009,8 +2043,10 @@ Do not return raw logs or a full transcript.
 - Use goal_id = "{goal["goal_id"]}" when creating tasks.
 - Use the compact digest by default.
 - Read a full task or its events only when the digest is insufficient.
-- At phase boundaries, call `team_goal_set_checkpoint` with durable decisions,
-  completed work, tests, rejected approaches, risks, and next action.
+- At phase boundaries, call
+  `team_write(operation="team_goal_set_checkpoint", arguments={...})` with
+  durable decisions, completed work, tests, rejected approaches, risks, and
+  next action.
 - Do not copy raw logs or full transcripts into the checkpoint.
 """
         return self._start_job(
@@ -2909,11 +2945,17 @@ Do not return raw logs or a full transcript.
         runtime = self.runtime
         if runtime is None:
             raise ClusterError("App Server runtime is not configured")
-        developer_instructions = _stable_developer_instructions(
+        developer_instructions, cache_profile = _agent_cache_profile(
             goal,
             role,
             developer_instructions,
+            cwd=cwd,
+            sandbox_mode=sandbox_mode,
         )
+        if configured_surface() != "core":
+            # Compatibility surfaces are for administration and migration;
+            # their changing tool declarations must not be reused by Agents.
+            continuity_mode = "fresh"
         workstream_key = str(goal.get("workstream_key") or goal["goal_id"])
         task_kind = "read" if kind == "lead" else str(
             self.team.get_task(task_id)["kind"]
@@ -2929,6 +2971,7 @@ Do not return raw logs or a full transcript.
                 task_kind,
                 self.model,
                 self.model_provider,
+                profile=cache_profile,
             )
             if agent is not None:
                 try:
@@ -3018,6 +3061,7 @@ Do not return raw logs or a full transcript.
                     self.model,
                     self.model_provider,
                     f"{role} {workstream_key}",
+                    profile=cache_profile,
                 )
             agent = self.agent_pool.mark_busy(
                 str(agent["agent_id"]),

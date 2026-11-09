@@ -334,7 +334,9 @@ class TeamFlowTests(unittest.TestCase):
         self.assertEqual(after.count("CODEX_TEAM_BOARD:END"), 1)
         self.assertIn("推荐最大并发线程数：2", after)
         self.assertIn("team_goal_set_checkpoint", after)
-        self.assertIn("Explorer、Reviewer 和 Worker 默认 fresh", after)
+        self.assertIn("Explorer 的 read 任务和 Reviewer", after)
+        self.assertIn("Worker 的 write 任务默认 fresh", after)
+        self.assertIn('team_read(operation="team_list_tasks")', after)
         self.assertIn("team_get_task_events", after)
         self.assertIn("主 checkout 必须干净", after)
         self.assertNotEqual(before, "")
@@ -347,6 +349,39 @@ class TeamFlowTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("team_heartbeat", reviewer_prompt)
         self.assertIn("team_heartbeat", explorer_prompt)
+        self.assertIn(
+            'team_write(operation="team_claim_task"',
+            reviewer_prompt,
+        )
+        self.assertIn(
+            'team_read(operation="team_get_task_events"',
+            reviewer_prompt,
+        )
+        self.assertIn(
+            'team_write(operation="team_submit_task"',
+            explorer_prompt,
+        )
+        worker_agent_toml = (
+            self.repo / ".codex" / "agents" / "team-worker.toml"
+        ).read_text(encoding="utf-8")
+        reviewer_agent_toml = (
+            self.repo / ".codex" / "agents" / "team-reviewer.toml"
+        ).read_text(encoding="utf-8")
+        explorer_agent_toml = (
+            self.repo / ".codex" / "agents" / "team-explorer.toml"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'team_write(operation="team_claim_task"',
+            worker_agent_toml,
+        )
+        self.assertIn(
+            'team_read(operation="team_get_task_events"',
+            reviewer_agent_toml,
+        )
+        self.assertIn(
+            'team_write(operation="team_submit_task"',
+            explorer_agent_toml,
+        )
 
     def test_worktree_creation_rejects_dirty_main_checkout(self) -> None:
         task = self.team.create_task(
