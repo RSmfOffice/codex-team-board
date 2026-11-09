@@ -37,7 +37,7 @@ from codex_team.scheduling import (
     DEFAULT_LEAD_TIMEOUT_SECONDS,
     DEFAULT_WORKER_TIMEOUT_SECONDS,
 )
-from codex_team.service import TeamService
+from codex_team.service import TeamError, TeamService
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -375,7 +375,7 @@ class ClusterSchedulerTests(unittest.TestCase):
         team: TeamService,
         dispatched: list[tuple[str, str]],
     ):
-        def dispatch(goal: dict, task: dict) -> dict:
+        def dispatch(goal: dict, task: dict, **kwargs) -> dict:
             sequence = len(dispatched) + 1
             job_id = f"J-TEST-{sequence}"
             started_at = utc_now()
@@ -626,6 +626,159 @@ class ClusterSchedulerTests(unittest.TestCase):
                     "global capacity full",
                 )
                 self.assertEqual(deferred[0]["data"]["ready_tasks"], 1)
+
+    def test_dispatch_reserves_claim_before_worker_start(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            repo = _repo(base, "claim-reservation")
+            runtime = StubAppServerRuntime()
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime=runtime,
+                runtime_mode="app_server",
+            )
+            goal, tasks = self._goal_with_ready_tasks(
+                manager,
+                team,
+                repo,
+                1,
+            )
+
+            job = manager._dispatch_worker(
+                manager.get_goal(goal["goal_id"]),
+                tasks[0],
+                reserve_claim=True,
+            )
+            expected_actor = manager._worker_actor(
+                tasks[0]["owner_role"],
+                tasks[0]["task_id"],
+                job["job_id"],
+            )
+            reserved = team.get_task(tasks[0]["task_id"])
+            self.assertEqual(reserved["status"], "running")
+            self.assertEqual(reserved["claimed_by"], expected_actor)
+
+            with self.assertRaisesRegex(TeamError, "already running"):
+                team.claim_task(tasks[0]["task_id"], actor="external-worker")
+
+            renewed = team.claim_task(
+                tasks[0]["task_id"],
+                actor=expected_actor,
+            )
+            self.assertEqual(renewed["claimed_by"], expected_actor)
+            self.assertEqual(
+                len(
+                    [
+                        item
+                        for item in manager.get_goal(goal["goal_id"])["jobs"]
+                        if item["task_id"] == tasks[0]["task_id"]
+                    ]
+                ),
+                1,
+            )
+
+    def test_dispatch_claim_conflict_does_not_start_or_replace_job(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            repo = _repo(base, "claim-conflict-dispatch")
+            runtime = StubAppServerRuntime()
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime=runtime,
+                runtime_mode="app_server",
+            )
+            goal, tasks = self._goal_with_ready_tasks(
+                manager,
+                team,
+                repo,
+                1,
+            )
+            external = team.claim_task(
+                tasks[0]["task_id"],
+                actor="external-worker",
+            )
+
+            job, changed, keep_goal = manager._dispatch_next_job(
+                manager.get_goal(goal["goal_id"]),
+                [tasks[0]],
+            )
+
+            self.assertIsNone(job)
+            self.assertTrue(changed)
+            self.assertTrue(keep_goal)
+            current = team.get_task(tasks[0]["task_id"])
+            self.assertEqual(current["claimed_by"], "external-worker")
+            self.assertEqual(current["lease_until"], external["lease_until"])
+            self.assertEqual(manager.get_goal(goal["goal_id"])["jobs"], [])
+            events = manager.get_goal(goal["goal_id"])["events"]
+            skipped = [
+                event
+                for event in events
+                if event["event_type"] == "dispatch_skipped"
+            ]
+            self.assertEqual(len(skipped), 1)
+            self.assertEqual(skipped[0]["data"]["reason"], "claim_conflict")
+
+    def test_worker_failure_cannot_recover_another_actors_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            repo = _repo(base, "claim-conflict-recovery")
+            runtime = StubAppServerRuntime()
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime=runtime,
+                runtime_mode="app_server",
+            )
+            goal, tasks = self._goal_with_ready_tasks(
+                manager,
+                team,
+                repo,
+                1,
+            )
+            job = manager._dispatch_worker(
+                manager.get_goal(goal["goal_id"]),
+                tasks[0],
+            )
+            external = team.claim_task(
+                tasks[0]["task_id"],
+                actor="external-worker",
+            )
+            job_row = next(
+                item
+                for item in manager.get_goal(goal["goal_id"])["jobs"]
+                if item["job_id"] == job["job_id"]
+            )
+
+            manager._handle_worker_failure(
+                job_row,
+                "worker exited before claiming",
+            )
+
+            current = team.get_task(tasks[0]["task_id"])
+            self.assertEqual(current["status"], "running")
+            self.assertEqual(current["claimed_by"], "external-worker")
+            self.assertEqual(current["lease_until"], external["lease_until"])
+            updated_job = next(
+                item
+                for item in manager.get_goal(goal["goal_id"])["jobs"]
+                if item["job_id"] == job["job_id"]
+            )
+            self.assertEqual(updated_job["status"], "lost")
+            event_types = {
+                event["event_type"]
+                for event in manager.get_goal(goal["goal_id"])["events"]
+            }
+            self.assertIn("worker_claim_conflict", event_types)
+            self.assertNotIn("worker_recovered", event_types)
 
     def test_each_goal_gets_three_workers_without_a_shared_four_job_pool(
         self,
@@ -2653,7 +2806,14 @@ class ClusterSchedulerTests(unittest.TestCase):
                 manager.get_goal(goal["goal_id"]),
                 team.get_task(tasks[0]["task_id"]),
             )
-            team.claim_task(tasks[0]["task_id"], actor="concurrent-b")
+            team.claim_task(
+                tasks[0]["task_id"],
+                actor=manager._worker_actor(
+                    tasks[0]["owner_role"],
+                    tasks[0]["task_id"],
+                    first["job_id"],
+                ),
+            )
             runtime.fail_turn = runtime.turn_attempts + 1
             current_goal = manager.get_goal(goal["goal_id"])
             current_task = team.get_task(tasks[1]["task_id"])
@@ -2735,7 +2895,14 @@ class ClusterSchedulerTests(unittest.TestCase):
                 manager.get_goal(goal["goal_id"]),
                 team.get_task(tasks[0]["task_id"]),
             )
-            team.claim_task(tasks[0]["task_id"], actor="concurrent-b")
+            team.claim_task(
+                tasks[0]["task_id"],
+                actor=manager._worker_actor(
+                    tasks[0]["owner_role"],
+                    tasks[0]["task_id"],
+                    worker_other["job_id"],
+                ),
+            )
             lead_other = manager._dispatch_lead(
                 manager.get_goal(goal["goal_id"]),
                 team.list_tasks(repo, goal_id=goal["goal_id"]),
@@ -2816,12 +2983,26 @@ class ClusterSchedulerTests(unittest.TestCase):
                 manager.get_goal(goal["goal_id"]),
                 team.get_task(tasks[0]["task_id"]),
             )
-            team.claim_task(tasks[0]["task_id"], actor="generation-a")
+            team.claim_task(
+                tasks[0]["task_id"],
+                actor=manager._worker_actor(
+                    tasks[0]["owner_role"],
+                    tasks[0]["task_id"],
+                    old_worker["job_id"],
+                ),
+            )
             old_explorer = manager._dispatch_worker(
                 manager.get_goal(goal["goal_id"]),
                 team.get_task(tasks[1]["task_id"]),
             )
-            team.claim_task(tasks[1]["task_id"], actor="generation-b")
+            team.claim_task(
+                tasks[1]["task_id"],
+                actor=manager._worker_actor(
+                    tasks[1]["owner_role"],
+                    tasks[1]["task_id"],
+                    old_explorer["job_id"],
+                ),
+            )
             runtime.restart_turn_attempt = runtime.turn_attempts + 1
 
             current = manager._dispatch_worker(
@@ -2923,12 +3104,26 @@ class ClusterSchedulerTests(unittest.TestCase):
                 manager.get_goal(goal["goal_id"]),
                 team.get_task(tasks[0]["task_id"]),
             )
-            team.claim_task(tasks[0]["task_id"], actor="thread-generation-a")
+            team.claim_task(
+                tasks[0]["task_id"],
+                actor=manager._worker_actor(
+                    tasks[0]["owner_role"],
+                    tasks[0]["task_id"],
+                    old_worker["job_id"],
+                ),
+            )
             old_explorer = manager._dispatch_worker(
                 manager.get_goal(goal["goal_id"]),
                 team.get_task(tasks[1]["task_id"]),
             )
-            team.claim_task(tasks[1]["task_id"], actor="thread-generation-b")
+            team.claim_task(
+                tasks[1]["task_id"],
+                actor=manager._worker_actor(
+                    tasks[1]["owner_role"],
+                    tasks[1]["task_id"],
+                    old_explorer["job_id"],
+                ),
+            )
             runtime.restart_start_thread_attempt = (
                 runtime.start_thread_attempts + 1
             )
@@ -2991,12 +3186,26 @@ class ClusterSchedulerTests(unittest.TestCase):
                 manager.get_goal(goal["goal_id"]),
                 team.get_task(tasks[0]["task_id"]),
             )
-            team.claim_task(tasks[0]["task_id"], actor="resume-generation-a")
+            team.claim_task(
+                tasks[0]["task_id"],
+                actor=manager._worker_actor(
+                    tasks[0]["owner_role"],
+                    tasks[0]["task_id"],
+                    old_worker["job_id"],
+                ),
+            )
             old_explorer = manager._dispatch_worker(
                 manager.get_goal(goal["goal_id"]),
                 team.get_task(tasks[1]["task_id"]),
             )
-            team.claim_task(tasks[1]["task_id"], actor="resume-generation-b")
+            team.claim_task(
+                tasks[1]["task_id"],
+                actor=manager._worker_actor(
+                    tasks[1]["owner_role"],
+                    tasks[1]["task_id"],
+                    old_explorer["job_id"],
+                ),
+            )
             pool = AgentPool(settings)
             old_agent = pool.register_thread(
                 project["project_id"],
@@ -3082,7 +3291,14 @@ class ClusterSchedulerTests(unittest.TestCase):
                 manager.get_goal(goal["goal_id"]),
                 team.get_task(tasks[0]["task_id"]),
             )
-            team.claim_task(tasks[0]["task_id"], actor="generation-old")
+            team.claim_task(
+                tasks[0]["task_id"],
+                actor=manager._worker_actor(
+                    tasks[0]["owner_role"],
+                    tasks[0]["task_id"],
+                    old_worker["job_id"],
+                ),
+            )
             old_lead = manager._dispatch_lead(
                 manager.get_goal(goal["goal_id"]),
                 team.list_tasks(repo, goal_id=goal["goal_id"]),
@@ -3776,7 +3992,14 @@ class ClusterSchedulerTests(unittest.TestCase):
                 manager.get_goal(goal["goal_id"]),
                 team.get_task(task["task_id"]),
             )
-            team.claim_task(task["task_id"], actor="restart-stub")
+            team.claim_task(
+                task["task_id"],
+                actor=manager._worker_actor(
+                    task["owner_role"],
+                    task["task_id"],
+                    dispatched["job_id"],
+                ),
+            )
 
             restarted = ClusterManager(
                 settings,

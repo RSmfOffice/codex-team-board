@@ -1549,7 +1549,11 @@ class TeamService:
                 raise TeamError("task is in review")
             if task["status"] == "blocked":
                 raise TeamError("task is blocked; unblock it before claiming")
-            if task["status"] == "running" and not self._lease_expired(task["lease_until"]):
+            if (
+                task["status"] == "running"
+                and not self._lease_expired(task["lease_until"])
+                and task["claimed_by"] != actor
+            ):
                 raise TeamError(f"task is already running under {task['claimed_by']}")
             blockers = self._blocking_tasks(connection, task_id)
             if blockers:

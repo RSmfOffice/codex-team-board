@@ -192,6 +192,10 @@ class ClusterError(TeamError):
     pass
 
 
+class WorkerClaimConflict(ClusterError):
+    """A worker task was claimed by another owner before dispatch."""
+
+
 class _AppServerJobStartError(ClusterError):
     """An App Server job could not start after its one runtime restart."""
 
@@ -1160,7 +1164,29 @@ class ClusterManager:
         if len(active_workers) < self.max_workers and candidates:
             task = candidates[0]
             try:
-                return self._dispatch_worker(goal, task), True, True
+                return (
+                    self._dispatch_worker(
+                        goal,
+                        task,
+                        reserve_claim=True,
+                    ),
+                    True,
+                    True,
+                )
+            except WorkerClaimConflict as exc:
+                with self.team.connection() as connection:
+                    self._event(
+                        connection,
+                        goal_id,
+                        "dispatch_skipped",
+                        "teamd",
+                        {
+                            "task_id": task["task_id"],
+                            "reason": "claim_conflict",
+                            "error": str(exc),
+                        },
+                    )
+                return None, True, True
             except Exception as exc:
                 self.team.block_task(
                     task["task_id"],
@@ -1448,10 +1474,17 @@ class ClusterManager:
                 return True
         return False
 
-    def _dispatch_worker(self, goal: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
+    def _dispatch_worker(
+        self,
+        goal: dict[str, Any],
+        task: dict[str, Any],
+        *,
+        reserve_claim: bool = False,
+    ) -> dict[str, Any]:
         role = str(task["owner_role"])
         if role not in self.team.ROLE_FILES:
             raise ClusterError(f"unsupported worker role: {role}")
+        job_id = self._new_id("J")
         if task["kind"] == "write":
             current = self.team.get_task(task["task_id"])
             if not current.get("worktree_path"):
@@ -1467,7 +1500,22 @@ class ClusterManager:
         else:
             cwd = Path(goal["root_path"])
         role_data = self.team.role_prompt(role, goal["root_path"])
-        actor = f"auto-{role}-{task['task_id'].lower()}"
+        actor = self._worker_actor(role, task["task_id"], job_id)
+        if reserve_claim:
+            lease_minutes = max(
+                5,
+                min((int(self.worker_timeout_seconds) + 59) // 60 + 5, 240),
+            )
+            try:
+                self.team.claim_task(
+                    task["task_id"],
+                    actor=actor,
+                    lease_minutes=lease_minutes,
+                )
+            except TeamError as exc:
+                raise WorkerClaimConflict(
+                    f"worker task claim conflict: {exc}"
+                ) from exc
         checkpoint = self._checkpoint_context(goal)
         checkpoint_summary = _clip_text(
             checkpoint.get("summary"),
@@ -1493,6 +1541,7 @@ Do not return raw logs or a full transcript.
 
 # Current Assignment
 - Goal ID: `{goal["goal_id"]}`
+- Job ID: `{job_id}`
 - Task ID: `{task["task_id"]}`
 - Repository: `{goal["root_path"]}`
 - Worktree: `{task.get("worktree_path") or "(none)"}`
@@ -1503,17 +1552,90 @@ Do not return raw logs or a full transcript.
 {checkpoint_summary or "(none)"}
 ```
 """
-        return self._start_job(
-            goal,
-            task_id=task["task_id"],
-            kind="worker",
-            role=role,
-            cwd=cwd,
-            developer_instructions=role_data["prompt"],
-            turn_input=assignment,
-            continuity_mode=str(task.get("continuity_mode") or "auto"),
-            sandbox_mode=self._worker_sandbox_mode(task),
-        )
+        try:
+            return self._start_job(
+                goal,
+                job_id=job_id,
+                task_id=task["task_id"],
+                kind="worker",
+                role=role,
+                cwd=cwd,
+                developer_instructions=role_data["prompt"],
+                turn_input=assignment,
+                continuity_mode=str(task.get("continuity_mode") or "auto"),
+                sandbox_mode=self._worker_sandbox_mode(task),
+                actor=actor,
+            )
+        except Exception:
+            if reserve_claim:
+                self._release_worker_reservation(
+                    task["task_id"],
+                    goal["goal_id"],
+                    actor,
+                    reason="worker dispatch failed before the job could start",
+                )
+            raise
+
+    @staticmethod
+    def _worker_actor(role: str, task_id: str, job_id: str) -> str:
+        return f"auto-{role}-{str(task_id).lower()}-{str(job_id).lower()}"
+
+    def _release_worker_reservation(
+        self,
+        task_id: str,
+        goal_id: str,
+        actor: str,
+        *,
+        reason: str,
+    ) -> bool:
+        now = utc_now()
+        with self.team.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            task = connection.execute(
+                "SELECT status, claimed_by FROM tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if (
+                task is None
+                or task["status"] != "running"
+                or task["claimed_by"] != actor
+            ):
+                return False
+            active_job = connection.execute(
+                """
+                SELECT 1 FROM cluster_jobs
+                WHERE task_id = ? AND kind = 'worker'
+                  AND status IN ('starting', 'running')
+                LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+            if active_job is not None:
+                return False
+            updated = connection.execute(
+                """
+                UPDATE tasks
+                SET status = 'ready', claimed_by = NULL, claim_token = NULL,
+                    lease_until = NULL, blocker = '', updated_at = ?,
+                    version = version + 1
+                WHERE task_id = ? AND status = 'running' AND claimed_by = ?
+                """,
+                (now, task_id, actor),
+            )
+            if updated.rowcount == 0:
+                return False
+            self._event(
+                connection,
+                goal_id,
+                "worker_reservation_released",
+                "teamd",
+                {
+                    "task_id": task_id,
+                    "actor": actor,
+                    "reason": reason,
+                },
+            )
+            return True
 
     @staticmethod
     def _worker_sandbox_mode(task: dict[str, Any]) -> str:
@@ -1654,12 +1776,14 @@ Do not return raw logs or a full transcript.
         self,
         goal: dict[str, Any],
         *,
+        job_id: str | None = None,
         task_id: str | None,
         kind: str,
         role: str,
         cwd: Path,
         developer_instructions: str,
         turn_input: str,
+        actor: str = "",
         continuity_mode: str = "auto",
         resume_thread_id: str | None = None,
         sandbox_mode: str = "workspace-write",
@@ -1672,7 +1796,7 @@ Do not return raw logs or a full transcript.
             "danger-full-access",
         }:
             raise ClusterError(f"invalid sandbox mode: {sandbox_mode}")
-        job_id = self._new_id("J")
+        job_id = job_id or self._new_id("J")
         selected_runtime = self._select_job_runtime(
             goal,
             task_id,
@@ -1728,6 +1852,7 @@ Do not return raw logs or a full transcript.
                     "task_id": task_id,
                     "kind": kind,
                     "role": role,
+                    "actor": actor,
                     "attempt": attempt,
                     "runtime": selected_runtime,
                     "runtime_generation": runtime_generation,
@@ -1776,6 +1901,7 @@ Do not return raw logs or a full transcript.
                     turn_input=turn_input,
                     resume_thread_id=None,
                     sandbox_mode=sandbox_mode,
+                    actor=actor,
                 )
         return self._start_exec_job(
             goal,
@@ -1791,6 +1917,7 @@ Do not return raw logs or a full transcript.
             turn_input=turn_input,
             resume_thread_id=resume_thread_id,
             sandbox_mode=sandbox_mode,
+            actor=actor,
         )
 
     def _start_exec_job(
@@ -1809,6 +1936,7 @@ Do not return raw logs or a full transcript.
         turn_input: str,
         resume_thread_id: str | None,
         sandbox_mode: str,
+        actor: str,
     ) -> dict[str, Any]:
         prompt = f"{developer_instructions.rstrip()}\n\n{turn_input.lstrip()}"
         command = self._build_command(
@@ -1825,6 +1953,7 @@ Do not return raw logs or a full transcript.
                 "CODEX_TEAM_JOB_ID": job_id,
                 "CODEX_TEAM_TASK_ID": task_id or "",
                 "CODEX_TEAM_ROLE": role,
+                "CODEX_TEAM_ACTOR": actor,
                 "CODEX_TEAM_REPO_ROOT": goal["root_path"],
                 "PYTHONUTF8": "1",
             }
@@ -4146,9 +4275,20 @@ Do not return raw logs or a full transcript.
 
     def _handle_worker_failure(self, job: dict[str, Any], reason: str) -> None:
         task = self.team.get_task(job["task_id"])
-        if task["status"] in {"review", "done"}:
+        if task["status"] in {"review", "done", "blocked", "canceled"}:
             return
-        if task["status"] == "blocked":
+        expected_actor = self._worker_actor(
+            str(job["role"]),
+            str(job["task_id"]),
+            str(job["job_id"]),
+        )
+        if task["status"] == "running" and task.get("claimed_by") != expected_actor:
+            self._mark_worker_claim_conflict(
+                job,
+                expected_actor=expected_actor,
+                actual_actor=str(task.get("claimed_by") or ""),
+                reason=reason,
+            )
             return
         if int(job["attempt"]) >= int(job.get("max_worker_attempts") or 3):
             self.team.block_task(
@@ -4163,7 +4303,47 @@ Do not return raw logs or a full transcript.
             reason=reason,
             job_id=job["job_id"],
             attempt=int(job["attempt"]),
+            expected_actor=expected_actor,
         )
+
+    def _mark_worker_claim_conflict(
+        self,
+        job: Mapping[str, Any],
+        *,
+        expected_actor: str,
+        actual_actor: str,
+        reason: str,
+    ) -> None:
+        now = utc_now()
+        error = (
+            "worker claim conflict: "
+            f"expected {expected_actor}, found {actual_actor or '(none)'}"
+        )
+        with self.team.connection() as connection:
+            connection.execute(
+                """
+                UPDATE cluster_jobs
+                SET status = 'lost', finished_at = COALESCE(finished_at, ?),
+                    error = ?
+                WHERE job_id = ?
+                  AND status NOT IN ('completed', 'interrupted')
+                """,
+                (now, error, job["job_id"]),
+            )
+            self._event(
+                connection,
+                str(job["goal_id"]),
+                "worker_claim_conflict",
+                "teamd",
+                {
+                    "job_id": job["job_id"],
+                    "task_id": job["task_id"],
+                    "expected_actor": expected_actor,
+                    "actual_actor": actual_actor,
+                    "reason": reason,
+                    "error": error,
+                },
+            )
 
     def _recover_task(
         self,
@@ -4173,21 +4353,53 @@ Do not return raw logs or a full transcript.
         reason: str,
         job_id: str | None = None,
         attempt: int = 0,
-    ) -> None:
+        expected_actor: str | None = None,
+    ) -> bool:
         task = self.team.get_task(task_id)
         if task["status"] in TERMINAL_TASK_STATUSES or task["status"] == "review":
-            return
+            return False
+        if task["status"] == "ready":
+            with self.team.connection() as connection:
+                self._event(
+                    connection,
+                    goal_id,
+                    "worker_recovered",
+                    "teamd",
+                    {
+                        "task_id": task_id,
+                        "job_id": job_id,
+                        "attempt": attempt,
+                        "reason": reason,
+                        "already_ready": True,
+                    },
+                )
+            return True
+        if task["status"] != "running":
+            return False
+        if expected_actor and task.get("claimed_by") != expected_actor:
+            return False
         with self.team.connection() as connection:
-            connection.execute(
+            where_claim = (
+                " AND claimed_by = ?"
+                if expected_actor
+                else ""
+            )
+            parameters: list[Any] = [reason, utc_now(), task_id]
+            if expected_actor:
+                parameters.append(expected_actor)
+            updated = connection.execute(
                 """
                 UPDATE tasks
                 SET status = 'ready', claimed_by = NULL, claim_token = NULL,
                     lease_until = NULL, blocker = ?, updated_at = ?,
                     version = version + 1
-                WHERE task_id = ?
-                """,
-                (reason, utc_now(), task_id),
+                WHERE task_id = ? AND status = 'running'
+                """
+                + where_claim,
+                parameters,
             )
+            if updated.rowcount == 0:
+                return False
             self._event(
                 connection,
                 goal_id,
@@ -4200,6 +4412,7 @@ Do not return raw logs or a full transcript.
                     "reason": reason,
                 },
             )
+            return True
 
     def _active_worker_jobs(self, goal_id: str) -> dict[str, dict[str, Any]]:
         with self.team.connection(write=False) as connection:

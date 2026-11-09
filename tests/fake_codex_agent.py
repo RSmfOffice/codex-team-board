@@ -87,7 +87,8 @@ def main() -> int:
 
     task_id = os.environ["CODEX_TEAM_TASK_ID"]
     task = team.get_task(task_id)
-    claim = team.claim_task(task_id, actor=f"fake-worker-{job_id}")
+    actor = os.environ.get("CODEX_TEAM_ACTOR") or f"fake-worker-{job_id}"
+    claim = team.claim_task(task_id, actor=actor)
     fail_marker = marker_dir / f"worker-failed-once-{task_id}"
     if not fail_marker.exists():
         fail_marker.write_text("1", encoding="utf-8")
@@ -100,7 +101,7 @@ def main() -> int:
     commit = git(worktree, "rev-parse", "HEAD")
     team.submit_task(
         task_id,
-        actor=f"fake-worker-{job_id}",
+        actor=actor,
         claim_token=claim["claim_token"],
         result=(
             "行为：创建 greeting.txt\n"
