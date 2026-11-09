@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any, Iterable
 
 
 CORE_SURFACE_VERSION = "core-v1"
 CACHE_PROFILE_PREFIX = "cache-v1"
+SURFACES = frozenset({"core", "admin", "legacy"})
 
 READ_OPERATIONS = frozenset(
     {
@@ -124,6 +126,22 @@ def core_tool_schema_hash() -> str:
     return sha256_text(canonical_json(core_tool_definitions()))
 
 
+def configured_surface() -> str:
+    surface = os.environ.get("CODEX_TEAM_MCP_SURFACE", "core").strip().lower()
+    return surface if surface in SURFACES else surface
+
+
+def tool_surface_identity(surface: str | None = None) -> tuple[str, str]:
+    selected = (surface or configured_surface()).strip().lower()
+    if selected not in SURFACES:
+        return selected, sha256_text(f"invalid-surface:{selected}")
+    if selected == "core":
+        return selected, core_tool_schema_hash()
+    # Non-core surfaces are admin compatibility modes. Their version must be
+    # bumped whenever their tool declarations change.
+    return selected, sha256_text(f"{selected}-surface-v1")
+
+
 def file_hash(path: Path | None) -> str:
     if path is None or not path.is_file():
         return sha256_text("")
@@ -134,16 +152,21 @@ def agent_cache_profile(
     developer_instructions: str,
     *,
     policy_path: Path | None,
+    sandbox_mode: str,
+    surface: str | None = None,
     tool_schema_hash: str | None = None,
 ) -> str:
     """Build a compact exact compatibility identity for one Agent thread."""
 
-    tools_hash = tool_schema_hash or core_tool_schema_hash()
+    selected_surface, surface_hash = tool_surface_identity(surface)
+    tools_hash = tool_schema_hash or surface_hash
     role_hash = sha256_text(developer_instructions)
     policy_hash = file_hash(policy_path)
+    sandbox_hash = sha256_text(str(sandbox_mode).strip().lower())
     return (
-        f"{CACHE_PROFILE_PREFIX};{CORE_SURFACE_VERSION};"
-        f"tools={tools_hash};policy={policy_hash};role={role_hash}"
+        f"{CACHE_PROFILE_PREFIX};{CORE_SURFACE_VERSION};surface={selected_surface};"
+        f"tools={tools_hash};policy={policy_hash};role={role_hash};"
+        f"sandbox={sandbox_hash}"
     )
 
 
@@ -160,8 +183,6 @@ def operation_help(
         if name not in OPERATIONS:
             continue
         schema = tool.get("inputSchema")
-        properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
-        required = schema.get("required", []) if isinstance(schema, dict) else []
         mode = "read" if name in READ_OPERATIONS else "write"
         if mode == "write" and not include_write:
             continue
@@ -169,8 +190,7 @@ def operation_help(
             {
                 "operation": name,
                 "description": str(tool.get("description") or ""),
-                "required": list(required),
-                "properties": sorted(properties),
+                "inputSchema": schema,
             }
         )
     return {

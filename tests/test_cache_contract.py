@@ -52,6 +52,20 @@ class CacheContractTests(unittest.TestCase):
                 for item in help_result["operations"]["read"]
             },
         )
+        get_task = next(
+            item
+            for item in help_result["operations"]["read"]
+            if item["operation"] == "team_get_task"
+        )
+        self.assertIn("inputSchema", get_task)
+        create_task = next(
+            item
+            for item in help_result["operations"]["write"]
+            if item["operation"] == "team_create_task"
+        )
+        priority = create_task["inputSchema"]["properties"]["priority"]
+        self.assertEqual((0, 3), (priority["minimum"], priority["maximum"]))
+        self.assertIn("0 is highest", priority["description"])
 
     def test_core_dispatcher_covers_every_legacy_operation(self) -> None:
         self.assertEqual(
@@ -197,6 +211,8 @@ class CacheContractTests(unittest.TestCase):
             first = agent_cache_profile(
                 "role-v1",
                 policy_path=policy,
+                sandbox_mode="workspace-write",
+                surface="core",
                 tool_schema_hash="tools-v1",
             )
             self.assertNotEqual(
@@ -204,6 +220,8 @@ class CacheContractTests(unittest.TestCase):
                 agent_cache_profile(
                     "role-v2",
                     policy_path=policy,
+                    sandbox_mode="workspace-write",
+                    surface="core",
                     tool_schema_hash="tools-v1",
                 ),
             )
@@ -212,6 +230,8 @@ class CacheContractTests(unittest.TestCase):
                 agent_cache_profile(
                     "role-v1",
                     policy_path=policy,
+                    sandbox_mode="workspace-write",
+                    surface="core",
                     tool_schema_hash="tools-v2",
                 ),
             )
@@ -221,6 +241,28 @@ class CacheContractTests(unittest.TestCase):
                 agent_cache_profile(
                     "role-v1",
                     policy_path=policy,
+                    sandbox_mode="workspace-write",
+                    surface="core",
+                    tool_schema_hash="tools-v1",
+                ),
+            )
+            self.assertNotEqual(
+                first,
+                agent_cache_profile(
+                    "role-v1",
+                    policy_path=policy,
+                    sandbox_mode="danger-full-access",
+                    surface="core",
+                    tool_schema_hash="tools-v1",
+                ),
+            )
+            self.assertNotEqual(
+                first,
+                agent_cache_profile(
+                    "role-v1",
+                    policy_path=policy,
+                    sandbox_mode="workspace-write",
+                    surface="legacy",
                     tool_schema_hash="tools-v1",
                 ),
             )

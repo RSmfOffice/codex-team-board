@@ -523,7 +523,8 @@ MCP 的 `team_cluster_control.action` 除 `pause`、`resume`、`cancel` 外，�
 - `team_write(operation, arguments, request_id?)`
 
 初始化后调用一次 `team_read(operation="help")` 可取得操作目录；新增 operation
-不会改变工具 schema。`CODEX_TEAM_MCP_SURFACE=core|admin|legacy` 控制工具面，
+不会改变工具 schema。help 会返回每个 operation 的完整 `inputSchema`，包括类型、
+默认值、范围、枚举和字段说明。`CODEX_TEAM_MCP_SURFACE=core|admin|legacy` 控制工具面，
 其中 `core` 是默认值，`admin`/`legacy` 暴露下列兼容细粒度工具，建议仅用于人工
 管理、迁移和故障回退。
 
@@ -653,8 +654,10 @@ thread 既有 baseline 的差值；只有 `total` 没有 token 证据时才回�
 
 `CODEX_TEAM_AGENT_REUSE_CONTEXT_RATIO` 默认 `0.85`。当 Agent 的
 `context_tokens / model_context_window` 达到该比例时，不再复用旧 thread。
-Agent cache profile 会同时绑定 Core 工具 schema、项目 AGENTS 策略和最终稳定
-developer instructions；任一变化都会阻止旧 thread 复用。
+Agent cache profile 会同时绑定实际执行目录的 AGENTS 策略、Core 工具 schema、
+surface、sandbox mode 和最终稳定 developer instructions；任一变化都会阻止旧
+thread 复用。`admin`/`legacy` 兼容工具面不会参与 Agent 自动复用，始终使用新
+thread，避免管理工具面变化污染缓存身份。
 `continuity_reason` 说明相关 goal 为什么可以延续同一 Lead 上下文。创建或恢复
 目标时可以直接提供：
 

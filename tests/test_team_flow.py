@@ -349,6 +349,18 @@ class TeamFlowTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("team_heartbeat", reviewer_prompt)
         self.assertIn("team_heartbeat", explorer_prompt)
+        self.assertIn(
+            'team_write(operation="team_claim_task"',
+            reviewer_prompt,
+        )
+        self.assertIn(
+            'team_read(operation="team_get_task_events"',
+            reviewer_prompt,
+        )
+        self.assertIn(
+            'team_write(operation="team_submit_task"',
+            explorer_prompt,
+        )
 
     def test_worktree_creation_rejects_dirty_main_checkout(self) -> None:
         task = self.team.create_task(

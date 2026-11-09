@@ -2672,6 +2672,8 @@ class ClusterSchedulerTests(unittest.TestCase):
                 goal,
                 "lead",
                 LEAD_DEVELOPER_INSTRUCTIONS,
+                cwd=repo,
+                sandbox_mode="danger-full-access",
             )
             legacy = pool.register_thread(
                 project["project_id"],
@@ -2766,6 +2768,8 @@ class ClusterSchedulerTests(unittest.TestCase):
                 goal,
                 "lead",
                 LEAD_DEVELOPER_INSTRUCTIONS,
+                cwd=repo,
+                sandbox_mode="danger-full-access",
             )
             old_agent = pool.register_thread(
                 project["project_id"],
@@ -2811,6 +2815,64 @@ class ClusterSchedulerTests(unittest.TestCase):
             self.assertEqual(job["thread_id"], dispatched["thread_id"])
             log = Path(job["log_path"]).read_text(encoding="utf-8")
             self.assertIn("agent_thread_resume_failed", log)
+
+    def test_non_core_mcp_surface_forces_fresh_agent_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(
+            os.environ,
+            {"CODEX_TEAM_MCP_SURFACE": "legacy"},
+            clear=False,
+        ):
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            repo = _repo(base, "legacy-surface-fresh")
+            project = team.init_project(repo)
+            runtime = StubAppServerRuntime()
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime=runtime,
+                runtime_mode="app_server",
+            )
+            goal = manager.create_goal(
+                repo,
+                objective="Compatibility surface must not reuse",
+                workstream_key="legacy-surface",
+            )
+            _, profile = _agent_cache_profile(
+                goal,
+                "lead",
+                LEAD_DEVELOPER_INSTRUCTIONS,
+                cwd=repo,
+                sandbox_mode="danger-full-access",
+            )
+            pool = AgentPool(settings)
+            old_agent = pool.register_thread(
+                project["project_id"],
+                "lead",
+                "legacy-surface",
+                "old-legacy-surface",
+                manager.model,
+                manager.model_provider,
+                "legacy surface lead",
+                profile=profile,
+            )
+            with team.connection() as connection:
+                connection.execute(
+                    """
+                    UPDATE cluster_goals
+                    SET lead_thread_id = ?, updated_at = ?
+                    WHERE goal_id = ?
+                    """,
+                    (old_agent["thread_id"], utc_now(), goal["goal_id"]),
+                )
+
+            dispatched = manager._dispatch_lead(
+                manager.get_goal(goal["goal_id"]),
+                [],
+            )
+            self.assertEqual([], runtime.resume_threads)
+            self.assertNotEqual(dispatched["thread_id"], old_agent["thread_id"])
 
     def test_lead_context_overflow_retries_once_then_fails_goal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -3393,6 +3455,8 @@ class ClusterSchedulerTests(unittest.TestCase):
                 goal,
                 "lead",
                 LEAD_DEVELOPER_INSTRUCTIONS,
+                cwd=repo,
+                sandbox_mode="danger-full-access",
             )
             old_agent = pool.register_thread(
                 project["project_id"],
@@ -4471,6 +4535,62 @@ class ClusterSchedulerTests(unittest.TestCase):
                 prompt.index("ROLE_CONTRACT_MARKER"),
                 prompt.index("## Thread Scope"),
             )
+
+    def test_agent_cache_profile_tracks_worktree_policy_sandbox_and_surface(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = base / "repo"
+            worktree = base / "worktree"
+            root.mkdir()
+            worktree.mkdir()
+            (root / "AGENTS.md").write_text("root policy", encoding="utf-8")
+            (worktree / "AGENTS.md").write_text(
+                "worktree policy",
+                encoding="utf-8",
+            )
+            goal = {
+                "goal_id": "G-CACHE",
+                "project_id": "P-CACHE",
+                "root_path": str(root),
+                "workstream_key": "cache-profile",
+            }
+            _, root_profile = _agent_cache_profile(
+                goal,
+                "team_worker",
+                "ROLE",
+                sandbox_mode="workspace-write",
+            )
+            _, worktree_profile = _agent_cache_profile(
+                goal,
+                "team_worker",
+                "ROLE",
+                cwd=worktree,
+                sandbox_mode="workspace-write",
+            )
+            _, dangerous_profile = _agent_cache_profile(
+                goal,
+                "team_worker",
+                "ROLE",
+                cwd=worktree,
+                sandbox_mode="danger-full-access",
+            )
+            self.assertNotEqual(root_profile, worktree_profile)
+            self.assertNotEqual(worktree_profile, dangerous_profile)
+            with patch.dict(
+                os.environ,
+                {"CODEX_TEAM_MCP_SURFACE": "legacy"},
+                clear=False,
+            ):
+                _, legacy_profile = _agent_cache_profile(
+                    goal,
+                    "team_worker",
+                    "ROLE",
+                    cwd=worktree,
+                    sandbox_mode="workspace-write",
+                )
+            self.assertNotEqual(worktree_profile, legacy_profile)
 
     def test_create_goal_does_not_rewrite_project_policy(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
