@@ -1321,6 +1321,27 @@ class ClusterSchedulerTests(unittest.TestCase):
                 ],
             )
 
+    def test_list_goals_without_status_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime_mode="exec",
+            )
+            repo = _repo(base, "list-goals")
+            created = manager.create_goal(
+                repo,
+                objective="Exercise the unfiltered cluster list query",
+            )
+            goals = manager.list_goals()
+            self.assertEqual(
+                [created["goal_id"]],
+                [goal["goal_id"] for goal in goals],
+            )
+
     def test_worker_heartbeat_warning_and_critical_alert_without_kill(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)

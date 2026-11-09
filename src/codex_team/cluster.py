@@ -595,7 +595,7 @@ class ClusterManager:
                 ).fetchall()
             else:
                 rows = connection.execute(
-                    """
+                    f"""
                     SELECT g.*, p.name AS project_name, p.root_path
                     FROM cluster_goals g JOIN projects p ON p.project_id = g.project_id
                     WHERE 1 = 1
