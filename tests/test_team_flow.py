@@ -361,6 +361,27 @@ class TeamFlowTests(unittest.TestCase):
             'team_write(operation="team_submit_task"',
             explorer_prompt,
         )
+        worker_agent_toml = (
+            self.repo / ".codex" / "agents" / "team-worker.toml"
+        ).read_text(encoding="utf-8")
+        reviewer_agent_toml = (
+            self.repo / ".codex" / "agents" / "team-reviewer.toml"
+        ).read_text(encoding="utf-8")
+        explorer_agent_toml = (
+            self.repo / ".codex" / "agents" / "team-explorer.toml"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'team_write(operation="team_claim_task"',
+            worker_agent_toml,
+        )
+        self.assertIn(
+            'team_read(operation="team_get_task_events"',
+            reviewer_agent_toml,
+        )
+        self.assertIn(
+            'team_write(operation="team_submit_task"',
+            explorer_agent_toml,
+        )
 
     def test_worktree_creation_rejects_dirty_main_checkout(self) -> None:
         task = self.team.create_task(

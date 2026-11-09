@@ -22,8 +22,8 @@
   surface；`admin`/`legacy` 兼容工具面强制 fresh，不复用旧 thread。
 - `cluster ensure` 不再隐式初始化或重写项目 AGENTS、角色模板和 marker；
   bootstrap/policy 写入必须显式执行。
-- Worker、Explorer 和 Reviewer 模板全部改用 `team_read`/`team_write`
-  operation，避免默认 core 工具面与角色指令冲突。
+- Worker、Explorer 和 Reviewer 的 Markdown/native TOML 模板全部改用
+  `team_read`/`team_write` operation，避免默认 core 工具面与角色指令冲突。
 
 ### Fixed
 
