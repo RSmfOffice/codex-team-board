@@ -724,14 +724,12 @@ class ClusterManager:
         now = utc_now()
         with self.team.connection() as connection:
             for job in active_jobs:
-                connection.execute(
-                    """
-                    UPDATE cluster_jobs
-                    SET status = 'interrupted', finished_at = ?, exit_code = -9,
-                        error = ?
-                    WHERE job_id = ?
-                    """,
-                    (now, reason, job["job_id"]),
+                self._settle_job_row(
+                    connection,
+                    job["job_id"],
+                    status="interrupted",
+                    error=reason,
+                    exit_code=-9,
                 )
             for task in tasks:
                 connection.execute(
@@ -1085,6 +1083,7 @@ class ClusterManager:
     def tick(self) -> dict[str, Any]:
         self._apply_agent_reset_requests()
         self._sync_project_agent_archive()
+        worktree_recovery = self.worktrees.recover_pending()
         self._reconcile_jobs()
         self._check_worker_health()
         goals = self.list_goals(["planning", "active"])
@@ -1094,7 +1093,12 @@ class ClusterManager:
                 schedulable.append(goal)
         scheduled = self._schedule_goals(schedulable)
         self._check_goal_stalls(goals, scheduled)
-        return {"tick_at": utc_now(), "scheduled": scheduled, "goals": len(goals)}
+        return {
+            "tick_at": utc_now(),
+            "scheduled": scheduled,
+            "goals": len(goals),
+            "worktree_recovery": worktree_recovery,
+        }
 
     def _sync_project_agent_archive(self) -> None:
         with self.team.connection(write=False) as connection:
@@ -2112,14 +2116,22 @@ Do not return raw logs or a full transcript.
         log_path = goal_dir / f"{job_id}.jsonl"
         output_path = goal_dir / f"{job_id}.last.md"
         attempt = self._next_attempt(goal["goal_id"], task_id, kind)
+        prompt_hash = hashlib.sha256(
+            (
+                developer_instructions.rstrip()
+                + "\n\n"
+                + turn_input.lstrip()
+            ).encode("utf-8")
+        ).hexdigest()
         with self.team.connection() as connection:
             connection.execute(
                 """
                 INSERT INTO cluster_jobs(
                     job_id, goal_id, task_id, kind, role, status,
                     attempt, log_path, output_path, runtime,
-                    runtime_generation, error, started_at
-                ) VALUES (?, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?, ?)
+                    runtime_generation, error, started_at, correlation_id,
+                    prompt_hash
+                ) VALUES (?, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -2134,6 +2146,8 @@ Do not return raw logs or a full transcript.
                     runtime_generation,
                     runtime_error,
                     utc_now(),
+                    job_id,
+                    prompt_hash,
                 ),
             )
             self._event(
@@ -2152,6 +2166,8 @@ Do not return raw logs or a full transcript.
                     "runtime_generation": runtime_generation,
                     "resume_thread_id": resume_thread_id,
                     "sandbox_mode": sandbox_mode,
+                    "correlation_id": job_id,
+                    "prompt_hash": prompt_hash,
                 },
             )
         if selected_runtime == "app_server":
@@ -2196,6 +2212,7 @@ Do not return raw logs or a full transcript.
                     resume_thread_id=None,
                     sandbox_mode=sandbox_mode,
                     actor=actor,
+                    thread_action="fallback_exec",
                 )
         return self._start_exec_job(
             goal,
@@ -2212,6 +2229,7 @@ Do not return raw logs or a full transcript.
             resume_thread_id=resume_thread_id,
             sandbox_mode=sandbox_mode,
             actor=actor,
+            thread_action="resume" if resume_thread_id else "fresh_exec",
         )
 
     def _start_exec_job(
@@ -2231,6 +2249,7 @@ Do not return raw logs or a full transcript.
         resume_thread_id: str | None,
         sandbox_mode: str,
         actor: str,
+        thread_action: str,
     ) -> dict[str, Any]:
         prompt = f"{developer_instructions.rstrip()}\n\n{turn_input.lstrip()}"
         command = self._build_command(
@@ -2290,21 +2309,21 @@ Do not return raw logs or a full transcript.
         except Exception as exc:
             safe_error = self._redact_error(str(exc))
             with self.team.connection() as connection:
-                connection.execute(
-                    """
-                    UPDATE cluster_jobs
-                    SET status = 'failed', finished_at = ?, error = ?
-                    WHERE job_id = ?
-                    """,
-                    (utc_now(), safe_error, job_id),
-                )
-                self._event(
+                if self._settle_job_row(
                     connection,
-                    goal["goal_id"],
-                    "job_start_failed",
-                    "teamd",
-                    {"job_id": job_id, "error": safe_error},
-                )
+                    job_id,
+                    status="failed",
+                    error=safe_error,
+                    exit_code=None,
+                    thread_action=thread_action,
+                ):
+                    self._event(
+                        connection,
+                        goal["goal_id"],
+                        "job_start_failed",
+                        "teamd",
+                        {"job_id": job_id, "error": safe_error},
+                    )
             raise ClusterError(
                 f"could not start {kind} process: {safe_error}"
             ) from exc
@@ -2313,10 +2332,11 @@ Do not return raw logs or a full transcript.
             connection.execute(
                 """
                 UPDATE cluster_jobs
-                SET status = 'running', pid = ?, thread_id = ?
+                SET status = 'running', pid = ?, thread_id = ?,
+                    thread_action = ?
                 WHERE job_id = ?
                 """,
-                (process.pid, resume_thread_id, job_id),
+                (process.pid, resume_thread_id, thread_action, job_id),
             )
             connection.execute(
                 """
@@ -2337,6 +2357,7 @@ Do not return raw logs or a full transcript.
             "runtime": "exec",
             "attempt": attempt,
             "log_path": str(log_path),
+            "thread_action": thread_action,
         }
 
     def _fallback_job_start_to_exec(
@@ -2363,7 +2384,8 @@ Do not return raw logs or a full transcript.
                 UPDATE cluster_jobs
                 SET runtime = 'exec', status = 'starting', pid = NULL,
                     thread_id = NULL, agent_id = NULL, turn_id = NULL,
-                    runtime_generation = NULL, error = ?
+                    runtime_generation = NULL, cache_profile = '',
+                    thread_action = 'fallback_exec', error = ?
                 WHERE job_id = ?
                 """,
                 (runtime_error, job_id),
@@ -2962,6 +2984,7 @@ Do not return raw logs or a full transcript.
         )
         agent: dict[str, Any] | None = None
         thread_id = ""
+        thread_action = "fresh"
         try:
             agent = self.agent_pool.select_agent(
                 str(goal["project_id"]),
@@ -2983,6 +3006,7 @@ Do not return raw logs or a full transcript.
                             str(agent["thread_id"])
                         ),
                     )
+                    thread_action = "resume"
                 except Exception as exc:
                     reason = self._app_server_failure(
                         f"thread resume failed: "
@@ -3094,13 +3118,16 @@ Do not return raw logs or a full transcript.
                     """
                     UPDATE cluster_jobs
                     SET status = 'running', thread_id = ?, agent_id = ?,
-                        runtime_generation = ?
+                        runtime_generation = ?, cache_profile = ?,
+                        thread_action = ?
                     WHERE job_id = ?
                     """,
                     (
                         thread_id,
                         agent["agent_id"],
                         runtime_generation,
+                        cache_profile,
+                        thread_action,
                         job_id,
                     ),
                 )
@@ -3113,6 +3140,8 @@ Do not return raw logs or a full transcript.
                     "agent_id": agent["agent_id"],
                     "runtime": "app_server",
                     "runtime_generation": runtime_generation,
+                    "cache_profile": cache_profile,
+                    "thread_action": thread_action,
                 },
             )
             turn = self._start_app_turn_with_restart(
@@ -3226,6 +3255,8 @@ Do not return raw logs or a full transcript.
             "runtime": "app_server",
             "attempt": attempt,
             "log_path": str(log_path),
+            "cache_profile": cache_profile,
+            "thread_action": thread_action,
         }
 
     @staticmethod
@@ -3612,38 +3643,55 @@ Do not return raw logs or a full transcript.
         reason: str = "App Server runtime restarted without the active turn",
     ) -> None:
         reason = self._redact_error(reason)
+        with self._app_state_lock:
+            state = dict(self.app_turns.get(job["job_id"], {}))
+        usage = self._app_job_usage(job, state)
+        usage_has_evidence = _usage_has_evidence(usage)
+        usage_source = (
+            "cluster_agents.last_usage+runtime_raw_turn"
+            if usage_has_evidence
+            else None
+        )
+        telemetry_complete = (
+            _usage_is_telemetry_complete(usage)
+            if usage_has_evidence
+            else False
+        )
+        settled = False
         with self.team.connection() as connection:
-            updated = connection.execute(
-                """
-                UPDATE cluster_jobs
-                SET status = 'lost', finished_at = ?, error = ?
-                WHERE job_id = ? AND status IN ('starting', 'running')
-                """,
-                (
-                    utc_now(),
-                    reason,
-                    job["job_id"],
-                ),
-            )
-            if updated.rowcount == 0:
-                return
-            self._event(
+            settled = self._settle_job_row(
                 connection,
-                job["goal_id"],
-                "app_server_turn_lost",
-                "teamd",
-                {
-                    "job_id": job["job_id"],
-                    "task_id": job.get("task_id"),
-                    "thread_id": job.get("thread_id"),
-                    "turn_id": job.get("turn_id"),
-                    "runtime_generation": job.get("runtime_generation"),
-                    "current_runtime_generation": (
-                        self._current_runtime_generation()
-                    ),
-                    "reason": reason,
-                },
+                job["job_id"],
+                status="lost",
+                error=reason,
+                exit_code=job.get("exit_code"),
+                thread_id=job.get("thread_id"),
+                usage=usage,
+                usage_source=usage_source,
+                telemetry_complete=telemetry_complete,
+                usage_missing_fields=_usage_missing_fields_json(usage),
             )
+            if settled:
+                self._event(
+                    connection,
+                    job["goal_id"],
+                    "app_server_turn_lost",
+                    "teamd",
+                    {
+                        "job_id": job["job_id"],
+                        "task_id": job.get("task_id"),
+                        "thread_id": job.get("thread_id"),
+                        "turn_id": job.get("turn_id"),
+                        "runtime_generation": job.get("runtime_generation"),
+                        "current_runtime_generation": (
+                            self._current_runtime_generation()
+                        ),
+                        "reason": reason,
+                        "usage_source": usage_source,
+                    },
+                )
+        if not settled:
+            return
         with self._app_state_lock:
             self.app_turns.pop(job["job_id"], None)
             if job.get("thread_id"):
@@ -4020,32 +4068,30 @@ Do not return raw logs or a full transcript.
         agent_id = str(job.get("agent_id") or "")
         if agent_id:
             with self.team.connection(write=False) as connection:
-                agent = connection.execute(
+                prior = connection.execute(
                     """
                     SELECT
-                        a.total_input_tokens,
-                        a.total_cached_input_tokens,
-                        COALESCE((
-                            SELECT SUM(j.output_tokens)
-                            FROM cluster_jobs j
-                            WHERE j.agent_id = a.agent_id
-                              AND j.job_id <> ?
-                              AND j.status = 'completed'
-                        ), 0) AS prior_output_tokens
-                    FROM cluster_agents a
-                    WHERE a.agent_id = ?
+                        COALESCE(SUM(input_tokens), 0) AS prior_input_tokens,
+                        COALESCE(SUM(cached_input_tokens), 0)
+                            AS prior_cached_input_tokens,
+                        COALESCE(SUM(output_tokens), 0)
+                            AS prior_output_tokens
+                    FROM cluster_jobs
+                    WHERE agent_id = ?
+                      AND job_id <> ?
+                      AND status = 'completed'
                     """,
-                    (str(job.get("job_id") or ""), agent_id),
+                    (agent_id, str(job.get("job_id") or "")),
                 ).fetchone()
-            if agent is not None:
-                baseline_input = max(0, int(agent["total_input_tokens"] or 0))
+            if prior is not None:
+                baseline_input = max(0, int(prior["prior_input_tokens"] or 0))
                 baseline_cached = max(
                     0,
-                    int(agent["total_cached_input_tokens"] or 0),
+                    int(prior["prior_cached_input_tokens"] or 0),
                 )
                 baseline_output = max(
                     0,
-                    int(agent["prior_output_tokens"] or 0),
+                    int(prior["prior_output_tokens"] or 0),
                 )
 
         def snapshot_values(
@@ -4323,6 +4369,95 @@ Do not return raw logs or a full transcript.
             if turn_id and self.app_turn_jobs.get(turn_id) == job_id:
                 self.app_turn_jobs.pop(turn_id, None)
 
+    def _settle_job_row(
+        self,
+        connection: Any,
+        job_id: str,
+        *,
+        status: str,
+        error: str,
+        exit_code: int | None,
+        thread_id: str | None = None,
+        usage: Mapping[str, Any] | None = None,
+        usage_source: str | None = None,
+        telemetry_complete: bool | None = None,
+        usage_missing_fields: str | None = None,
+        thread_action: str | None = None,
+    ) -> bool:
+        if status not in {"completed", "failed", "interrupted", "lost"}:
+            raise ClusterError(f"invalid terminal job status: {status}")
+        now = utc_now()
+        fields = [
+            "status = ?",
+            "finished_at = ?",
+            "exit_code = ?",
+            "error = ?",
+            "outcome = ?",
+            "settled_at = ?",
+        ]
+        parameters: list[Any] = [
+            status,
+            now,
+            exit_code,
+            error,
+            status,
+            now,
+        ]
+        if thread_id is not None:
+            fields.append("thread_id = ?")
+            parameters.append(thread_id)
+        if thread_action is not None:
+            fields.append("thread_action = ?")
+            parameters.append(thread_action)
+        if usage is not None:
+            fields.extend(
+                [
+                    "input_tokens = ?",
+                    "cached_input_tokens = ?",
+                    "uncached_input_tokens = ?",
+                    "output_tokens = ?",
+                    "first_input_tokens = ?",
+                    "first_cached_input_tokens = ?",
+                    "first_uncached_input_tokens = ?",
+                    "context_tokens = ?",
+                    "model_context_window = ?",
+                    "cache_write_input_tokens = ?",
+                    "reasoning_output_tokens = ?",
+                    "usage_source = ?",
+                    "telemetry_complete = ?",
+                    "usage_missing_fields = ?",
+                ]
+            )
+            parameters.extend(
+                [
+                    usage.get("input_tokens") or 0,
+                    usage.get("cached_input_tokens") or 0,
+                    usage.get("uncached_input_tokens") or 0,
+                    usage.get("output_tokens") or 0,
+                    usage.get("first_input_tokens") or 0,
+                    usage.get("first_cached_input_tokens") or 0,
+                    usage.get("first_uncached_input_tokens") or 0,
+                    usage.get("context_tokens") or 0,
+                    usage.get("model_context_window"),
+                    usage.get("cache_write_input_tokens") or 0,
+                    usage.get("reasoning_output_tokens") or 0,
+                    usage_source,
+                    1 if telemetry_complete else 0,
+                    usage_missing_fields
+                    or _usage_missing_fields_json(usage),
+                ]
+            )
+        parameters.append(job_id)
+        updated = connection.execute(
+            f"""
+            UPDATE cluster_jobs
+            SET {", ".join(fields)}
+            WHERE job_id = ? AND status IN ('starting', 'running')
+            """,
+            parameters,
+        )
+        return updated.rowcount == 1
+
     def _finish_job(
         self,
         job: dict[str, Any],
@@ -4390,58 +4525,41 @@ Do not return raw logs or a full transcript.
                 error = "worker exited without submitting or blocking its task"
             elif task["status"] == "blocked" and process_error:
                 error = process_error
+            elif not process_ok:
+                error = process_error or "worker process failed"
+            settled = False
             with self.team.connection() as connection:
-                connection.execute(
-                    """
-                    UPDATE cluster_jobs
-                    SET status = ?, thread_id = ?, finished_at = ?, exit_code = ?, error = ?,
-                        input_tokens = ?, cached_input_tokens = ?,
-                        uncached_input_tokens = ?, output_tokens = ?,
-                        first_input_tokens = ?, first_cached_input_tokens = ?,
-                        first_uncached_input_tokens = ?, context_tokens = ?,
-                        model_context_window = ?, cache_write_input_tokens = ?,
-                        reasoning_output_tokens = ?, usage_source = ?,
-                        telemetry_complete = ?, usage_missing_fields = ?
-                    WHERE job_id = ?
-                    """,
-                    (
-                        status,
-                        thread_id,
-                        utc_now(),
-                        exit_code,
-                        error,
-                        usage.get("input_tokens") or 0,
-                        usage.get("cached_input_tokens") or 0,
-                        usage.get("uncached_input_tokens") or 0,
-                        usage.get("output_tokens") or 0,
-                        usage.get("first_input_tokens") or 0,
-                        usage.get("first_cached_input_tokens") or 0,
-                        usage.get("first_uncached_input_tokens") or 0,
-                        usage.get("context_tokens") or 0,
-                        usage.get("model_context_window"),
-                        usage.get("cache_write_input_tokens") or 0,
-                        usage.get("reasoning_output_tokens") or 0,
-                        usage_source,
-                        int(telemetry_complete),
-                        usage_missing_fields,
-                        job["job_id"],
-                    ),
-                )
-                self._event(
+                settled = self._settle_job_row(
                     connection,
-                    job["goal_id"],
-                    "worker_finished",
-                    "teamd",
-                    {
-                        "job_id": job["job_id"],
-                        "task_id": job["task_id"],
-                        "status": status,
-                        "exit_code": exit_code,
-                        "thread_id": thread_id,
-                        "error": error or process_error,
-                    },
+                    job["job_id"],
+                    status=status,
+                    error=error,
+                    exit_code=exit_code,
+                    thread_id=thread_id,
+                    usage=usage,
+                    usage_source=usage_source,
+                    telemetry_complete=telemetry_complete,
+                    usage_missing_fields=usage_missing_fields,
                 )
+                if settled:
+                    self._event(
+                        connection,
+                        job["goal_id"],
+                        "worker_finished",
+                        "teamd",
+                        {
+                            "job_id": job["job_id"],
+                            "task_id": job["task_id"],
+                            "status": status,
+                            "outcome": status,
+                            "exit_code": exit_code,
+                            "thread_id": thread_id,
+                            "error": error or process_error,
+                        },
+                    )
             self.processes.pop(job["job_id"], None)
+            if not settled:
+                return
             if app_server_runtime:
                 self._finalize_app_agent(
                     job,
@@ -4458,103 +4576,84 @@ Do not return raw logs or a full transcript.
         error = "" if process_ok else process_error or (
             f"lead process exited with code {exit_code}" if exit_code is not None else "lead process lost"
         )
+        settled = False
         with self.team.connection() as connection:
-            connection.execute(
-                """
-                UPDATE cluster_jobs
-                SET status = ?, thread_id = ?, finished_at = ?, exit_code = ?, error = ?,
-                    input_tokens = ?, cached_input_tokens = ?,
-                    uncached_input_tokens = ?, output_tokens = ?,
-                    first_input_tokens = ?, first_cached_input_tokens = ?,
-                    first_uncached_input_tokens = ?, context_tokens = ?,
-                    model_context_window = ?, cache_write_input_tokens = ?,
-                    reasoning_output_tokens = ?, usage_source = ?,
-                    telemetry_complete = ?, usage_missing_fields = ?
-                WHERE job_id = ?
-                """,
-                (
-                    status,
-                    thread_id,
-                    utc_now(),
-                    exit_code,
-                    error,
-                    usage.get("input_tokens") or 0,
-                    usage.get("cached_input_tokens") or 0,
-                    usage.get("uncached_input_tokens") or 0,
-                    usage.get("output_tokens") or 0,
-                    usage.get("first_input_tokens") or 0,
-                    usage.get("first_cached_input_tokens") or 0,
-                    usage.get("first_uncached_input_tokens") or 0,
-                    usage.get("context_tokens") or 0,
-                    usage.get("model_context_window"),
-                    usage.get("cache_write_input_tokens") or 0,
-                    usage.get("reasoning_output_tokens") or 0,
-                    usage_source,
-                    int(telemetry_complete),
-                    usage_missing_fields,
-                    job["job_id"],
-                ),
+            settled = self._settle_job_row(
+                connection,
+                job["job_id"],
+                status=status,
+                error=error,
+                exit_code=exit_code,
+                thread_id=thread_id,
+                usage=usage,
+                usage_source=usage_source,
+                telemetry_complete=telemetry_complete,
+                usage_missing_fields=usage_missing_fields,
             )
-            if process_ok:
-                connection.execute(
-                    """
-                    UPDATE cluster_goals
-                    SET lead_thread_id = COALESCE(?, lead_thread_id),
-                        lead_ticks = lead_ticks + 1,
-                        lead_failures = 0,
-                        last_error = '',
-                        updated_at = ?
-                    WHERE goal_id = ?
-                    """,
-                    (thread_id, utc_now(), job["goal_id"]),
-                )
-            else:
-                failures = int(job.get("lead_failures") or 0) + 1
-                reset_thread = context_overflow or failures >= 2
-                connection.execute(
-                    """
-                    UPDATE cluster_goals
-                    SET lead_thread_id = CASE
-                            WHEN ? THEN NULL
-                            ELSE COALESCE(lead_thread_id, ?)
-                        END,
-                        lead_generation = lead_generation + CASE WHEN ? THEN 1 ELSE 0 END,
-                        lead_failures = ?, last_error = ?, updated_at = ?
-                    WHERE goal_id = ?
-                    """,
-                    (
-                        int(reset_thread),
-                        thread_id,
-                        int(reset_thread),
-                        failures,
-                        error,
-                        utc_now(),
-                        job["goal_id"],
-                    ),
-                )
-                if failures >= int(job.get("max_lead_attempts") or 5):
+            if settled:
+                if process_ok:
                     connection.execute(
                         """
                         UPDATE cluster_goals
-                        SET status = 'failed', completed_at = ?, updated_at = ?
+                        SET lead_thread_id = COALESCE(?, lead_thread_id),
+                            lead_ticks = lead_ticks + 1,
+                            lead_failures = 0,
+                            last_error = '',
+                            updated_at = ?
                         WHERE goal_id = ?
                         """,
-                        (utc_now(), utc_now(), job["goal_id"]),
+                        (thread_id, utc_now(), job["goal_id"]),
                     )
-            self._event(
-                connection,
-                job["goal_id"],
-                "lead_finished",
-                "teamd",
-                {
-                    "job_id": job["job_id"],
-                    "status": status,
-                    "exit_code": exit_code,
-                    "thread_id": thread_id,
-                    "error": error,
-                },
-            )
+                else:
+                    failures = int(job.get("lead_failures") or 0) + 1
+                    reset_thread = context_overflow or failures >= 2
+                    connection.execute(
+                        """
+                        UPDATE cluster_goals
+                        SET lead_thread_id = CASE
+                                WHEN ? THEN NULL
+                                ELSE COALESCE(lead_thread_id, ?)
+                            END,
+                            lead_generation = lead_generation + CASE WHEN ? THEN 1 ELSE 0 END,
+                            lead_failures = ?, last_error = ?, updated_at = ?
+                        WHERE goal_id = ?
+                        """,
+                        (
+                            int(reset_thread),
+                            thread_id,
+                            int(reset_thread),
+                            failures,
+                            error,
+                            utc_now(),
+                            job["goal_id"],
+                        ),
+                    )
+                    if failures >= int(job.get("max_lead_attempts") or 5):
+                        connection.execute(
+                            """
+                            UPDATE cluster_goals
+                            SET status = 'failed', completed_at = ?, updated_at = ?
+                            WHERE goal_id = ?
+                            """,
+                            (utc_now(), utc_now(), job["goal_id"]),
+                        )
+                self._event(
+                    connection,
+                    job["goal_id"],
+                    "lead_finished",
+                    "teamd",
+                    {
+                        "job_id": job["job_id"],
+                        "status": status,
+                        "outcome": status,
+                        "exit_code": exit_code,
+                        "thread_id": thread_id,
+                        "error": error,
+                    },
+                )
         self.processes.pop(job["job_id"], None)
+        if not settled:
+            return
         if app_server_runtime:
             self._finalize_app_agent(
                 job,
@@ -4616,36 +4715,32 @@ Do not return raw logs or a full transcript.
         actual_actor: str,
         reason: str,
     ) -> None:
-        now = utc_now()
         error = (
             "worker claim conflict: "
             f"expected {expected_actor}, found {actual_actor or '(none)'}"
         )
         with self.team.connection() as connection:
-            connection.execute(
-                """
-                UPDATE cluster_jobs
-                SET status = 'lost', finished_at = COALESCE(finished_at, ?),
-                    error = ?
-                WHERE job_id = ?
-                  AND status NOT IN ('completed', 'interrupted')
-                """,
-                (now, error, job["job_id"]),
-            )
-            self._event(
+            if self._settle_job_row(
                 connection,
-                str(job["goal_id"]),
-                "worker_claim_conflict",
-                "teamd",
-                {
-                    "job_id": job["job_id"],
-                    "task_id": job["task_id"],
-                    "expected_actor": expected_actor,
-                    "actual_actor": actual_actor,
-                    "reason": reason,
-                    "error": error,
-                },
-            )
+                str(job["job_id"]),
+                status="lost",
+                error=error,
+                exit_code=None,
+            ):
+                self._event(
+                    connection,
+                    str(job["goal_id"]),
+                    "worker_claim_conflict",
+                    "teamd",
+                    {
+                        "job_id": job["job_id"],
+                        "task_id": job["task_id"],
+                        "expected_actor": expected_actor,
+                        "actual_actor": actual_actor,
+                        "reason": reason,
+                        "error": error,
+                    },
+                )
 
     def _recover_task(
         self,

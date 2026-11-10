@@ -177,25 +177,36 @@ Merge commit:
 
 ### Phase 2：Assignment、外部副作用 Saga 和统一 Settlement
 
-状态：未开始
+状态：实现与自动化验收完成，等待 Lead diff Review 和合并
 
 目标：把一次执行收敛成可追踪的 attempt。
 
-- [ ] 设计 `assignments`/`attempts` 聚合。
-- [ ] 建立 durable intent/outbox。
-- [ ] worktree create 使用 intent + recover。
-- [ ] App Server thread/start、turn/start 使用 attempt 关联。
-- [ ] exec 启动使用同一 attempt 关联。
-- [ ] 建立统一 `settle_attempt()`。
-- [ ] 成功、失败、超时、取消、lost、context overflow 全部走 settlement。
-- [ ] failed/interrupted job usage 写入 attempt 和 latest-job 投影。
-- [ ] Agent 累计 usage 改为 attempt/job usage 的派生结果。
+- [x] 将 `cluster_jobs` 扩展为统一 attempt ledger，而不是新增第二套 job 状态。
+- [x] 建立 `external_operations` durable intent/outbox 基础表。
+- [x] worktree create 使用 intent + recover。
+- [x] App Server thread/start、turn/start 使用 attempt 关联。
+- [x] exec 启动使用同一 attempt 关联。
+- [x] 建立统一 `_settle_job_row()`。
+- [x] 成功、失败、超时、取消、lost、context overflow 全部走 settlement。
+- [x] failed/interrupted/lost job usage 写入 attempt 和 latest-job 投影。
+- [x] App Server baseline 改读已完成 attempt ledger；Dashboard 增加 ledger totals。
 
 验收：
 
 - 每个活动 attempt 都有 task/job/runtime/thread/generation/correlation。
 - 任意外部步骤失败后可在下一 tick 解释和恢复。
 - 不再出现 failed Agent 0 用量但对应 job 有真实 token。
+
+本轮验证：
+
+```text
+151 tests OK, 1 skipped
+dashboard-ui-smoke: ok
+compileall ok
+schema 18
+Core schema hash:
+86e78eef5f5f631094f5218d763c83997f5ab52d1ba22877f93092720f93fca6
+```
 
 ---
 

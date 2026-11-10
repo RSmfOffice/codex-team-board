@@ -118,7 +118,7 @@ class MigrationTests(unittest.TestCase):
             finally:
                 upgraded.close()
 
-    def test_schema_17_keeps_usage_presence_and_archive_migrations_idempotent(self) -> None:
+    def test_current_schema_keeps_usage_presence_and_archive_migrations_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "usage-v14.sqlite"
             connection = sqlite3.connect(path)
@@ -159,14 +159,18 @@ class MigrationTests(unittest.TestCase):
             try:
                 old = upgraded.execute(
                     """
-                    SELECT usage_missing_fields
+                    SELECT usage_missing_fields, correlation_id, outcome,
+                           settled_at
                     FROM cluster_jobs WHERE job_id = 'J-OLD'
                     """
                 ).fetchone()
                 self.assertEqual(old["usage_missing_fields"], "[]")
+                self.assertEqual(old["correlation_id"], "J-OLD")
+                self.assertEqual(old["outcome"], "completed")
+                self.assertEqual(old["settled_at"], "2026-11-08T00:00:00Z")
                 self.assertEqual(
                     upgraded.execute("PRAGMA user_version").fetchone()[0],
-                    17,
+                    SCHEMA_VERSION,
                 )
             finally:
                 upgraded.close()
@@ -182,7 +186,7 @@ class MigrationTests(unittest.TestCase):
                         """
                     ).fetchall()
                 ]
-                self.assertEqual(versions, [14, 17])
+                self.assertEqual(versions, [14, SCHEMA_VERSION])
                 columns = {
                     row["name"]
                     for row in reopened.execute(
@@ -190,6 +194,23 @@ class MigrationTests(unittest.TestCase):
                     ).fetchall()
                 }
                 self.assertIn("usage_missing_fields", columns)
+                self.assertTrue(
+                    {
+                        "correlation_id",
+                        "prompt_hash",
+                        "cache_profile",
+                        "thread_action",
+                        "outcome",
+                        "settled_at",
+                    }.issubset(columns)
+                )
+                operation_table = reopened.execute(
+                    """
+                    SELECT name FROM sqlite_master
+                    WHERE type = 'table' AND name = 'external_operations'
+                    """
+                ).fetchone()
+                self.assertIsNotNone(operation_table)
                 goal_columns = {
                     row["name"]
                     for row in reopened.execute(

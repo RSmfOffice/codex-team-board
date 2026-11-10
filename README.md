@@ -231,6 +231,9 @@ prompt。这样不依赖当前版本尚未生效的 `multi_agent_v2`。
 
 在此之前主 checkout 必须干净并位于命名分支。`team init` 生成的 `AGENTS.md`
 和 `.codex` 文件应先由用户提交，保证每个 worktree 都包含团队规范。
+worktree 创建会先写入 `external_operations` durable intent，再执行 Git 操作并
+回写 task。`teamd` 每个 tick 会恢复已存在但未完成数据库落板的 worktree；若
+Git 结果缺失、branch/target 不匹配或仓库已不可用，intent 会标记 failed 供审计。
 
 Worker 认领：
 
@@ -645,6 +648,12 @@ thread 既有 baseline 的差值；只有 `total` 没有 token 证据时才回�
 `usage_missing_fields` 保存字段级缺失信息，Dashboard 将未知字段展示为 null，
 不会把缺失 cached/output 伪造成 0。成功但 baseline 不完整的 thread 会被
 标记为 `failed/needs_reset`，不会进入复用池污染下一 job 的累计差值。
+
+`cluster_jobs` 是统一的 attempt ledger，记录 `correlation_id`、prompt hash、
+cache profile、`thread_action`、outcome 和 settled time。所有 job 终态走同一
+settlement helper；completed、failed、interrupted、lost 都会写入 outcome 和
+settled_at。Dashboard 的 Agent 卡片通过 latest-job 和 attempt ledger 投影失败或
+中断任务的真实 usage，不再依赖成功 release 后的累计字段。
 
 `workstream_key` 是项目内连续性作用域；省略时默认使用当前 `goal_id`。默认复用
 策略为：

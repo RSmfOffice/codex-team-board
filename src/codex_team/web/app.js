@@ -83,6 +83,7 @@ function nonNegativeNumber(value, fallback = 0) {
 }
 
 function tokenText(value) {
+  if (value === null || value === undefined || value === "") return "—";
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed >= 0
     ? Math.floor(parsed).toLocaleString("zh-CN")
@@ -90,22 +91,34 @@ function tokenText(value) {
 }
 
 function cacheRate(value, cachedValue, uncachedValue) {
-  const explicit = Number(value);
-  if (Number.isFinite(explicit) && explicit >= 0) {
-    return Math.min(1, explicit);
+  if (value !== null && value !== undefined && value !== "") {
+    const explicit = Number(value);
+    if (Number.isFinite(explicit) && explicit >= 0) {
+      return Math.min(1, explicit);
+    }
   }
   const cached = Number(cachedValue);
   const uncached = Number(uncachedValue);
-  const cachedCount = Number.isFinite(cached) && cached >= 0 ? cached : 0;
-  const uncachedCount = Number.isFinite(uncached) && uncached >= 0 ? uncached : 0;
+  const cachedCount = cachedValue !== null
+    && cachedValue !== undefined
+    && Number.isFinite(cached)
+    && cached >= 0
+    ? cached
+    : null;
+  const uncachedCount = uncachedValue !== null
+    && uncachedValue !== undefined
+    && Number.isFinite(uncached)
+    && uncached >= 0
+    ? uncached
+    : null;
+  if (cachedCount === null || uncachedCount === null) return null;
   const total = cachedCount + uncachedCount;
-  return total > 0 ? cachedCount / total : 0;
+  return total > 0 ? cachedCount / total : null;
 }
 
 function cacheRateText(value, cachedValue, uncachedValue) {
-  return `${Math.round(
-    cacheRate(value, cachedValue, uncachedValue) * 100,
-  )}%`;
+  const rate = cacheRate(value, cachedValue, uncachedValue);
+  return rate === null ? "—" : `${Math.round(rate * 100)}%`;
 }
 
 function jobRuntimeHtml(job) {
@@ -801,14 +814,21 @@ function renderAgentThreads(agents, events = []) {
     const model = [agent.model, agent.model_provider]
       .filter((value) => value !== undefined && value !== null && value !== "")
       .join(" · ") || "模型未知";
-    const cached = agent.total_cached_input_tokens
-      ?? agent.last_cached_input_tokens
-      ?? 0;
-    const uncached = agent.total_uncached_input_tokens
-      ?? agent.last_uncached_input_tokens
-      ?? 0;
-    const contextTokens = agent.context_tokens ?? 0;
-    const windowTokens = agent.model_context_window;
+    const useLatestJobUsage = agent.cache_usage_source === "latest_job";
+    const cached = useLatestJobUsage
+      ? agent.latest_job_cached_input_tokens
+      : agent.last_cached_input_tokens
+        ?? agent.total_cached_input_tokens;
+    const uncached = useLatestJobUsage
+      ? agent.latest_job_uncached_input_tokens
+      : agent.last_uncached_input_tokens
+        ?? agent.total_uncached_input_tokens;
+    const contextTokens = useLatestJobUsage
+      ? agent.latest_job_context_tokens
+      : agent.context_tokens;
+    const windowTokens = useLatestJobUsage
+      ? agent.latest_job_model_context_window
+      : agent.model_context_window;
     const context = windowTokens !== undefined
       && windowTokens !== null
       && Number(windowTokens) > 0
@@ -821,6 +841,9 @@ function renderAgentThreads(agents, events = []) {
       ? `${agent.current_goal_id}${agent.current_goal_objective ? ` · ${agent.current_goal_objective}` : ""}`
       : "未绑定目标";
     const latestEvent = latestEventByAgent.get(agent.agent_id);
+    const latestJob = agent.latest_job_id
+      ? `${agent.latest_job_id} · ${agent.latest_job_status || "unknown"}${agent.latest_job_thread_action ? ` · ${agent.latest_job_thread_action}` : ""}`
+      : "无 job";
     const resetState = agent.reset_requested_at
       ? `重置已请求 ${timeText(agent.reset_requested_at)}${agent.reset_reason ? ` · ${agent.reset_reason}` : ""}`
       : latestEvent
@@ -850,7 +873,8 @@ function renderAgentThreads(agents, events = []) {
           <span>${escapeHtml(model)}</span>
           <span>turn ${escapeHtml(agent.turn_count ?? 0)}</span>
           <span>last ${escapeHtml(timeText(agent.last_used_at))}</span>
-          <span>last cache/uncached ${escapeHtml(tokenText(agent.last_cached_input_tokens))} / ${escapeHtml(tokenText(agent.last_uncached_input_tokens))}</span>
+          <span>latest job ${escapeHtml(latestJob)}</span>
+          <span>last cache/uncached ${escapeHtml(tokenText(cached))} / ${escapeHtml(tokenText(uncached))}</span>
         </div>
         <div class="agent-thread-task">
           <div>任务：${escapeHtml(taskLabel)}</div>
