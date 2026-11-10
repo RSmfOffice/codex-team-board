@@ -49,6 +49,8 @@
   failed Thread 继续保留，并增加明确的 failed 视觉状态。
 - Native Agent 同步会读取 session 的 `token_usage_record` 与 `token_count`，
   持久化最近/累计 input、cached、uncached、context、model window 和 turn 数。
+- 新增 `agent archive-stale`，可 dry-run/apply 归档 failed、superseded 与
+  历史 cache profile 的 managed Thread；默认诊断不再显示，审计和 session 保留。
 
 ### Changed
 

@@ -565,6 +565,25 @@ Merge commit:
 
 ---
 
+### Phase 4D-3：不可复用 Agent Thread 清理
+
+状态：实现完成，待 Lead Review、合并和正式库归档
+
+- [x] 识别 failed、superseded 和历史 cache profile 的 managed Thread。
+- [x] 保留 Native、current reusable、busy/starting 和活动引用记录。
+- [x] 默认 dry-run，只有显式 `--apply` 才写入 `archived_at`。
+- [x] 软归档后默认诊断隐藏，include-archived 可查。
+- [x] Agent events、cluster jobs 和 Codex session 文件不删除。
+- [x] 重复执行幂等，并记录 `archived_stale` 审计事件。
+
+验收：
+
+- dry-run 不产生数据库写入。
+- apply 后目标归档，Native 与 current Thread 保持可见。
+- 归档项目、busy/starting 和活动引用记录跳过。
+
+---
+
 ### Phase 5：安装、进程与历史清理
 
 状态：未开始

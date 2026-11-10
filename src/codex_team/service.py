@@ -439,6 +439,22 @@ class TeamService:
         except AgentPoolError as exc:
             raise TeamError(str(exc)) from exc
 
+    def archive_stale_agents(
+        self,
+        *,
+        actor: str = "human",
+        reason: str = "archive failed and non-reusable managed agents",
+        apply: bool = False,
+    ) -> dict[str, Any]:
+        try:
+            return self.agent_pool.archive_stale_managed_agents(
+                actor=actor,
+                reason=reason,
+                apply=apply,
+            )
+        except AgentPoolError as exc:
+            raise TeamError(str(exc)) from exc
+
     def list_projects(self, *, include_archived: bool = False) -> list[dict[str, Any]]:
         with self.connection(write=False) as connection:
             where = "" if include_archived else "WHERE archived_at IS NULL"

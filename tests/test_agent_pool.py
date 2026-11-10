@@ -15,6 +15,7 @@ from codex_team.agent_pool import (
     AgentPool,
     AgentPoolError,
 )
+from codex_team.cache_contract import agent_cache_profile
 from codex_team.db import SCHEMA_VERSION, connect, utc_now
 
 
@@ -850,6 +851,145 @@ class AgentPoolTests(unittest.TestCase):
                 "native-reviewer",
                 task_id="T2",
             )
+
+    def test_archive_stale_managed_agents_is_dry_run_by_default(self) -> None:
+        current_profile = agent_cache_profile(
+            "current role instructions",
+            policy_path=None,
+            sandbox_mode="danger-full-access",
+            surface="core",
+            access_mode="full",
+            mcp_instructions="current instructions",
+        )
+        current = self.register(
+            thread_id="thread-current",
+            profile=current_profile,
+        )
+        historical = self.register(
+            thread_id="thread-historical",
+            profile="legacy",
+        )
+        failed = self.register(
+            thread_id="thread-failed",
+            profile=current_profile,
+        )
+        superseded = self.register(
+            thread_id="thread-superseded",
+            profile=current_profile,
+        )
+        busy = self.register(
+            thread_id="thread-busy-historical",
+            profile="legacy",
+        )
+        archived_project = self.register(
+            project_id="P2",
+            thread_id="thread-archived-project",
+            profile="legacy",
+        )
+        native = self.pool.register_native_thread(
+            "P1",
+            "team_explorer",
+            "native",
+            "thread-native",
+            "native-actor",
+        )
+        with closing(connect(self.db_path)) as connection:
+            connection.execute(
+                "UPDATE cluster_agents SET status='failed' WHERE agent_id=?",
+                (failed["agent_id"],),
+            )
+            connection.execute(
+                "UPDATE cluster_agents SET status='superseded' WHERE agent_id=?",
+                (superseded["agent_id"],),
+            )
+            connection.execute(
+                "UPDATE cluster_agents SET status='busy' WHERE agent_id=?",
+                (busy["agent_id"],),
+            )
+            connection.execute(
+                "UPDATE projects SET archived_at=? WHERE project_id='P2'",
+                (utc_now(),),
+            )
+            connection.commit()
+
+        dry_run = self.pool.archive_stale_managed_agents()
+        self.assertFalse(dry_run["apply"])
+        self.assertEqual(dry_run["archived_count"], 0)
+        self.assertEqual(
+            {item["agent_id"] for item in dry_run["candidates"]},
+            {
+                historical["agent_id"],
+                failed["agent_id"],
+                superseded["agent_id"],
+            },
+        )
+        self.assertEqual(
+            {
+                item["agent_id"]: item["reason"]
+                for item in dry_run["skipped"]
+            }[busy["agent_id"]],
+            "active_status:busy",
+        )
+        with closing(connect(self.db_path)) as connection:
+            archived_before = connection.execute(
+                """
+                SELECT COUNT(*) FROM cluster_agents
+                WHERE agent_id IN (?, ?, ?) AND archived_at IS NOT NULL
+                """,
+                (
+                    historical["agent_id"],
+                    failed["agent_id"],
+                    superseded["agent_id"],
+                ),
+            ).fetchone()[0]
+        self.assertEqual(archived_before, 0)
+
+        applied = self.pool.archive_stale_managed_agents(apply=True)
+        self.assertEqual(applied["archived_count"], 3)
+        self.assertEqual(
+            set(applied["archived"]),
+            {
+                historical["agent_id"],
+                failed["agent_id"],
+                superseded["agent_id"],
+            },
+        )
+        with closing(connect(self.db_path)) as connection:
+            rows = {
+                row["agent_id"]: dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT agent_id, archived_at FROM cluster_agents
+                    WHERE agent_id IN (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        current["agent_id"],
+                        historical["agent_id"],
+                        failed["agent_id"],
+                        superseded["agent_id"],
+                        busy["agent_id"],
+                        archived_project["agent_id"],
+                        native["agent_id"],
+                    ),
+                ).fetchall()
+            }
+        self.assertIsNone(rows[current["agent_id"]]["archived_at"])
+        self.assertIsNotNone(rows[historical["agent_id"]]["archived_at"])
+        self.assertIsNotNone(rows[failed["agent_id"]]["archived_at"])
+        self.assertIsNotNone(rows[superseded["agent_id"]]["archived_at"])
+        self.assertIsNone(rows[busy["agent_id"]]["archived_at"])
+        self.assertIsNone(rows[archived_project["agent_id"]]["archived_at"])
+        self.assertIsNone(rows[native["agent_id"]]["archived_at"])
+        self.assertEqual(
+            self.agent_events(failed["agent_id"])[-1]["event_type"],
+            "archived_stale",
+        )
+        self.assertEqual(
+            self.pool.archive_stale_managed_agents(apply=True)[
+                "archived_count"
+            ],
+            0,
+        )
 
 
 if __name__ == "__main__":
