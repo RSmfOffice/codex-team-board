@@ -277,6 +277,191 @@ class TeamFlowTests(unittest.TestCase):
                 goal_id=archived["goal_id"],
             )
 
+    def test_workflow_epoch_tracks_policy_role_and_environment(self) -> None:
+        initial = self.team.current_workflow_epoch(self.repo)
+        task = self.team.create_task(
+            self.repo,
+            title="Epoch-bound task",
+            description="Bind to the current model-visible contract.",
+            acceptance="The stored epoch matches the current cohort.",
+            kind="read",
+            owner_role="team_explorer",
+        )
+        self.assertEqual(task["workflow_epoch"], initial)
+
+        agents_path = self.repo / "AGENTS.md"
+        agents_path.write_text(
+            agents_path.read_text(encoding="utf-8") + "\n<!-- epoch v2 -->\n",
+            encoding="utf-8",
+        )
+        policy_changed = self.team.current_workflow_epoch(self.repo)
+        self.assertNotEqual(policy_changed, initial)
+
+        role_path = self.repo / ".codex" / "team-roles" / "team-worker.md"
+        role_path.write_text(
+            role_path.read_text(encoding="utf-8") + "\nRole epoch v2.\n",
+            encoding="utf-8",
+        )
+        role_changed = self.team.current_workflow_epoch(self.repo)
+        self.assertNotEqual(role_changed, policy_changed)
+
+        with patch.dict(
+            os.environ,
+            {"CODEX_TEAM_MODEL": "model-epoch-v2"},
+            clear=False,
+        ):
+            model_changed = self.team.current_workflow_epoch(self.repo)
+        self.assertNotEqual(model_changed, role_changed)
+
+    def test_old_workflow_epoch_tasks_and_goals_fail_closed(self) -> None:
+        manager = ClusterManager(
+            self.settings,
+            team=self.team,
+            worktrees=self.worktrees,
+            runtime_mode="exec",
+            agent_command=["codex"],
+        )
+        goal = manager.create_goal(
+            self.repo,
+            objective="Reject an old workflow cohort",
+            autonomy="auto",
+        )
+        task = self.team.create_task(
+            self.repo,
+            title="Old cohort task",
+            description="Must not dispatch after an epoch change.",
+            acceptance="The task is blocked before claim.",
+            kind="read",
+            owner_role="team_explorer",
+            goal_id=goal["goal_id"],
+        )
+        with self.team.connection() as connection:
+            connection.execute(
+                "UPDATE cluster_goals SET workflow_epoch = 'legacy-unbound' WHERE goal_id = ?",
+                (goal["goal_id"],),
+            )
+            connection.execute(
+                "UPDATE tasks SET workflow_epoch = 'legacy-unbound' WHERE task_id = ?",
+                (task["task_id"],),
+            )
+
+        with self.assertRaisesRegex(TeamError, "workflow epoch"):
+            manager.ensure_goal(
+                self.repo,
+                objective="Do not reuse an old cohort",
+            )
+        manager.tick()
+        current_task = self.team.get_task(task["task_id"])
+        current_goal = manager.get_goal(goal["goal_id"])
+        self.assertEqual(current_task["status"], "blocked")
+        self.assertIn("workflow epoch", current_task["blocker"])
+        self.assertEqual(current_goal["status"], "paused")
+        self.assertIn(
+            "workflow_epoch_mismatch",
+            [event["event_type"] for event in current_goal["events"]],
+        )
+        with self.assertRaisesRegex(TeamError, "workflow epoch"):
+            manager.set_goal_status(
+                goal["goal_id"],
+                "active",
+                reason="must migrate first",
+            )
+        with self.assertRaisesRegex(TeamError, "workflow epoch"):
+            self.team.create_task(
+                self.repo,
+                title="Cannot join old goal",
+                description="Old goals cannot accept current tasks.",
+                acceptance="Creation is rejected.",
+                kind="read",
+                owner_role="team_explorer",
+                goal_id=goal["goal_id"],
+            )
+
+    def test_explicit_goal_workflow_epoch_migration(self) -> None:
+        manager = ClusterManager(
+            self.settings,
+            team=self.team,
+            worktrees=self.worktrees,
+            runtime_mode="exec",
+            agent_command=["codex"],
+        )
+        goal = manager.create_goal(
+            self.repo,
+            objective="Migrate an explicit workflow cohort",
+            autonomy="auto",
+        )
+        task = self.team.create_task(
+            self.repo,
+            title="Migrate me explicitly",
+            description="Only explicit migration may change the epoch.",
+            acceptance="Goal and ready task move together.",
+            kind="read",
+            owner_role="team_explorer",
+            goal_id=goal["goal_id"],
+        )
+        with self.team.connection() as connection:
+            connection.execute(
+                "UPDATE cluster_goals SET workflow_epoch = 'legacy-unbound' WHERE goal_id = ?",
+                (goal["goal_id"],),
+            )
+            connection.execute(
+                "UPDATE tasks SET workflow_epoch = 'legacy-unbound' WHERE task_id = ?",
+                (task["task_id"],),
+            )
+
+        with self.assertRaisesRegex(TeamError, "durable checkpoint"):
+            manager.migrate_goal_workflow_epoch(
+                goal["goal_id"],
+                actor="human",
+                reason="missing checkpoint",
+            )
+        manager.set_goal_checkpoint(
+            goal["goal_id"],
+            summary="Reviewed current prefix and task intent.",
+            actor="human",
+        )
+        migrated = manager.migrate_goal_workflow_epoch(
+            goal["goal_id"],
+            actor="human",
+            reason="accept current stable prefix",
+        )
+        current = self.team.current_workflow_epoch(self.repo)
+        self.assertEqual(migrated["workflow_epoch"], current)
+        self.assertEqual(migrated["goal"]["workflow_epoch"], current)
+        self.assertEqual(
+            self.team.get_task(task["task_id"])["workflow_epoch"],
+            current,
+        )
+        event_types = [
+            event["event_type"]
+            for event in manager.get_goal(goal["goal_id"])["events"]
+        ]
+        self.assertIn("workflow_epoch_migrated", event_types)
+        with self.team.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO cluster_jobs(
+                    job_id, goal_id, task_id, workflow_epoch, kind, role,
+                    actor, status, attempt, log_path, output_path, started_at
+                ) VALUES (
+                    'J-MIGRATION-ACTIVE', ?, ?, ?, 'worker', 'team_explorer',
+                    'migration-test', 'running', 1, 'active.log', 'active.out', ?
+                )
+                """,
+                (
+                    goal["goal_id"],
+                    task["task_id"],
+                    current,
+                    utc_now(),
+                ),
+            )
+        with self.assertRaisesRegex(TeamError, "active jobs"):
+            manager.migrate_goal_workflow_epoch(
+                goal["goal_id"],
+                actor="human",
+                reason="must wait for active jobs",
+            )
+
     def test_write_task_requires_worktree_and_full_review_flow(self) -> None:
         task = self.team.create_task(
             self.repo,

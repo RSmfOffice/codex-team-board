@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import secrets
 import sqlite3
@@ -12,7 +13,11 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping
 
 from .agent_pool import AgentPool, AgentPoolError
-from .cache_contract import cache_profile_contract_status
+from .cache_contract import (
+    cache_profile_contract_status,
+    file_hash,
+    workflow_epoch as build_workflow_epoch,
+)
 from .config import Settings
 from .db import connect, connect_readonly, utc_now
 from .scheduling import (
@@ -55,6 +60,10 @@ class TeamService:
         with self.connection():
             pass
         self.agent_pool = agent_pool or AgentPool(settings)
+        self._workflow_epoch_cache: dict[
+            str,
+            tuple[tuple[Any, ...], str],
+        ] = {}
 
     @contextmanager
     def connection(self, *, write: bool = True) -> Iterator[sqlite3.Connection]:
@@ -649,6 +658,31 @@ class TeamService:
 
     def role_prompt(self, role: str, repo: str | Path | None = None) -> dict[str, Any]:
         normalized = role.strip()
+        project_root = self._root(repo) if repo else None
+        return self._role_prompt_from_root(normalized, project_root)
+
+    def _role_prompt_from_root(
+        self,
+        role: str,
+        project_root: Path | None,
+    ) -> dict[str, Any]:
+        normalized, path, source = self._role_prompt_path(
+            role,
+            project_root,
+        )
+        return {
+            "role": normalized,
+            "prompt": path.read_text(encoding="utf-8"),
+            "source": str(path),
+            "scope": source,
+        }
+
+    def _role_prompt_path(
+        self,
+        role: str,
+        project_root: Path | None,
+    ) -> tuple[str, Path, str]:
+        normalized = role.strip()
         template_name = self.ROLE_FILES.get(normalized)
         if template_name is None:
             raise TeamError(
@@ -656,20 +690,106 @@ class TeamService:
             )
         path = self.settings.project_root / "templates" / "roles" / template_name
         source = "global"
-        if repo:
-            project_root = self._root(repo)
+        if project_root is not None:
             project_path = project_root / ".codex" / "team-roles" / template_name
             if project_path.is_file():
                 path = project_path
                 source = "project"
         if not path.is_file():
             raise TeamError(f"role prompt template missing: {path}")
-        return {
-            "role": normalized,
-            "prompt": path.read_text(encoding="utf-8"),
-            "source": str(path),
-            "scope": source,
+        return normalized, path, source
+
+    @staticmethod
+    def _path_stamp(path: Path) -> tuple[str, int, int]:
+        try:
+            stat = path.stat()
+            return str(path), stat.st_mtime_ns, stat.st_size
+        except OSError:
+            return str(path), 0, 0
+
+    def current_workflow_epoch(
+        self,
+        repo: str | Path,
+        *,
+        resolved_root: bool = False,
+    ) -> str:
+        root = (
+            Path(repo).expanduser().resolve()
+            if resolved_root
+            else self._root(repo)
+        )
+        role_paths = {
+            role: self._role_prompt_path(role, root)[1]
+            for role in sorted(self.ROLE_FILES)
         }
+        project_agent_dir = root / ".codex" / "agents"
+        global_agent_dir = (
+            self.settings.project_root / "templates" / "agents"
+        )
+        native_role_hashes: dict[str, str] = {}
+        native_paths: list[Path] = []
+        for role, filename in {
+            "lead": None,
+            "team_explorer": "team-explorer.toml",
+            "team_worker": "team-worker.toml",
+            "team_reviewer": "team-reviewer.toml",
+        }.items():
+            if filename is None:
+                native_role_hashes[role] = file_hash(None)
+                continue
+            project_path = project_agent_dir / filename
+            global_path = global_agent_dir / filename
+            selected_path = (
+                project_path if project_path.is_file() else global_path
+            )
+            native_paths.append(selected_path)
+            native_role_hashes[role] = file_hash(selected_path)
+        runtime_mode = (
+            os.environ.get("CODEX_TEAM_AGENT_RUNTIME", "app_server")
+            .strip()
+            .lower()
+            or "app_server"
+        )
+        command_identity = os.environ.get(
+            "CODEX_TEAM_CODEX_COMMAND",
+            "",
+        ).strip()
+        policy_path = root / "AGENTS.md"
+        environment_signature = (
+            runtime_mode,
+            command_identity,
+            os.environ.get("CODEX_TEAM_MODEL", ""),
+            os.environ.get("CODEX_TEAM_MODEL_PROVIDER", ""),
+            os.environ.get("CODEX_TEAM_MCP_SURFACE", "core"),
+            os.environ.get("CODEX_TEAM_MCP_ACCESS", "full"),
+        )
+        signature = (
+            *environment_signature,
+            *(self._path_stamp(path) for path in role_paths.values()),
+            *(self._path_stamp(path) for path in native_paths),
+            self._path_stamp(policy_path),
+        )
+        cache_key = str(root)
+        cached = self._workflow_epoch_cache.get(cache_key)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+        role_prompts = {
+            role: path.read_text(encoding="utf-8")
+            for role, path in role_paths.items()
+        }
+        epoch = build_workflow_epoch(
+            policy_hash=file_hash(root / "AGENTS.md"),
+            role_prompts=role_prompts,
+            native_role_hashes=native_role_hashes,
+            runtime=f"{runtime_mode}:{command_identity}",
+            model=os.environ.get("CODEX_TEAM_MODEL", ""),
+            model_provider=os.environ.get(
+                "CODEX_TEAM_MODEL_PROVIDER",
+                "",
+            ),
+        )
+        self._workflow_epoch_cache[cache_key] = (signature, epoch)
+        return epoch
 
     def list_roles(self) -> list[dict[str, Any]]:
         return [
@@ -712,6 +832,10 @@ class TeamService:
             raise TeamError("continuity_mode must be auto, reuse, or fresh")
         project = self.register_project(repo)
         self._ensure_project_active(project)
+        workflow_epoch_value = self.current_workflow_epoch(
+            project["root_path"],
+            resolved_root=True,
+        )
         dependencies = list(dict.fromkeys(depends_on or []))
         task_id = self._new_task_id()
         now = utc_now()
@@ -720,7 +844,7 @@ class TeamService:
             if goal_id:
                 goal = connection.execute(
                     """
-                    SELECT project_id, status, archived_at
+                    SELECT project_id, status, archived_at, workflow_epoch
                     FROM cluster_goals
                     WHERE goal_id = ?
                     """,
@@ -734,6 +858,11 @@ class TeamService:
                     raise TeamError(
                         f"goal is terminal ({goal['status']}); create or resume an active goal"
                     )
+                if goal["workflow_epoch"] != workflow_epoch_value:
+                    raise TeamError(
+                        "goal workflow epoch is incompatible with current "
+                        "architecture; migrate or archive the goal"
+                    )
             for dependency in dependencies:
                 row = connection.execute(
                     "SELECT project_id FROM tasks WHERE task_id = ?",
@@ -745,8 +874,9 @@ class TeamService:
                 """
                 INSERT INTO tasks(
                     task_id, project_id, goal_id, title, description, acceptance, kind,
-                    status, priority, owner_role, continuity_mode, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?, ?)
+                    status, priority, owner_role, continuity_mode, workflow_epoch,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -759,6 +889,7 @@ class TeamService:
                     priority,
                     owner_role.strip(),
                     continuity_mode,
+                    workflow_epoch_value,
                     now,
                     now,
                 ),
@@ -782,6 +913,7 @@ class TeamService:
                     "depends_on": dependencies,
                     "goal_id": goal_id,
                     "continuity_mode": continuity_mode,
+                    "workflow_epoch": workflow_epoch_value,
                 },
             )
         return self.get_task(task_id)
@@ -1067,6 +1199,7 @@ class TeamService:
                        latest_job.job_id AS latest_job_id,
                        latest_job.status AS latest_job_status,
                        latest_job.thread_action AS latest_job_thread_action,
+                       latest_job.workflow_epoch AS latest_job_workflow_epoch,
                        latest_job.outcome AS latest_job_outcome,
                        latest_job.input_tokens AS latest_job_input_tokens,
                        latest_job.cached_input_tokens AS latest_job_cached_input_tokens,
@@ -1371,6 +1504,7 @@ class TeamService:
                     "thread_id": job.get("thread_id"),
                     "turn_id": job.get("turn_id"),
                     "runtime": job.get("runtime"),
+                    "workflow_epoch": job.get("workflow_epoch"),
                     "input_tokens": job.get("input_tokens", 0),
                     "cached_input_tokens": job.get("cached_input_tokens", 0),
                     "uncached_input_tokens": job.get("uncached_input_tokens", 0),

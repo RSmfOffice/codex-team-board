@@ -271,20 +271,21 @@ Terminal jobs missing settlement/correlation:
 ### 后续施工顺序
 
 1. Phase 4A 先封死旧 Agent、旧 worktree/branch 和 native Thread 的错误分配面。
-2. Phase 4B 修状态机和 tick 阶段边界，保证调度结果可解释、可恢复。
-3. Phase 4C 处理来源校验、归档事务、数据库初始化和脱敏等 P1 安全缺口。
-4. Phase 4D 再拆分 Read Model，避免在状态机未稳定时过早扩大 Dashboard 读取面。
-5. Phase 5 最后做 daemon 身份、安装回滚、日志和历史 worktree 清理。
+2. Phase 4A2 让 Goal、Task、Attempt 绑定 `workflow_epoch`，阻止新任务进入旧 cohort。
+3. Phase 4B 修状态机和 tick 阶段边界，保证调度结果可解释、可恢复。
+4. Phase 4C 处理来源校验、归档事务、数据库初始化和脱敏等 P1 安全缺口。
+5. Phase 4D 再拆分 Read Model，避免在状态机未稳定时过早扩大 Dashboard 读取面。
+6. Phase 5 最后做 daemon 身份、安装回滚、日志和历史 worktree 清理。
 
-Phase 4A 是低风险、高收益的分配安全门禁，应作为下一批唯一首选写任务。
-Phase 4B 可以在全量基线通过后开始；Phase 4C 以后按共享文件范围串行执行，
+Phase 4A 和 4A2 共同构成分配安全与稳定前缀 cohort 门禁。
+Phase 4B 可以在 4A2 全量基线通过后开始；Phase 4C 以后按共享文件范围串行执行，
 不要让多个 Writer 同时修改 `service.py`、`cluster.py` 或 `dashboard.py`。
 
 ---
 
 ### Phase 4A：Assignment Boundary Hardening
 
-状态：代码与自动化验收完成，等待 Lead diff Review 和合并
+状态：已完成并通过 Lead Review 和主分支集成验证
 
 目标：不拆新版架构、不删除历史数据，只保证旧 Thread、旧 worktree/branch
 和历史任务对象不会进入新任务的分配链。
@@ -325,6 +326,52 @@ Worker commit:
 ff9268f07ac283905b0ebe7bca8bbfd2716e600a
 Merge commit:
 3c3e9eb7dbb4a4192ef2de5204f146a5d7a868db
+```
+
+---
+
+### Phase 4A2：Workflow Epoch 与稳定前缀 cohort
+
+状态：代码与自动化验收完成，等待 Lead diff Review 和合并
+
+目标：让新 Goal/Task 只进入当前稳定前缀 cohort；旧 cohort 不被静默改写，
+也不能继续 claim、dispatch 或运行。
+
+- [x] 新增 `workflow_epoch`，由 package/schema、Prompt Contract、
+  Core schema、access/surface、AGENTS、角色 prompts、native role 模板、
+  runtime 和 model 配置派生。
+- [x] `cluster_goals`、`tasks`、`cluster_jobs` 持久记录 `workflow_epoch`。
+- [x] 新 Goal/Task 写入当前 epoch；旧 Goal 不再接受新 Task。
+- [x] 旧 epoch 的 ready Task 在 claim 前被阻断，不创建 job。
+- [x] 旧 epoch 的 Lead dispatch 将 Goal 暂停并记录
+  `workflow_epoch_mismatch`，不自动迁移或运行。
+- [x] Goal resume、ensure 和 lead dispatch 校验当前 epoch。
+- [x] 提供显式 `cluster migrate-workflow` 和
+  `team_goal_migrate_workflow`，有活动 job 时拒绝迁移；存在未完成任务时要求
+  durable checkpoint。
+- [x] Dashboard/API 显示 Goal、Task 和最近 job 的 epoch，未绑定显示
+  `workflow unbound`。
+- [x] cache profile 绑定 `workflow-v1` 和 DB schema；旧 profile 自动归为
+  historical。
+
+验收：
+
+- 新任务绝不会进入旧 workflow cohort。
+- 旧 running 任务不会自动迁移；有活动 job 时迁移被拒绝。
+- 旧 ready 任务只有显式迁移后才能重新调度。
+- 普通当前 epoch 的 Lead/Worker、App Server、恢复和 usage 流程无回归。
+- 每个 dispatch attempt 都能追溯 Goal/Task 的实际 epoch。
+
+本轮验证：
+
+```text
+169 tests OK, 1 skipped
+dashboard-ui-smoke: ok
+compileall ok
+schema 20
+Core tools: team_read, team_write
+Core schema hash:
+86e78eef5f5f631094f5218d763c83997f5ab52d1ba22877f93092720f93fca6
 ```
 
 ---

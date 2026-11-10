@@ -10,13 +10,16 @@ from unittest.mock import Mock, patch
 from codex_team.cache_contract import (
     OPERATIONS,
     READ_OPERATIONS,
+    WORKFLOW_EPOCH_VERSION,
     WRITE_OPERATIONS,
     agent_cache_profile,
     cache_profile_contract_status,
     core_tool_definitions,
     core_tool_schema_hash,
     operation_help,
+    workflow_epoch,
 )
+from codex_team.db import SCHEMA_VERSION
 from codex_team.mcp import (
     _instructions_for_surface,
     _normalize_tool_call,
@@ -530,12 +533,73 @@ class CacheContractTests(unittest.TestCase):
                 "contract=prompt-v0",
                 1,
             ),
+            current.replace(
+                f"workflow={WORKFLOW_EPOCH_VERSION}",
+                "workflow=workflow-v0",
+                1,
+            ),
+            current.replace(
+                f"schema={SCHEMA_VERSION}",
+                "schema=0",
+                1,
+            ),
         ]:
             expected = "unknown" if not historical else "historical"
             self.assertEqual(
                 cache_profile_contract_status(historical),
                 expected,
             )
+
+    def test_workflow_epoch_tracks_stable_prefix_inputs(self) -> None:
+        base = workflow_epoch(
+            policy_hash="policy-v1",
+            role_prompts={"team_worker": "worker-v1"},
+            native_role_hashes={"team_worker": "native-v1"},
+            runtime="app_server:codex",
+            model="model-a",
+            model_provider="provider-a",
+            surface="core",
+            access_mode="full",
+        )
+        self.assertTrue(base.startswith(f"{WORKFLOW_EPOCH_VERSION}:"))
+        self.assertEqual(
+            base,
+            workflow_epoch(
+                policy_hash="policy-v1",
+                role_prompts={"team_worker": "worker-v1"},
+                native_role_hashes={"team_worker": "native-v1"},
+                runtime="app_server:codex",
+                model="model-a",
+                model_provider="provider-a",
+                surface="core",
+                access_mode="full",
+            ),
+        )
+        variants = [
+            {"policy_hash": "policy-v2"},
+            {"role_prompts": {"team_worker": "worker-v2"}},
+            {"native_role_hashes": {"team_worker": "native-v2"}},
+            {"runtime": "exec:codex"},
+            {"model": "model-b"},
+            {"model_provider": "provider-b"},
+            {"access_mode": "read_only"},
+        ]
+        base_values = {
+            "policy_hash": "policy-v1",
+            "role_prompts": {"team_worker": "worker-v1"},
+            "native_role_hashes": {"team_worker": "native-v1"},
+            "runtime": "app_server:codex",
+            "model": "model-a",
+            "model_provider": "provider-a",
+            "surface": "core",
+            "access_mode": "full",
+        }
+        for variant in variants:
+            with self.subTest(variant=variant):
+                self.assertNotEqual(
+                    base,
+                    workflow_epoch(**{**base_values, **variant}),
+                )
 
 
 if __name__ == "__main__":

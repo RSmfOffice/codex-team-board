@@ -710,6 +710,30 @@ def _tool_definitions() -> list[dict[str, Any]]:
             },
         },
         {
+            "name": "team_goal_migrate_workflow",
+            "description": (
+                "Explicitly migrate a stopped cluster goal and its unfinished "
+                "tasks to the current workflow epoch. Active jobs or running "
+                "tasks block migration."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "goal_id": {"type": "string", "minLength": 1},
+                    "actor": {
+                        "type": "string",
+                        "minLength": 1,
+                    },
+                    "reason": {
+                        "type": "string",
+                        "minLength": 1,
+                    },
+                },
+                "required": ["goal_id", "actor", "reason"],
+                "additionalProperties": False,
+            },
+        },
+        {
             "name": "team_agent_list",
             "description": (
                 "List persistent Agent threads, cache usage, current assignment, "
@@ -1042,6 +1066,12 @@ class TeamMcpServer:
                 arguments["goal_id"],
                 summary=arguments["summary"],
                 actor="lead",
+            )
+        if name == "team_goal_migrate_workflow":
+            return self.cluster.migrate_goal_workflow_epoch(
+                arguments["goal_id"],
+                actor=arguments["actor"],
+                reason=arguments["reason"],
             )
         if name == "team_agent_list":
             return {

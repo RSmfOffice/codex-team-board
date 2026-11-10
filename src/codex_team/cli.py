@@ -206,6 +206,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     checkpoint_source.add_argument("--summary")
     checkpoint_source.add_argument("--summary-file")
+    cluster_migrate = cluster_sub.add_parser("migrate-workflow")
+    cluster_migrate.add_argument("goal_id")
+    cluster_migrate.add_argument("--actor", default="human")
+    cluster_migrate.add_argument("--reason", required=True)
     cluster_sub.add_parser("daemon-status")
     cluster_sub.add_parser("stop-daemon")
     daemon = cluster_sub.add_parser("daemon")
@@ -506,6 +510,14 @@ def main(argv: list[str] | None = None) -> int:
                         args.goal_id,
                         summary=summary,
                         actor="human",
+                    )
+                )
+            elif args.cluster_command == "migrate-workflow":
+                _print(
+                    cluster.migrate_goal_workflow_epoch(
+                        args.goal_id,
+                        actor=args.actor,
+                        reason=args.reason,
                     )
                 )
             elif args.cluster_command == "daemon-status":

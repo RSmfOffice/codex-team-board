@@ -5,7 +5,7 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     task_id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
     goal_id TEXT REFERENCES cluster_goals(goal_id) ON DELETE SET NULL,
+    workflow_epoch TEXT NOT NULL DEFAULT '',
     title TEXT NOT NULL,
     description TEXT NOT NULL,
     acceptance TEXT NOT NULL,
@@ -86,6 +87,7 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE TABLE IF NOT EXISTS cluster_goals (
     goal_id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+    workflow_epoch TEXT NOT NULL DEFAULT '',
     objective TEXT NOT NULL,
     status TEXT NOT NULL CHECK(status IN (
         'planning', 'active', 'paused', 'completed', 'failed'
@@ -115,6 +117,7 @@ CREATE TABLE IF NOT EXISTS cluster_jobs (
     job_id TEXT PRIMARY KEY,
     goal_id TEXT NOT NULL REFERENCES cluster_goals(goal_id) ON DELETE CASCADE,
     task_id TEXT REFERENCES tasks(task_id) ON DELETE SET NULL,
+    workflow_epoch TEXT NOT NULL DEFAULT '',
     kind TEXT NOT NULL CHECK(kind IN ('lead', 'worker')),
     role TEXT NOT NULL,
     actor TEXT NOT NULL DEFAULT '',
@@ -259,6 +262,8 @@ CREATE INDEX IF NOT EXISTS idx_tasks_archived
     ON tasks(project_id, archived_at, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_goal_archive
     ON tasks(goal_id, status, archived_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_workflow_epoch
+    ON tasks(project_id, workflow_epoch, status);
 CREATE INDEX IF NOT EXISTS idx_dependencies_depends_on
     ON task_dependencies(depends_on);
 CREATE INDEX IF NOT EXISTS idx_events_task
@@ -271,10 +276,14 @@ CREATE INDEX IF NOT EXISTS idx_messages_project
     ON messages(project_id, message_id);
 CREATE INDEX IF NOT EXISTS idx_cluster_jobs_goal
     ON cluster_jobs(goal_id, status, job_id);
+CREATE INDEX IF NOT EXISTS idx_cluster_jobs_workflow_epoch
+    ON cluster_jobs(goal_id, workflow_epoch, started_at);
 CREATE INDEX IF NOT EXISTS idx_cluster_events_goal
     ON cluster_events(goal_id, event_id);
 CREATE INDEX IF NOT EXISTS idx_cluster_goals_archived
     ON cluster_goals(project_id, archived_at, updated_at);
+CREATE INDEX IF NOT EXISTS idx_cluster_goals_workflow_epoch
+    ON cluster_goals(project_id, workflow_epoch, status);
 CREATE INDEX IF NOT EXISTS idx_cluster_agents_pool
     ON cluster_agents(project_id, role, workstream_key, status, last_used_at);
 CREATE INDEX IF NOT EXISTS idx_cluster_agents_runtime
@@ -309,6 +318,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_cluster_one_active_lead_job
 """
 
 TASK_MIGRATION_COLUMNS = {
+    "workflow_epoch": "TEXT NOT NULL DEFAULT ''",
     "worktree_path": "TEXT",
     "branch": "TEXT",
     "target_branch": "TEXT",
@@ -343,6 +353,7 @@ PROJECT_MIGRATION_COLUMNS = {
 }
 
 CLUSTER_GOAL_MIGRATION_COLUMNS = {
+    "workflow_epoch": "TEXT NOT NULL DEFAULT ''",
     "archived_at": "TEXT",
     "workstream_key": "TEXT",
     "continuity_reason": "TEXT NOT NULL DEFAULT ''",
@@ -354,6 +365,7 @@ CLUSTER_GOAL_MIGRATION_COLUMNS = {
 }
 
 CLUSTER_JOB_MIGRATION_COLUMNS = {
+    "workflow_epoch": "TEXT NOT NULL DEFAULT ''",
     "agent_id": "TEXT",
     "actor": "TEXT NOT NULL DEFAULT ''",
     "turn_id": "TEXT",
@@ -544,8 +556,31 @@ def _upgrade_schema(connection: sqlite3.Connection) -> None:
             END
         """
     )
+    _backfill_workflow_epochs(connection)
     _backfill_goal_archive_tasks(connection)
     _backfill_goal_archive_all_tasks(connection)
+
+
+def _backfill_workflow_epochs(connection: sqlite3.Connection) -> None:
+    marker = "workflow_epoch_backfill_v20"
+    exists = connection.execute(
+        "SELECT 1 FROM metadata WHERE key = ?",
+        (marker,),
+    ).fetchone()
+    if exists is not None:
+        return
+    for table in ("tasks", "cluster_goals", "cluster_jobs"):
+        connection.execute(
+            f"""
+            UPDATE {table}
+            SET workflow_epoch = 'legacy-unbound'
+            WHERE workflow_epoch IS NULL OR TRIM(workflow_epoch) = ''
+            """
+        )
+    connection.execute(
+        "INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)",
+        (marker, utc_now()),
+    )
 
 
 def _backfill_goal_archive_tasks(connection: sqlite3.Connection) -> None:

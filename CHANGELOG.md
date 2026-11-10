@@ -26,6 +26,11 @@
   prompt 是否由用户消息真实送达及 prompt hash。
 - `task_events` 增加结构化 `thread_id`、`job_id`、`correlation_id` 和
   `assignment_id`，Dashboard/API 直接返回关联字段。
+- 新增 `workflow_epoch` 稳定前缀 cohort：Goal、Task 和 cluster job 绑定同一
+  架构语义；新任务只进入当前 cohort，旧 cohort fail closed。
+- 新增显式 `cluster migrate-workflow` 和
+  `team_goal_migrate_workflow`；有活动 job/running task 时禁止迁移，
+  存在未完成任务时要求 durable checkpoint。
 
 ### Changed
 
@@ -74,10 +79,15 @@
 - write task 在 claim、submit 和 approve 时验证 worktree 路径归属、branch
   归属、实际 checkout branch、主仓库隔离和 clean 状态；跨 task worktree 或
   错误 branch 会在业务状态迁移前被拒绝。
+- 旧 `workflow_epoch` 的 ready Task 在 claim 前被阻断，旧 Goal 不自动 resume；
+  Lead/Task dispatch 会记录 `workflow_epoch_mismatch` 并保持等待迁移。
+- Dashboard 的 Goal、Task、Agent latest job 显示当前或未绑定 workflow epoch。
 
 ### Database
 
-- schema 升级到 19；`cluster_agents` 新增 runtime、parent/path/nickname、
+- schema 升级到 20；`cluster_goals`、`tasks` 和 `cluster_jobs` 新增
+  `workflow_epoch`；旧记录一次性回填为 `legacy-unbound`。
+- schema 19 的 `cluster_agents` runtime、parent/path/nickname、
   actor、prompt hash/status、native session path 和 last-seen；
   `task_events` 新增 thread/job/correlation/assignment 关联字段。
 - schema 18 的 `cluster_jobs` attempt ledger 和 `external_operations`
