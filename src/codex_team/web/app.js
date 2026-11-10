@@ -358,18 +358,20 @@ async function syncNativeAgentThreads({
       "sync native agents",
     );
     const registered = nonNegativeNumber(result.registered_count);
+    const refreshed = nonNegativeNumber(result.refreshed_count);
+    const changed = registered + refreshed;
     const errors = Array.isArray(result.errors) ? result.errors.length : 0;
     setActionStatus(
       "agent-reset-status",
-      registered
-        ? `已发现并登记 ${registered} 个 Native Thread${errors ? ` · ${errors} 个失败` : ""}`
+      changed
+        ? `Native Thread 已同步 · 新增 ${registered} · 更新 ${refreshed}${errors ? ` · ${errors} 个失败` : ""}`
         : `Native Thread 已同步${errors ? ` · ${errors} 个失败` : " · 无新增"}`,
       errors ? "error" : "success",
     );
-    if (refresh && registered > 0) {
+    if (refresh && changed > 0) {
       await requestImmediateRefresh({ forceRender: true });
     }
-    return registered > 0;
+    return changed > 0;
   } catch (error) {
     setActionStatus(
       "agent-reset-status",

@@ -353,6 +353,38 @@ class DashboardClusterControlTests(unittest.TestCase):
             self.assertEqual(native["runtime"], "native")
             self.assertEqual(native["prompt_status"], "delivered")
             self.assertEqual(native["current_task_id"], task["task_id"])
+            self.assertFalse(native["usage_available"])
+            self.assertIsNone(native["last_input_tokens"])
+            self.assertIsNone(native["last_cached_input_tokens"])
+            self.assertIsNone(native["last_uncached_input_tokens"])
+            self.assertIsNone(native["context_tokens"])
+
+            with session_path.open("a", encoding="utf-8") as stream:
+                stream.write(
+                    json.dumps(
+                        {
+                            "type": "event_msg",
+                            "payload": {
+                                "type": "token_count",
+                                "info": {
+                                    "total_token_usage": {
+                                        "input_tokens": 2000,
+                                        "cached_input_tokens": 1600,
+                                        "output_tokens": 100,
+                                    },
+                                    "last_token_usage": {
+                                        "input_tokens": 1000,
+                                        "cached_input_tokens": 800,
+                                        "output_tokens": 50,
+                                    },
+                                    "model_context_window": 996147,
+                                },
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+            os.utime(session_path, None)
 
             status, second = self.post(
                 "/api/agents/sync-native",
@@ -360,7 +392,30 @@ class DashboardClusterControlTests(unittest.TestCase):
             )
             self.assertEqual(status, 200)
             self.assertEqual(second["registered_count"], 0)
-            self.assertIn(thread_id, second["skipped_existing"])
+            self.assertEqual(second["refreshed_count"], 1)
+            usage_board = self.get("/api/board")
+            usage_agent = next(
+                agent
+                for agent in usage_board["cluster_agents"]
+                if agent["thread_id"] == thread_id
+            )
+            self.assertTrue(usage_agent["usage_available"])
+            self.assertEqual(usage_agent["last_input_tokens"], 1000)
+            self.assertEqual(usage_agent["last_cached_input_tokens"], 800)
+            self.assertEqual(usage_agent["last_uncached_input_tokens"], 200)
+            self.assertEqual(usage_agent["context_tokens"], 1000)
+            self.assertEqual(usage_agent["model_context_window"], 996147)
+            self.assertEqual(usage_agent["turn_count"], 1)
+            self.assertAlmostEqual(usage_agent["cache_hit_rate"], 0.8)
+
+            status, third = self.post(
+                "/api/agents/sync-native",
+                {"limit": 100},
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(third["registered_count"], 0)
+            self.assertEqual(third["refreshed_count"], 0)
+            self.assertIn(thread_id, third["skipped_existing"])
             after = self.get("/api/board")
             self.assertEqual(
                 len(after["cluster_agents"]),
@@ -373,6 +428,26 @@ class DashboardClusterControlTests(unittest.TestCase):
                     for agent in after["cluster_agents"]
                 },
             )
+
+        unknown_thread_id = "01a1cafe-5555-7222-8333-944455556666"
+        self.team.agent_pool.register_native_thread(
+            str(self.project["project_id"]),
+            "team_explorer",
+            "native:unknown-usage",
+            unknown_thread_id,
+            "native:unknown-usage",
+        )
+        unknown_board = self.get("/api/board")
+        unknown_usage_agent = next(
+            agent
+            for agent in unknown_board["cluster_agents"]
+            if agent["thread_id"] == unknown_thread_id
+        )
+        self.assertFalse(unknown_usage_agent["usage_available"])
+        self.assertIsNone(unknown_usage_agent["last_input_tokens"])
+        self.assertIsNone(unknown_usage_agent["last_cached_input_tokens"])
+        self.assertIsNone(unknown_usage_agent["last_uncached_input_tokens"])
+        self.assertIsNone(unknown_usage_agent["context_tokens"])
 
     def test_control_cluster_goal_pause_resume_and_cancel(self) -> None:
         cluster = ClusterManager(self.settings, team=self.team)

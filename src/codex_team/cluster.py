@@ -1295,6 +1295,11 @@ class ClusterManager:
             ),
             native_session_path=inspection.get("session_path"),
             last_seen_at=inspection.get("last_seen_at"),
+            usage=(
+                inspection.get("usage")
+                if isinstance(inspection.get("usage"), Mapping)
+                else None
+            ),
         )
         if task_id:
             event_type = (
@@ -1365,9 +1370,15 @@ class ClusterManager:
         )
         with self.team.connection(write=False) as connection:
             registered_threads = {
-                str(row["thread_id"])
+                str(row["thread_id"]): dict(row)
                 for row in connection.execute(
-                    "SELECT thread_id FROM cluster_agents"
+                    """
+                    SELECT thread_id, runtime, project_id, role,
+                           workstream_key, current_task_id, last_seen_at,
+                           turn_count, model_context_window,
+                           last_input_tokens
+                    FROM cluster_agents
+                    """
                 ).fetchall()
             }
             task_rows = connection.execute(
@@ -1399,18 +1410,43 @@ class ClusterManager:
             return None
 
         registered: list[dict[str, Any]] = []
+        refreshed: list[dict[str, Any]] = []
         skipped_existing: list[str] = []
         skipped_unknown_project: list[str] = []
         errors: list[dict[str, str]] = []
         for item in discovered:
             thread_id = str(item["thread_id"])
-            if thread_id in registered_threads:
-                skipped_existing.append(thread_id)
-                continue
             project = matching_project(item.get("cwd"))
             if project is None:
                 skipped_unknown_project.append(thread_id)
                 continue
+            existing = registered_threads.get(thread_id)
+            usage = (
+                item.get("usage")
+                if isinstance(item.get("usage"), Mapping)
+                else {}
+            )
+            if existing is not None:
+                usage_window = usage.get("model_context_window")
+                needs_refresh = (
+                    existing.get("runtime") == "native"
+                    and (
+                        existing.get("last_seen_at")
+                        != item.get("last_seen_at")
+                        or (
+                            bool(usage.get("available"))
+                            and int(existing.get("turn_count") or 0) == 0
+                        )
+                        or (
+                            usage_window is not None
+                            and existing.get("model_context_window")
+                            != usage_window
+                        )
+                    )
+                )
+                if not needs_refresh:
+                    skipped_existing.append(thread_id)
+                    continue
             task_id = next(
                 (
                     task_id_value
@@ -1422,17 +1458,25 @@ class ClusterManager:
                 ),
                 None,
             )
-            parent_thread_id = item.get("parent_thread_id")
-            workstream_key = (
-                f"native:{parent_thread_id}"
-                if parent_thread_id
-                else f"native:{thread_id}"
-            )
+            if existing is not None:
+                task_id = task_id or existing.get("current_task_id")
+                workstream_key = str(existing["workstream_key"])
+                role = str(existing["role"])
+            else:
+                parent_thread_id = item.get("parent_thread_id")
+                workstream_key = (
+                    f"native:{parent_thread_id}"
+                    if parent_thread_id
+                    else f"native:{thread_id}"
+                )
+                role = str(
+                    item.get("agent_role") or "team_explorer"
+                )
             try:
                 result = self.register_native_agent(
                     project["root_path"],
                     thread_id,
-                    str(item.get("agent_role") or "team_explorer"),
+                    role,
                     workstream_key,
                     actor=f"{actor}:{thread_id}",
                     task_id=task_id,
@@ -1451,13 +1495,21 @@ class ClusterManager:
                     }
                 )
                 continue
-            registered.append(result["agent"])
-            registered_threads.add(thread_id)
+            if existing is None:
+                registered.append(result["agent"])
+            else:
+                refreshed.append(result["agent"])
+            registered_threads[thread_id] = {
+                **dict(existing or {}),
+                **result["agent"],
+            }
         return {
             "discovered": len(discovered),
             "max_age_hours": max_age_hours,
             "registered": registered,
             "registered_count": len(registered),
+            "refreshed": refreshed,
+            "refreshed_count": len(refreshed),
             "skipped_existing": skipped_existing,
             "skipped_unknown_project": skipped_unknown_project,
             "errors": errors,
