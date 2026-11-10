@@ -222,7 +222,7 @@ Jobs missing correlation:
 
 ### Phase 3：Prompt Contract 与 Agent Thread 统一
 
-状态：代码与自动化验收完成，等待 Lead diff Review 和合并
+状态：已完成并通过 Lead Review 和主分支集成验证
 
 - [x] 建立单一 Prompt Contract manifest；MCP instructions 直接由 manifest 加载。
 - [x] AGENTS、角色 Markdown/TOML、工具 schema、policy 内容和运行时身份进入同一
@@ -321,6 +321,10 @@ Live historical managed Threads:
 21 / 21
 Live current-contract managed Threads:
 0
+Worker commit:
+ff9268f07ac283905b0ebe7bca8bbfd2716e600a
+Merge commit:
+3c3e9eb7dbb4a4192ef2de5204f146a5d7a868db
 ```
 
 ---
