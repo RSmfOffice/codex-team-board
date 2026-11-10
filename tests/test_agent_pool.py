@@ -145,7 +145,15 @@ class AgentPoolTests(unittest.TestCase):
             "provider-a",
         )
         self.assertEqual(selected_explorer["agent_id"], explorer["agent_id"])
-        self.pool.release(selected_explorer["agent_id"], {"input": 1, "cached": 1})
+        self.pool.release(
+            selected_explorer["agent_id"],
+            {
+                "input": 1,
+                "cached": 1,
+                "context": 1,
+                "modelContextWindow": 100,
+            },
+        )
         selected_explorer = self.pool.select_agent(
             "P1", "team_explorer", "main", "reuse", "read", "model-a", "provider-a"
         )
@@ -162,7 +170,15 @@ class AgentPoolTests(unittest.TestCase):
             "provider-a",
         )
         self.assertEqual(selected_reviewer["agent_id"], reviewer["agent_id"])
-        self.pool.release(selected_reviewer["agent_id"], {"input": 1, "cached": 1})
+        self.pool.release(
+            selected_reviewer["agent_id"],
+            {
+                "input": 1,
+                "cached": 1,
+                "context": 1,
+                "modelContextWindow": 100,
+            },
+        )
         selected_reviewer = self.pool.select_agent(
             "P1", "team_reviewer", "main", "reuse", "review", "model-a", "provider-a"
         )
@@ -379,7 +395,8 @@ class AgentPoolTests(unittest.TestCase):
             connection.execute(
                 """
                 UPDATE cluster_agents
-                SET context_tokens = 90, model_context_window = 100
+                SET context_tokens = 90, model_context_window = 100,
+                    turn_count = 1
                 WHERE agent_id = ?
                 """,
                 (agent["agent_id"],),
@@ -479,7 +496,12 @@ class AgentPoolTests(unittest.TestCase):
         self.assertEqual(selected["agent_id"], agent["agent_id"])
         stored = self.pool.release(
             agent["agent_id"],
-            {"input": 1, "cached": 1},
+            {
+                "input": 1,
+                "cached": 1,
+                "context": 1,
+                "modelContextWindow": 100,
+            },
             cache_epoch_changed=True,
         )
         self.assertEqual(stored["status"], "stored")
@@ -487,6 +509,36 @@ class AgentPoolTests(unittest.TestCase):
             "P1", "team_explorer", "main", "reuse", "read", "model-a", "provider-a"
         )
         self.assertEqual(selected_again["agent_id"], agent["agent_id"])
+
+    def test_unknown_context_is_not_reused(self) -> None:
+        agent = self.register(thread_id="unknown-context")
+        selected = self.pool.select_agent(
+            "P1",
+            "team_explorer",
+            "main",
+            "reuse",
+            "read",
+            "model-a",
+            "provider-a",
+        )
+        self.assertEqual(selected["agent_id"], agent["agent_id"])
+        released = self.pool.release(
+            agent["agent_id"],
+            {"input": 100, "cached": 50, "modelContextWindow": 1000},
+        )
+        self.assertEqual(released["turn_count"], 1)
+        self.assertIsNone(released["model_context_window"])
+        self.assertIsNone(
+            self.pool.select_agent(
+                "P1",
+                "team_explorer",
+                "main",
+                "reuse",
+                "read",
+                "model-a",
+                "provider-a",
+            )
+        )
 
     def test_busy_and_release_update_links_usage_and_audit(self) -> None:
         self.seed_runtime_references()

@@ -47,7 +47,14 @@ PYTHONUTF8 = "1"
             self.assertIn("Keep this content.", agents)
             self.assertEqual(agents.count("CODEX_TEAM_BOARD_GLOBAL:START"), 1)
             self.assertEqual(agents.count("CODEX_TEAM_BOARD_GLOBAL:END"), 1)
-            self.assertIn("team_cluster_ensure", agents)
+            self.assertIn(
+                'team_write(operation="team_cluster_ensure"',
+                agents,
+            )
+            self.assertIn(
+                'team_read(operation="team_list_tasks"',
+                agents,
+            )
             self.assertIn("非平凡开发任务", agents)
 
             second = install_global_integration(settings, codex_home=codex_home)

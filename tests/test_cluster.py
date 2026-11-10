@@ -2720,6 +2720,7 @@ class ClusterSchedulerTests(unittest.TestCase):
                         "totalTokens": 13,
                     },
                     "last": {},
+                    "modelContextWindow": 100,
                 },
             )
             manager.app_turns[first["job_id"]]["status"] = "completed"
@@ -3734,6 +3735,7 @@ class ClusterSchedulerTests(unittest.TestCase):
                         "totalTokens": 13,
                     },
                     "last": {},
+                    "modelContextWindow": 100,
                 },
             )
             manager.app_turns[first_job["job_id"]]["status"] = "completed"

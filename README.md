@@ -284,9 +284,11 @@ Review 重点：
 
 - worktree 仍然存在；
 - worktree 没有未提交文件；
+- task 记录的 Worker commit 已包含在 `merge_commit` 中；
 - `merge_commit` 能在主仓库解析；
 - `merge_commit` 已包含在创建任务时固定下来的目标分支中，不受当前 checkout
   切换影响。
+- task/project 未归档，且 Review 期间 task version 没有变化。
 
 ## 可视化看板
 
@@ -524,9 +526,10 @@ MCP 的 `team_cluster_control.action` 除 `pause`、`resume`、`cancel` 外，�
 
 初始化后调用一次 `team_read(operation="help")` 可取得操作目录；新增 operation
 不会改变工具 schema。help 会返回每个 operation 的完整 `inputSchema`，包括类型、
-默认值、范围、枚举和字段说明。`CODEX_TEAM_MCP_SURFACE=core|admin|legacy` 控制工具面，
-其中 `core` 是默认值，`admin`/`legacy` 暴露下列兼容细粒度工具，建议仅用于人工
-管理、迁移和故障回退。
+默认值、范围、枚举和字段说明。Core dispatcher 和 legacy surface 都会在执行
+业务前校验同一份 schema，不接受隐式布尔/整数转换。
+`CODEX_TEAM_MCP_SURFACE=core|admin|legacy` 控制工具面，其中 `core` 是默认值，
+`admin`/`legacy` 暴露下列兼容细粒度工具，建议仅用于人工管理、迁移和故障回退。
 
 - `team_init_project`
 - `team_status`
@@ -654,6 +657,8 @@ thread 既有 baseline 的差值；只有 `total` 没有 token 证据时才回�
 
 `CODEX_TEAM_AGENT_REUSE_CONTEXT_RATIO` 默认 `0.85`。当 Agent 的
 `context_tokens / model_context_window` 达到该比例时，不再复用旧 thread。
+如果 context 或 model window 任一项未知，旧 thread 默认不复用；新注册但尚未
+执行过 turn 的 Agent 仍按空上下文处理。
 Agent cache profile 会同时绑定实际执行目录的 AGENTS 策略、Core 工具 schema、
 surface、sandbox mode 和最终稳定 developer instructions；任一变化都会阻止旧
 thread 复用。`admin`/`legacy` 兼容工具面不会参与 Agent 自动复用，始终使用新

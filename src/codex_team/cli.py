@@ -94,6 +94,7 @@ def build_parser() -> argparse.ArgumentParser:
     update.add_argument("--note", required=True)
     update.add_argument("--result")
     update.add_argument("--tests")
+    update.add_argument("--commit", default="")
 
     submit = task_sub.add_parser("submit")
     submit.add_argument("task_id")

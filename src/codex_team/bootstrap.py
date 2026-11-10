@@ -66,40 +66,52 @@ def _agents_block(project_root: Path) -> str:
 
 - 环境位于 `{project_root}`。仅当用户明确要求多 Agent 团队协作，或项目根存在
   `.codex/team-project.json` 时启用本流程。
-- 首次接入 Git 项目时，主 Agent 调用 `codexTeamBoard` 的
-  `team_init_project`；后续以 `team_list_tasks` / `team_get_task` 为任务状态源。
+- 首次接入 Git 项目时，主 Agent 调用
+  `team_write(operation="team_init_project", arguments={{...}})`；后续以
+  `team_read(operation="team_list_tasks", arguments={{...}})` 和
+  `team_read(operation="team_get_task", arguments={{...}})` 为任务状态源。
 - 主 Agent 是唯一 Lead，负责创建任务、worktree、最终 Review、合并和关闭任务。
-- 处理团队项目时先调用 `team_list_tasks` 检查现有任务、依赖和 Review 状态；
-  能恢复已有任务时不得重复创建。
-- 子 Agent 返回后必须检查 `team_get_task` 和 `team_get_task_events`；没有 claim
-  和 submit/block 事件的回复不能视为完成。
+- 处理团队项目时先调用
+  `team_read(operation="team_list_tasks", arguments={{...}})` 检查现有任务、依赖
+  和 Review 状态；能恢复已有任务时不得重复创建。
+- 子 Agent 返回后必须检查
+  `team_read(operation="team_get_task", arguments={{...}})` 和
+  `team_read(operation="team_get_task_events", arguments={{...}})`；没有 claim 和
+  submit/block 事件的回复不能视为完成。
 - 已完成子 Agent 不得复用为另一个任务的 follow-up；新材料和新审查必须创建新
   thread。60 秒未 claim 提醒，5 分钟无 heartbeat 标记异常。
-- 当前 Codex 不能自动加载角色 TOML 时，调用 `team_role_prompt` 并传入
-  `repo_root`，把返回的 Prompt 作为原生子 Agent 的 spawn prompt。
+- 当前 Codex 不能自动加载角色 TOML 时，调用
+  `team_read(operation="team_role_prompt", arguments={{...}})`，把返回的 Prompt
+  作为原生子 Agent 的 spawn prompt。
 - 默认最多同时运行 4 个 agent thread。只并行文件范围互不重叠的任务。
 - 所有 `write` 任务必须先创建 worktree，再认领。Worker 只允许修改自己的 worktree，
   不得切回主 checkout 或修改其他任务的 worktree。
 - 创建 worktree 前主 checkout 必须干净并位于命名分支；初始化产生的
   `AGENTS.md` 和 `.codex` 文件应先提交。
 - `claim_token` 不写入代码、任务描述、日志或最终回复。长任务必须 heartbeat。
-- Worker 提交前必须 commit、清理 worktree，并在 `team_submit_task` 中提供 commit
-  SHA、测试命令与结果、变更文件、风险和待决问题。
+- Worker 提交前必须 commit、清理 worktree，并在
+  `team_write(operation="team_submit_task", arguments={{...}})` 中提供 commit SHA、
+  测试命令与结果、变更文件、风险和待决问题。
 - Worker 无权标记 `done`。Lead 必须在真实合并并运行集成测试后提供
-  `merge_commit`，再调用 `team_review_task`。
+  `merge_commit`，再调用
+  `team_write(operation="team_review_task", arguments={{...}})`。
 - 多模块共享字段必须声明单位、区间、枚举、更新者和消费方，并验证真实生产者到
   真实消费者的一体化路径。
-- 接手或验收任务前使用 `team_get_task_events` 检查认领、进度、提交和 Review
-  事件，不能只看最终状态。
+- 接手或验收任务前使用
+  `team_read(operation="team_get_task_events", arguments={{...}})` 检查认领、进度、
+  提交和 Review 事件，不能只看最终状态。
 - 在团队项目中，凡是非平凡开发任务（会修改文件、跨多个步骤或预计超过 5 分钟），
-  主 Agent 必须在第一次编辑或创建 worktree 前调用 `team_cluster_ensure`，
-  确保项目已有但仅有一个 planning/active cluster goal。已有目标时复用，不重复
-  创建；paused goal 不得自动恢复。纯问答和无需修改文件的单次只读检查可跳过。
-- `team_cluster_start` 只用于明确新建目标。由常驻 `teamd` 自动启动/恢复 Lead
-  和 Worker；不得手工重复 spawn 同一 goal 的 Agent。
+  主 Agent 必须在第一次编辑或创建 worktree 前调用
+  `team_write(operation="team_cluster_ensure", arguments={{...}})`，确保项目已有
+  但仅有一个 planning/active cluster goal。已有目标时复用，不重复创建；paused
+  goal 不得自动恢复。纯问答和无需修改文件的单次只读检查可跳过。
+- `team_write(operation="team_cluster_start", arguments={{...}})` 只用于明确新建
+  目标。由常驻 `teamd` 自动启动/恢复 Lead 和 Worker；不得手工重复 spawn 同一
+  goal 的 Agent。
 - `teamd` 会 resume 中断的 Lead 线程、重建连续失败的 Lead generation、回收过期
   Worker lease，并按 `max_worker_attempts` 自动重试。主 Agent 通过
-  `team_cluster_status` 查看状态，不直接管理 Worker 进程。
+  `team_read(operation="team_cluster_status", arguments={{...}})` 查看状态，不直接
+  管理 Worker 进程。
 - `auto` 模式允许受管 Lead 在测试通过后合并并验收；`supervised` 模式在 Review
   阶段自动暂停，等待人工决定。
 - 看板地址：`http://127.0.0.1:8765`。启动：
