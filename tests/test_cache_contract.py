@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
@@ -16,10 +17,19 @@ from codex_team.cache_contract import (
     operation_help,
 )
 from codex_team.mcp import (
+    _instructions_for_surface,
     _normalize_tool_call,
     _process,
     _tool_definitions,
     _visible_tool_definitions,
+)
+from codex_team.prompt_contract import (
+    CORE_INSTRUCTIONS,
+    DISABLED_INSTRUCTIONS,
+    INSTRUCTIONS,
+    PROMPT_CONTRACT_VERSION,
+    READ_ONLY_CORE_INSTRUCTIONS,
+    bundled_manifest_path,
 )
 
 
@@ -39,6 +49,47 @@ class CacheContractTests(unittest.TestCase):
                 set(schema["properties"]),
             )
         self.assertEqual(core_tool_schema_hash(), core_tool_schema_hash())
+
+    def test_read_only_core_uses_read_only_instructions(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "CODEX_TEAM_MCP_ACCESS": "read_only",
+                "CODEX_TEAM_MCP_SURFACE": "core",
+            },
+            clear=False,
+        ):
+            instructions = _instructions_for_surface()
+        self.assertIn("`team_read`", instructions)
+        self.assertIn("read-only", instructions)
+        self.assertNotIn("`team_write`", instructions)
+
+    def test_prompt_contract_manifest_is_versioned(self) -> None:
+        manifest = json.loads(
+            bundled_manifest_path().read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            manifest["contract_version"],
+            PROMPT_CONTRACT_VERSION,
+        )
+        self.assertEqual(manifest["core_surface_version"], "core-v1")
+        self.assertEqual(manifest["native_thread_reuse"], "same_task_only")
+        self.assertEqual(
+            manifest["mcp_instructions"]["admin"],
+            INSTRUCTIONS,
+        )
+        self.assertEqual(
+            manifest["mcp_instructions"]["core_full"],
+            CORE_INSTRUCTIONS,
+        )
+        self.assertEqual(
+            manifest["mcp_instructions"]["core_read_only"],
+            READ_ONLY_CORE_INSTRUCTIONS,
+        )
+        self.assertEqual(
+            manifest["mcp_instructions"]["disabled"],
+            DISABLED_INSTRUCTIONS,
+        )
 
     def test_operation_help_keeps_catalog_out_of_tool_schema(self) -> None:
         help_result = operation_help(_tool_definitions())
@@ -375,6 +426,73 @@ class CacheContractTests(unittest.TestCase):
                     sandbox_mode="workspace-write",
                     surface="legacy",
                     tool_schema_hash="tools-v1",
+                ),
+            )
+
+    def test_agent_profile_tracks_access_instructions_and_runtime_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            policy = Path(temporary) / "AGENTS.md"
+            policy.write_text("policy-v1", encoding="utf-8")
+            base = agent_cache_profile(
+                "role-v1",
+                policy_path=policy,
+                sandbox_mode="workspace-write",
+                surface="core",
+                access_mode="full",
+                mcp_instructions="core instructions",
+                runtime_version="0.5.0",
+                runtime_identity="codex app-server exe-a",
+            )
+            self.assertNotEqual(
+                base,
+                agent_cache_profile(
+                    "role-v1",
+                    policy_path=policy,
+                    sandbox_mode="workspace-write",
+                    surface="core",
+                    access_mode="read_only",
+                    mcp_instructions="core instructions",
+                    runtime_version="0.5.0",
+                    runtime_identity="codex app-server exe-a",
+                ),
+            )
+            self.assertNotEqual(
+                base,
+                agent_cache_profile(
+                    "role-v1",
+                    policy_path=policy,
+                    sandbox_mode="workspace-write",
+                    surface="core",
+                    access_mode="full",
+                    mcp_instructions="changed instructions",
+                    runtime_version="0.5.0",
+                    runtime_identity="codex app-server exe-a",
+                ),
+            )
+            self.assertNotEqual(
+                base,
+                agent_cache_profile(
+                    "role-v1",
+                    policy_path=policy,
+                    sandbox_mode="workspace-write",
+                    surface="core",
+                    access_mode="full",
+                    mcp_instructions="core instructions",
+                    runtime_version="0.6.0",
+                    runtime_identity="codex app-server exe-a",
+                ),
+            )
+            self.assertNotEqual(
+                base,
+                agent_cache_profile(
+                    "role-v1",
+                    policy_path=policy,
+                    sandbox_mode="workspace-write",
+                    surface="core",
+                    access_mode="full",
+                    mcp_instructions="core instructions",
+                    runtime_version="0.5.0",
+                    runtime_identity="codex app-server exe-b",
                 ),
             )
 

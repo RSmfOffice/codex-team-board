@@ -737,6 +737,82 @@ class AgentPoolTests(unittest.TestCase):
         with self.assertRaisesRegex(AgentPoolError, "different agent metadata"):
             self.register(thread_id="stable-thread", role="team_reviewer")
 
+    def test_native_thread_is_registered_but_never_auto_selected(self) -> None:
+        self.seed_runtime_references()
+        native = self.pool.register_native_thread(
+            "P1",
+            "team_reviewer",
+            "native-review",
+            "native-thread",
+            "native-reviewer",
+            task_id="T1",
+            parent_thread_id="parent-thread",
+            agent_path="/root/reviewer",
+            agent_nickname="Socrates",
+            prompt_hash="a" * 64,
+            prompt_status="delivered",
+            native_session_path="session.jsonl",
+            last_seen_at=utc_now(),
+        )
+        self.assertEqual(native["runtime"], "native")
+        self.assertEqual(native["prompt_status"], "delivered")
+        self.assertEqual(native["current_task_id"], "T1")
+        self.assertIsNone(
+            self.pool.select_agent(
+                "P1",
+                "team_reviewer",
+                "native-review",
+                "reuse",
+                "review",
+                "model-a",
+                "provider-a",
+            )
+        )
+        with self.assertRaisesRegex(AgentPoolError, "same_task_only"):
+            self.pool.request_reset(
+                native["agent_id"],
+                "must not reset native",
+                "human",
+            )
+        refreshed = self.pool.register_native_thread(
+            "P1",
+            "team_reviewer",
+            "native-review",
+            "native-thread",
+            "native-reviewer",
+            task_id="T1",
+            prompt_status="missing",
+        )
+        self.assertEqual(refreshed["agent_id"], native["agent_id"])
+        self.assertEqual(refreshed["prompt_status"], "missing")
+
+        now = utc_now()
+        with closing(connect(self.db_path)) as connection:
+            connection.execute(
+                """
+                INSERT INTO tasks(
+                    task_id, project_id, goal_id, title, description,
+                    acceptance, kind, status, priority, owner_role,
+                    continuity_mode, created_at, updated_at
+                ) VALUES (
+                    'T2', 'P1', 'G1', 'Second task', 'Different task',
+                    'same-task guard', 'review', 'ready', 1,
+                    'team_reviewer', 'auto', ?, ?
+                )
+                """,
+                (now, now),
+            )
+            connection.commit()
+        with self.assertRaisesRegex(AgentPoolError, "same_task_only"):
+            self.pool.register_native_thread(
+                "P1",
+                "team_reviewer",
+                "native-review",
+                "native-thread",
+                "native-reviewer",
+                task_id="T2",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

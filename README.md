@@ -19,6 +19,8 @@
 - 每个 active goal 独立保留 1 个 Lead 和最多 3 个 Worker；系统另有进程安全上限
 - 默认 2 小时 Worker、45 分钟 Lead 的长任务超时与心跳诊断
 - WebUI Worker 槽位、Lead 数、排队、等待时长和 heartbeat 健康指标
+- Prompt Contract 与完整 cache profile，稳定前缀变化时禁止旧 Thread 复用
+- managed 与 native Thread 统一登记；native 仅允许同任务 follow-up
 
 ## 两个仓库如何联动
 
@@ -152,18 +154,19 @@ codex plugin add codex-context-meter@codex-tools
 
 ```text
 主 Agent / Lead
-  ├─ team_create_task
-  ├─ team_create_worktree
-  └─ team_review_task
+  ├─ team_write: team_create_task
+  ├─ team_write: team_create_worktree
+  └─ team_write: team_review_task
           ↓
 codexTeamBoard MCP
   ├─ SQLite 任务图 / 租约 / 审计
   └─ 本地 Web 看板
           ↓
 team_explorer / team_worker / team_reviewer
-  ├─ claim task
+  ├─ team_write: team_agent_register_native（原生子 Agent）
+  ├─ team_write: team_claim_task
   ├─ work only in assigned worktree
-  ├─ heartbeat
+  ├─ team_write: team_heartbeat
   └─ submit commit + tests to review
 ```
 
@@ -194,8 +197,10 @@ watchdog 和计划任务，确保它们始终连接同一个正式数据库。
 - `~/.codex/agents/*.toml`：面向后续 Codex 版本的角色配置。
 - `.codex/team-roles/*.md`：当前版本使用的便携 Prompt 包。
 
-主 Agent 先调用 `team_role_prompt`，再把返回内容作为原生子 Agent 的 spawn
-prompt。这样不依赖当前版本尚未生效的 `multi_agent_v2`。
+主 Agent 先调用
+`team_read(operation="team_role_prompt", arguments={...})`，再把返回内容作为
+原生子 Agent 的 spawn prompt。这样不依赖当前版本尚未生效的
+`multi_agent_v2`。
 
 ## 主 Agent 工作流
 
@@ -307,9 +312,10 @@ Blocked、Done 泳道，以及依赖、租约、分支、worktree、审计结果
 也可以双击根目录的 `启动Codex团队看板.cmd`。
 
 看板只显示已经通过 `codexTeamBoard` MCP 或 `team.ps1 task create`/
-`cluster start` 写入任务图的任务。普通 Codex 对话和原生子 Agent 不会自动变成
-看板任务；如果预期有任务但页面为空，先检查 `/api/board` 的 `tasks` 数量和
-`CODEX_TEAM_HOME` 是否指向同一数据库。
+`cluster start` 写入任务图的任务。普通 Codex 对话和未登记的原生子 Agent 不会
+自动变成看板任务；native 子 Agent 创建后需显式调用
+`team_agent_register_native`。如果预期有任务但页面为空，先检查 `/api/board`
+的 `tasks` 数量和 `CODEX_TEAM_HOME` 是否指向同一数据库。
 
 ### WebUI 集群控制
 
@@ -559,6 +565,8 @@ MCP 的 `team_cluster_control.action` 除 `pause`、`resume`、`cancel` 外，�
 - `team_cluster_status`
 - `team_cluster_control`
 - `team_goal_set_workstream`
+- `team_goal_set_checkpoint`
+- `team_agent_register_native`
 - `team_agent_list`
 - `team_agent_reset`
 
@@ -669,9 +677,10 @@ settled_at。Dashboard 的 Agent 卡片通过 latest-job 和 attempt ledger 投�
 如果 context 或 model window 任一项未知，旧 thread 默认不复用；新注册但尚未
 执行过 turn 的 Agent 仍按空上下文处理。
 Agent cache profile 会同时绑定实际执行目录的 AGENTS 策略、Core 工具 schema、
-surface、sandbox mode 和最终稳定 developer instructions；任一变化都会阻止旧
-thread 复用。`admin`/`legacy` 兼容工具面不会参与 Agent 自动复用，始终使用新
-thread，避免管理工具面变化污染缓存身份。
+surface、access mode、Prompt Contract manifest、MCP instructions、sandbox
+mode、运行时身份和最终稳定 developer instructions；任一变化都会阻止旧 thread
+复用。`admin`/`legacy` 兼容工具面不会参与 Agent 自动复用，始终使用新 thread，
+避免管理工具面变化污染缓存身份。
 `continuity_reason` 说明相关 goal 为什么可以延续同一 Lead 上下文。创建或恢复
 目标时可以直接提供：
 
@@ -716,6 +725,40 @@ thread，避免管理工具面变化污染缓存身份。
 CLI、MCP、ClusterManager 和 WebUI 的 reset 都统一进入
 `AgentPool.request_reset`；`starting`/`busy`、`superseded` 和已归档 Agent
 会被拒绝，避免重置正在执行或已失效的 thread。
+
+### Native 子 Agent 登记
+
+Codex 原生子 Agent 不会进入 managed AgentPool 的自动复用池。创建 thread 后，
+Lead 必须在任务正文实际送达后登记：
+
+```powershell
+.\scripts\team.ps1 agent register-native `
+  --repo "D:\path\to\repo" `
+  --thread-id "<native-thread-id>" `
+  --role team_explorer `
+  --workstream-key "native-investigation" `
+  --task-id "<task-id>" `
+  --actor "<native-thread-actor>"
+```
+
+等价的 Core operation 是：
+
+```text
+team_write(
+  operation="team_agent_register_native",
+  arguments={...}
+)
+```
+
+登记会读取 Codex session JSONL，记录 parent thread、agent path、nickname、
+task prompt hash 和最近更新时间。只有用户输入消息中出现该 task ID，状态才是
+`prompt_status=delivered`；assistant 文本、日志或工具输出中的同名字符串不算
+送达。`missing` 会阻止 claim，必须补发任务并重新登记。
+
+native Thread 为 `same_task_only`：同一 thread/actor 只能对应同一 task，不能由
+managed runtime reset，也不会被 `continuity_mode=auto|reuse` 选中。每日 Codex
+session 根目录不是默认 `~/.codex/sessions` 时，通过
+`CODEX_NATIVE_SESSIONS_ROOT` 指定。
 
 ### Workstream checkpoint
 
@@ -841,6 +884,7 @@ Agent runtime 与模型配置：
 | `CODEX_TEAM_AGENT_RUNTIME` | `app_server` | `app_server` 启用持久 thread；显式设为 `exec` 可关闭复用 |
 | `CODEX_TEAM_AGENT_REUSE_CONTEXT_RATIO` | `0.85` | 复用 thread 的 context/window 上限比例，范围 `0.1..1.0` |
 | `CODEX_TEAM_AGENT_CODEX_HOME` | `<CODEX_TEAM_HOME>\agent-codex-home` | 托管 Agent 专用 Codex Home；同步 `config.toml`、`auth.json`、`models.json`，不复制用户 sessions |
+| `CODEX_NATIVE_SESSIONS_ROOT` | `%USERPROFILE%\.codex\sessions` | Native Thread 登记的 Codex session JSONL 根目录 |
 | `CODEX_TEAM_MODEL` | 空 | 可选模型覆盖；空值使用 Codex 默认模型 |
 | `CODEX_TEAM_MODEL_PROVIDER` | 空 | 可选 provider 覆盖；必须与 AgentPool 身份匹配 |
 

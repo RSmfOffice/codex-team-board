@@ -20,7 +20,12 @@ from .app_server import AppServerEvents, AppServerRuntime
 from .cache_contract import agent_cache_profile, configured_surface
 from .config import Settings
 from .db import connect, connect_readonly, utc_now
+from .native_threads import inspect_native_session
 from .processes import pid_is_running
+from .prompt_contract import (
+    configured_access_mode,
+    instructions_for_surface,
+)
 from .redaction import redact_sensitive_text
 from .scheduling import (
     DEFAULT_GLOBAL_JOB_CAPACITY,
@@ -125,6 +130,8 @@ def _agent_cache_profile(
     *,
     cwd: Path | None = None,
     sandbox_mode: str = "workspace-write",
+    runtime_version: str = "",
+    runtime_identity: str = "",
 ) -> tuple[str, str]:
     stable_instructions = _stable_developer_instructions(goal, role, instructions)
     worktree_policy = (cwd / "AGENTS.md") if cwd is not None else None
@@ -138,6 +145,13 @@ def _agent_cache_profile(
         policy_path=policy_path,
         sandbox_mode=sandbox_mode,
         surface=configured_surface(),
+        access_mode=configured_access_mode(),
+        mcp_instructions=instructions_for_surface(
+            configured_surface(),
+            configured_access_mode(),
+        ),
+        runtime_version=runtime_version,
+        runtime_identity=runtime_identity,
     )
     return stable_instructions, profile
 
@@ -1059,6 +1073,82 @@ class ClusterManager:
             project_id,
             include_archived=include_archived,
         )
+
+    def register_native_agent(
+        self,
+        repo: str | Path,
+        thread_id: str,
+        role: str,
+        workstream_key: str,
+        *,
+        actor: str,
+        task_id: str | None = None,
+        display_name: str | None = None,
+        model: str = "",
+        model_provider: str = "",
+    ) -> dict[str, Any]:
+        project = self.team.project_for_repo(repo)
+        self.team.ensure_project_active(project)
+        task: dict[str, Any] | None = None
+        if task_id:
+            task = self.team.get_task(task_id)
+            if task["project_id"] != project["project_id"]:
+                raise ClusterError("task does not belong to this project")
+            if task.get("archived_at"):
+                raise ClusterError("archived task cannot bind a native thread")
+        inspection = inspect_native_session(
+            thread_id,
+            task_id=task_id,
+        )
+        agent = self.agent_pool.register_native_thread(
+            str(project["project_id"]),
+            role,
+            workstream_key,
+            thread_id,
+            actor,
+            task_id=task_id,
+            parent_thread_id=inspection.get("parent_thread_id"),
+            agent_path=inspection.get("agent_path"),
+            agent_nickname=inspection.get("agent_nickname"),
+            display_name=display_name,
+            model=model,
+            model_provider=model_provider,
+            prompt_hash=str(inspection.get("prompt_hash") or ""),
+            prompt_status=str(
+                inspection.get("prompt_status") or "unknown"
+            ),
+            native_session_path=inspection.get("session_path"),
+            last_seen_at=inspection.get("last_seen_at"),
+        )
+        if task_id:
+            event_type = (
+                "native_prompt_missing"
+                if inspection.get("prompt_status") == "missing"
+                else "native_thread_registered"
+            )
+            with self.team.connection() as connection:
+                self.team._event(
+                    connection,
+                    task_id,
+                    event_type,
+                    actor,
+                    {
+                        "thread_id": thread_id,
+                        "prompt_status": inspection.get("prompt_status"),
+                        "session_found": inspection.get("session_found"),
+                        "parent_thread_id": inspection.get(
+                            "parent_thread_id"
+                        ),
+                    },
+                    thread_id=thread_id,
+                    correlation_id=f"native:{thread_id}",
+                    assignment_id=thread_id,
+                )
+        return {
+            "agent": agent,
+            "inspection": inspection,
+            "same_task_only": True,
+        }
 
     def reset_agent(
         self,
@@ -2127,11 +2217,14 @@ Do not return raw logs or a full transcript.
             connection.execute(
                 """
                 INSERT INTO cluster_jobs(
-                    job_id, goal_id, task_id, kind, role, status,
+                    job_id, goal_id, task_id, kind, role, actor, status,
                     attempt, log_path, output_path, runtime,
                     runtime_generation, error, started_at, correlation_id,
                     prompt_hash
-                ) VALUES (?, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, 'starting',
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
                 """,
                 (
                     job_id,
@@ -2139,6 +2232,7 @@ Do not return raw logs or a full transcript.
                     task_id,
                     kind,
                     role,
+                    actor,
                     attempt,
                     str(log_path),
                     str(output_path),
@@ -2973,6 +3067,10 @@ Do not return raw logs or a full transcript.
             developer_instructions,
             cwd=cwd,
             sandbox_mode=sandbox_mode,
+            runtime_version=__version__,
+            runtime_identity=(
+                f"{self.agent_runtime}:" + " ".join(self.agent_command)
+            ),
         )
         if configured_surface() != "core":
             # Compatibility surfaces are for administration and migration;

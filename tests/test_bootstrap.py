@@ -55,6 +55,11 @@ PYTHONUTF8 = "1"
                 'team_read(operation="team_list_tasks"',
                 agents,
             )
+            self.assertIn(
+                'team_agent_register_native',
+                agents,
+            )
+            self.assertIn("prompt_status=delivered", agents)
             self.assertIn("非平凡开发任务", agents)
 
             second = install_global_integration(settings, codex_home=codex_home)

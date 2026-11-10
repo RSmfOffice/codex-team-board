@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 import threading
@@ -596,6 +597,11 @@ class TeamFlowTests(unittest.TestCase):
             'team_write(operation="team_review_task"',
             after,
         )
+        self.assertIn(
+            'team_agent_register_native',
+            after,
+        )
+        self.assertIn("same-task-only", after)
         self.assertIn("主 checkout 必须干净", after)
         self.assertNotEqual(before, "")
         self.assertIn("Review 重点", worker_prompt.read_text(encoding="utf-8"))
@@ -1258,6 +1264,211 @@ class TeamFlowTests(unittest.TestCase):
         self.assertEqual(agent["ledger_total_cached_input_tokens"], 600)
         self.assertEqual(agent["ledger_total_uncached_input_tokens"], 200)
         self.assertEqual(agent["cache_hit_rate"], 0.75)
+
+    def test_native_thread_registration_and_correlated_task_events(self) -> None:
+        task = self.team.create_task(
+            self.repo,
+            title="Native thread registration",
+            description="Register the real native session and task prompt.",
+            acceptance="Dashboard and events carry thread correlation.",
+            kind="read",
+            owner_role="team_explorer",
+        )
+        thread_id = "01a1cafe-1111-7222-8333-944455556666"
+        sessions = self.base / "native-sessions"
+        session = sessions / "2026" / "11" / "10" / f"rollout-{thread_id}.jsonl"
+        session.parent.mkdir(parents=True)
+        session.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "session_meta",
+                            "payload": {
+                                "source": {
+                                    "subagent": {
+                                        "thread_spawn": {
+                                            "parent_thread_id": "parent-thread",
+                                            "agent_path": "/root/native-explorer",
+                                            "agent_nickname": "Erdos",
+                                            "agent_role": "team_explorer",
+                                        }
+                                    }
+                                }
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "response_item",
+                            "payload": {
+                                "type": "message",
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "input_text",
+                                        "text": f"Execute task {task['task_id']}",
+                                    }
+                                ],
+                            },
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        manager = ClusterManager(
+            self.settings,
+            team=self.team,
+            worktrees=self.worktrees,
+            runtime_mode="exec",
+            agent_command=["codex"],
+        )
+        with patch.dict(
+            os.environ,
+            {"CODEX_NATIVE_SESSIONS_ROOT": str(sessions)},
+            clear=False,
+        ):
+            registered = manager.register_native_agent(
+                self.repo,
+                thread_id,
+                "team_explorer",
+                "native-stream",
+                actor="native-explorer",
+                task_id=str(task["task_id"]),
+            )
+        agent = registered["agent"]
+        self.assertEqual(agent["runtime"], "native")
+        self.assertEqual(agent["prompt_status"], "delivered")
+        self.assertEqual(agent["parent_thread_id"], "parent-thread")
+        self.assertEqual(agent["agent_nickname"], "Erdos")
+
+        claimed = self.team.claim_task(
+            str(task["task_id"]),
+            actor="native-explorer",
+        )
+        self.assertEqual(claimed["status"], "running")
+        events = self.team.get_task_events(str(task["task_id"]))["events"]
+        claim_event = next(
+            event for event in events if event["event_type"] == "claimed"
+        )
+        self.assertEqual(claim_event["thread_id"], thread_id)
+        self.assertEqual(claim_event["correlation_id"], f"native:{thread_id}")
+        self.assertEqual(claim_event["assignment_id"], thread_id)
+        dashboard = self.team.dashboard_snapshot(str(task["project_id"]))
+        dashboard_agent = next(
+            item
+            for item in dashboard["cluster_agents"]
+            if item["agent_id"] == agent["agent_id"]
+        )
+        self.assertEqual(dashboard_agent["runtime"], "native")
+        self.assertEqual(dashboard_agent["prompt_status"], "delivered")
+
+    def test_native_prompt_missing_blocks_claim_until_refresh(self) -> None:
+        task = self.team.create_task(
+            self.repo,
+            title="Native prompt missing",
+            description="A created thread without the task prompt must not claim.",
+            acceptance="Claim is blocked until prompt delivery is verified.",
+            kind="read",
+            owner_role="team_explorer",
+        )
+        thread_id = "01a1cafe-3333-7444-8555-966677778888"
+        sessions = self.base / "native-missing"
+        session = sessions / f"rollout-{thread_id}.jsonl"
+        session.parent.mkdir(parents=True)
+        session.write_text(
+            json.dumps(
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": "Only AGENTS and environment context",
+                            }
+                        ],
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        manager = ClusterManager(
+            self.settings,
+            team=self.team,
+            worktrees=self.worktrees,
+            runtime_mode="exec",
+            agent_command=["codex"],
+        )
+        with patch.dict(
+            os.environ,
+            {"CODEX_NATIVE_SESSIONS_ROOT": str(sessions)},
+            clear=False,
+        ):
+            registered = manager.register_native_agent(
+                self.repo,
+                thread_id,
+                "team_explorer",
+                "native-missing",
+                actor="native-missing-worker",
+                task_id=str(task["task_id"]),
+            )
+        self.assertEqual(
+            registered["agent"]["prompt_status"],
+            "missing",
+        )
+        with self.assertRaisesRegex(TeamError, "prompt has not been verified"):
+            self.team.claim_task(
+                str(task["task_id"]),
+                actor="native-missing-worker",
+            )
+        with session.open("a", encoding="utf-8") as stream:
+            stream.write(
+                json.dumps(
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": f"Execute {task['task_id']}",
+                                }
+                            ],
+                        },
+                    }
+                )
+                + "\n"
+            )
+        with patch.dict(
+            os.environ,
+            {"CODEX_NATIVE_SESSIONS_ROOT": str(sessions)},
+            clear=False,
+        ):
+            refreshed = manager.register_native_agent(
+                self.repo,
+                thread_id,
+                "team_explorer",
+                "native-missing",
+                actor="native-missing-worker",
+                task_id=str(task["task_id"]),
+            )
+        self.assertEqual(
+            refreshed["agent"]["prompt_status"],
+            "delivered",
+        )
+        self.assertEqual(
+            self.team.claim_task(
+                str(task["task_id"]),
+                actor="native-missing-worker",
+            )["status"],
+            "running",
+        )
 
     def test_dashboard_projects_missing_usage_fields_to_null(self) -> None:
         manager = ClusterManager(

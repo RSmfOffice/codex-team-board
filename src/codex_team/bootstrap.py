@@ -83,6 +83,11 @@ def _agents_block(project_root: Path) -> str:
 - 当前 Codex 不能自动加载角色 TOML 时，调用
   `team_read(operation="team_role_prompt", arguments={{...}})`，把返回的 Prompt
   作为原生子 Agent 的 spawn prompt。
+- Native subagent 创建后必须调用
+  `team_write(operation="team_agent_register_native", arguments={{...}})`
+  登记真实 thread_id、角色、workstream 和 task。要求返回
+  `prompt_status=delivered`；如果是 `missing`，立即补发任务并重新登记。Native
+  thread 只允许 same-task follow-up，不得切换到另一个 task 或进入 managed 自动复用池。
 - 默认最多同时运行 4 个 agent thread。只并行文件范围互不重叠的任务。
 - 所有 `write` 任务必须先创建 worktree，再认领。Worker 只允许修改自己的 worktree，
   不得切回主 checkout 或修改其他任务的 worktree。

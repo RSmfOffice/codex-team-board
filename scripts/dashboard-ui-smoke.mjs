@@ -609,6 +609,42 @@ assert.match(agentThreadHtml, /已被替换不可重置/);
 assert.match(agentThreadHtml, /已归档不可重置/);
 assert.match(agentThreadHtml, /data-agent-archived="true"/);
 assert.doesNotMatch(agentThreadHtml, /conversation|transcript/i);
+
+const nativeBoard = JSON.parse(JSON.stringify(secondBoard));
+nativeBoard.cluster_agents = [{
+  agent_id: "A-NATIVE",
+  display_name: "Native Explorer",
+  status: "loaded",
+  runtime: "native",
+  role: "team_explorer",
+  workstream_key: "native-stream",
+  thread_id: "thread-native-1",
+  parent_thread_id: "thread-parent-1",
+  agent_path: "/root/native_explorer",
+  agent_nickname: "Erdos",
+  prompt_status: "missing",
+  current_task_id: "T-NATIVE",
+  current_task_title: "验证任务送达",
+  context_tokens: 0,
+  turn_count: 0,
+}];
+assert.equal(
+  hooks.renderBoard(nativeBoard),
+  true,
+  "native prompt status changes should redraw diagnostics",
+);
+const nativeAgentHtml = fakeElements.get("agent-thread-list").innerHTML;
+assert.match(nativeAgentHtml, /runtime native/);
+assert.match(nativeAgentHtml, /prompt missing/);
+assert.match(nativeAgentHtml, /agent Erdos/);
+assert.match(nativeAgentHtml, /父 Thread：thread-parent-1/);
+assert.match(nativeAgentHtml, /Native thread 仅支持 same-task/);
+assert.equal(
+  hooks.renderBoard(secondBoard),
+  true,
+  "restoring managed diagnostics should redraw once",
+);
+
 assert.match(taskCardHtml, /thread thread-task-1/);
 assert.match(taskCardHtml, /thread reuse/);
 assert.match(taskCardHtml, /turn turn-3/);

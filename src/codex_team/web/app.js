@@ -844,6 +844,12 @@ function renderAgentThreads(agents, events = []) {
     const latestJob = agent.latest_job_id
       ? `${agent.latest_job_id} · ${agent.latest_job_status || "unknown"}${agent.latest_job_thread_action ? ` · ${agent.latest_job_thread_action}` : ""}`
       : "无 job";
+    const nativePrompt = agent.runtime === "native"
+      ? agent.prompt_status || "unknown"
+      : "";
+    const nativeIdentity = agent.runtime === "native"
+      ? agent.agent_nickname || agent.agent_path || ""
+      : "";
     const resetState = agent.reset_requested_at
       ? `重置已请求 ${timeText(agent.reset_requested_at)}${agent.reset_reason ? ` · ${agent.reset_reason}` : ""}`
       : latestEvent
@@ -851,6 +857,8 @@ function renderAgentThreads(agents, events = []) {
         : "尚未请求重置";
     const resetBlockedReason = agent.archived_at
       ? "已归档不可重置"
+      : agent.runtime === "native"
+        ? "Native thread 仅支持 same-task，不能由 managed runtime 重置"
       : ["busy", "starting"].includes(status)
         ? "忙碌中不可重置"
         : status === "superseded"
@@ -868,6 +876,9 @@ function renderAgentThreads(agents, events = []) {
         </div>
         <div class="agent-thread-meta">
           <span>role ${escapeHtml(agent.role || "—")}</span>
+          <span>runtime ${escapeHtml(agent.runtime || "managed")}</span>
+          ${nativePrompt ? `<span>prompt ${escapeHtml(nativePrompt)}</span>` : ""}
+          ${nativeIdentity ? `<span>agent ${escapeHtml(nativeIdentity)}</span>` : ""}
           <span>workstream ${escapeHtml(workstream)}</span>
           <span>thread ${escapeHtml(thread)}</span>
           <span>${escapeHtml(model)}</span>
@@ -879,6 +890,9 @@ function renderAgentThreads(agents, events = []) {
         <div class="agent-thread-task">
           <div>任务：${escapeHtml(taskLabel)}</div>
           <div>当前目标：${escapeHtml(goalLabel)}</div>
+          ${agent.runtime === "native" && agent.parent_thread_id
+            ? `<div>父 Thread：${escapeHtml(agent.parent_thread_id)}</div>`
+            : ""}
         </div>
         <div class="agent-thread-usage">
           <div><span>context</span><strong>${escapeHtml(context)}</strong></div>

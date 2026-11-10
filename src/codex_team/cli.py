@@ -226,6 +226,20 @@ def build_parser() -> argparse.ArgumentParser:
     agent_reset.add_argument("agent_id")
     agent_reset.add_argument("--actor", default="human")
     agent_reset.add_argument("--reason", default="manual reset requested through CLI")
+    native_register = agent_sub.add_parser("register-native")
+    native_register.add_argument("--repo", default=".")
+    native_register.add_argument("--thread-id", required=True)
+    native_register.add_argument(
+        "--role",
+        required=True,
+        choices=["lead", "team_explorer", "team_worker", "team_reviewer"],
+    )
+    native_register.add_argument("--workstream-key", required=True)
+    native_register.add_argument("--task-id")
+    native_register.add_argument("--actor", required=True)
+    native_register.add_argument("--display-name")
+    native_register.add_argument("--model", default="")
+    native_register.add_argument("--model-provider", default="")
 
     usage = sub.add_parser("usage", help="Inspect and repair usage telemetry")
     usage_sub = usage.add_subparsers(dest="usage_command", required=True)
@@ -519,6 +533,20 @@ def main(argv: list[str] | None = None) -> int:
                         args.agent_id,
                         actor=args.actor,
                         reason=args.reason,
+                    )
+                )
+            elif args.agent_command == "register-native":
+                _print(
+                    cluster.register_native_agent(
+                        args.repo,
+                        args.thread_id,
+                        args.role,
+                        args.workstream_key,
+                        actor=args.actor,
+                        task_id=args.task_id,
+                        display_name=args.display_name,
+                        model=args.model,
+                        model_provider=args.model_provider,
                     )
                 )
         elif args.command == "usage":
