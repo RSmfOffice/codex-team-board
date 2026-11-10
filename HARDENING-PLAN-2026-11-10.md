@@ -47,7 +47,7 @@
 
 ### Phase 1：入口契约、状态真实性和基础安全
 
-状态：代码与自动化验收完成，等待 Lead diff Review 和合并
+状态：已完成并通过 Lead Review、合并和真实库迁移验证
 
 这是当前第一批实施内容。
 
@@ -250,10 +250,20 @@ Jobs missing correlation:
 161 tests OK, 1 skipped
 dashboard-ui-smoke: ok
 compileall ok
-schema 19 (worktree)
+schema 19
 Core tools: team_read, team_write
 Core schema hash:
 86e78eef5f5f631094f5218d763c83997f5ab52d1ba22877f93092720f93fca6
+Worker commit:
+a00038d2fb7960ffcb7cee3ffc5b7eee1316cb2d
+Merge commit:
+5c95b2a62cd3b4af373b5d78a40d4078d346ef9d
+Live schema after migration:
+19
+Legacy managed agents:
+21 / 21
+Terminal jobs missing settlement/correlation:
+0 / 0
 ```
 
 ---
@@ -264,6 +274,8 @@ Core schema hash:
 
 - [ ] 将 tick 拆成 settle/recover/control/prepare/dispatch/health/publish 阶段。
 - [ ] 每个阶段输出耗时与计数。
+- [ ] 修复 `planning` goal 在全部任务终态时直接尝试 `completed` 的非法转换；
+  应由 prepare 阶段显式执行可审计的 `planning -> active -> completed` 收敛。
 - [ ] split dashboard API：summary、tasks、goal、events、agents、attempts。
 - [ ] 使用 version/ETag/cursor，避免每 2 秒读取全量 board。
 - [ ] unknown、真实 0、unavailable 分离。
