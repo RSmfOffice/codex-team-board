@@ -157,7 +157,7 @@ invalid input => no domain mutation
 - [x] compileall。
 - [x] diff check。
 - [x] Core tools/list 仍只有 `team_read/team_write`。
-- [ ] 工作区干净。
+- [x] 工作区干净。
 
 本轮验证：
 
@@ -167,6 +167,10 @@ dashboard-ui-smoke: ok
 compileall ok
 Core schema hash:
 86e78eef5f5f631094f5218d763c83997f5ab52d1ba22877f93092720f93fca6
+Worker commit:
+a88072eee5106b45b1f0b012bebdc9e1e738c43d
+Merge commit:
+38c3d71520a10944c11cafdc6946327bbc153b66
 ```
 
 ---
