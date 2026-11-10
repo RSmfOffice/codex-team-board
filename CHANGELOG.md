@@ -2,7 +2,7 @@
 
 本项目遵循语义化版本。
 
-## [Unreleased]
+## [0.5.0] - 2026-11-10
 
 ### Added
 
@@ -144,7 +144,7 @@
 - schema 17 引入的 `cluster_goals.stall_ticks`、`stall_signature` 和
   `stalled_at` 保持兼容并继续用于跨 daemon 停滞检测。
 
-## [0.5.0] - 2026-11-08
+## [0.5.0-preview] - 2026-11-08
 
 ### Changed
 
