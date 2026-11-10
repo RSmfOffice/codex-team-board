@@ -339,6 +339,19 @@ class FakeExecProcess:
 
 
 class ClusterSchedulerTests(unittest.TestCase):
+    class _RunningProcessStub:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+            self.stdin = None
+            self.stdout = None
+            self.stderr = None
+
+        def poll(self) -> None:
+            return None
+
+        def wait(self, timeout: float | None = None) -> int:
+            return 0
+
     def _goal_with_ready_tasks(
         self,
         manager: ClusterManager,
@@ -367,6 +380,7 @@ class ClusterSchedulerTests(unittest.TestCase):
         team: TeamService,
         goal_id: str,
         *,
+        manager: ClusterManager | None = None,
         job_id: str,
         kind: str,
         status: str,
@@ -402,6 +416,8 @@ class ClusterSchedulerTests(unittest.TestCase):
                     None if status in {"starting", "running"} else started_at,
                 ),
             )
+        if manager is not None and status in {"starting", "running"} and pid:
+            manager.processes[job_id] = self._RunningProcessStub(pid)
 
     def _fake_running_dispatch(
         self,
@@ -1297,6 +1313,7 @@ class ClusterSchedulerTests(unittest.TestCase):
             self._insert_job(
                 team,
                 busy_goal["goal_id"],
+                manager=manager,
                 job_id="J-ACTIVE-LEAD",
                 kind="lead",
                 status="running",
@@ -1532,6 +1549,7 @@ class ClusterSchedulerTests(unittest.TestCase):
             self._insert_job(
                 team,
                 goal["goal_id"],
+                manager=manager,
                 job_id="J-ACTIVE-LEAD",
                 kind="lead",
                 status="running",
@@ -1654,6 +1672,7 @@ class ClusterSchedulerTests(unittest.TestCase):
             self._insert_job(
                 team,
                 goal["goal_id"],
+                manager=manager,
                 job_id="J-HEALTH",
                 task_id=task["task_id"],
                 kind="worker",

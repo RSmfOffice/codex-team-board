@@ -7,13 +7,16 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
 from codex_team.cluster import (
+    ClusterError,
     ClusterManager,
     daemon_paths,
     daemon_status,
+    ensure_daemon,
     stop_daemon,
 )
 from codex_team.clusterd import acquire_lock as acquire_clusterd_lock
@@ -82,6 +85,9 @@ class ProcessIdentityTests(unittest.TestCase):
             forged[field] = value
             with self.subTest(field=field):
                 self.assertFalse(process_identity_matches(forged))
+        empty_executable = dict(identity)
+        empty_executable["executable"] = ""
+        self.assertFalse(process_identity_matches(empty_executable))
 
     def test_daemon_status_rejects_forged_pid_instance(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -104,22 +110,27 @@ class ProcessIdentityTests(unittest.TestCase):
             status = daemon_status(settings)
             self.assertFalse(status["running"])
             self.assertFalse(status["process_identity_verified"])
+            self.assertTrue(status["unverified_live_process"])
             with patch("codex_team.cluster.subprocess.run") as run:
-                stopped = stop_daemon(settings)
+                with self.assertRaisesRegex(
+                    ClusterError,
+                    "unverified live process",
+                ):
+                    stop_daemon(settings)
             run.assert_not_called()
-            self.assertEqual(stopped["stale_pid"], os.getpid())
-            self.assertIsNone(stopped["stopped_pid"])
-            self.assertFalse(lock_path.exists())
+            self.assertTrue(lock_path.exists())
 
     def test_daemon_status_requires_lock_pid_to_match_identity(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             settings = _settings(Path(temporary))
             lock_path, _, _ = daemon_paths(settings)
             lock_path.parent.mkdir(parents=True)
+            exited = subprocess.Popen([sys.executable, "-c", "pass"])
+            exited.wait(timeout=5)
             lock_path.write_text(
                 json.dumps(
                     {
-                        "pid": os.getpid() + 1,
+                        "pid": exited.pid,
                         "process_identity": current_process_identity(),
                         "started_at": utc_now(),
                     }
@@ -135,7 +146,7 @@ class ProcessIdentityTests(unittest.TestCase):
             run.assert_not_called()
             self.assertIsNone(stopped["stopped_pid"])
 
-    def test_daemon_lock_replaces_forged_owner_with_verified_identity(self) -> None:
+    def test_daemon_lock_rejects_forged_live_owner(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             settings = _settings(Path(temporary))
             lock_path, _, _ = daemon_paths(settings)
@@ -147,12 +158,80 @@ class ProcessIdentityTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with acquire_clusterd_lock(settings):
-                owner = json.loads(lock_path.read_text(encoding="utf-8"))
-                self.assertTrue(
-                    process_identity_matches(owner["process_identity"])
-                )
-            self.assertFalse(lock_path.exists())
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "unverified live process",
+            ):
+                with acquire_clusterd_lock(settings):
+                    self.fail("forged live lock must not be replaced")
+            self.assertTrue(lock_path.exists())
+            with self.assertRaisesRegex(
+                ClusterError,
+                "unverified live process",
+            ):
+                stop_daemon(settings)
+            self.assertTrue(lock_path.exists())
+
+    def test_daemon_lock_rejects_legacy_live_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = _settings(Path(temporary))
+            lock_path, _, _ = daemon_paths(settings)
+            lock_path.parent.mkdir(parents=True)
+            lock_path.write_text(
+                json.dumps(
+                    {
+                        "pid": os.getpid(),
+                        "started_at": utc_now(),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            status = daemon_status(settings)
+            self.assertFalse(status["running"])
+            self.assertTrue(status["unverified_live_process"])
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "stop the legacy daemon",
+            ):
+                with acquire_clusterd_lock(settings):
+                    self.fail("legacy live lock must not be replaced")
+            self.assertTrue(lock_path.exists())
+            with self.assertRaisesRegex(
+                ClusterError,
+                "stop the legacy daemon",
+            ):
+                stop_daemon(settings)
+            self.assertTrue(lock_path.exists())
+            with patch("codex_team.cluster.subprocess.Popen") as popen:
+                with self.assertRaisesRegex(
+                    ClusterError,
+                    "stop the legacy daemon",
+                ):
+                    ensure_daemon(settings)
+            popen.assert_not_called()
+            self.assertTrue(lock_path.exists())
+
+    def test_daemon_lock_rejects_corrupt_unverifiable_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = _settings(Path(temporary))
+            lock_path, _, _ = daemon_paths(settings)
+            lock_path.parent.mkdir(parents=True)
+            lock_path.write_text("{", encoding="utf-8")
+
+            status = daemon_status(settings)
+            self.assertFalse(status["running"])
+            self.assertFalse(status["lock_state_valid"])
+            with self.assertRaisesRegex(RuntimeError, "lock is corrupt"):
+                with acquire_clusterd_lock(settings):
+                    self.fail("corrupt lock must not be replaced")
+            with self.assertRaisesRegex(ClusterError, "lock is corrupt"):
+                stop_daemon(settings)
+            with patch("codex_team.cluster.subprocess.Popen") as popen:
+                with self.assertRaisesRegex(ClusterError, "lock is corrupt"):
+                    ensure_daemon(settings)
+            popen.assert_not_called()
+            self.assertTrue(lock_path.exists())
 
     def test_unverified_persisted_identity_is_not_running(self) -> None:
         identity = current_process_identity()
@@ -192,6 +271,55 @@ class WindowsJobObjectTests(unittest.TestCase):
             self.assertEqual(stopped["stopped_pid"], process.pid)
             process.wait(timeout=5)
             self.assertFalse(pid_is_running(process.pid))
+
+    def test_daemon_stop_does_not_unlink_while_verified_pid_lives(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = _settings(Path(temporary))
+            lock_path, _, _ = daemon_paths(settings)
+            lock_path.parent.mkdir(parents=True)
+            process = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            identity = process_identity(process.pid)
+            self.assertTrue(identity)
+            lock_path.write_text(
+                json.dumps(
+                    {
+                        "pid": process.pid,
+                        "process_identity": identity,
+                        "started_at": utc_now(),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            try:
+                with patch(
+                    "codex_team.cluster.subprocess.run",
+                    return_value=subprocess.CompletedProcess(
+                        [],
+                        0,
+                        stdout="",
+                        stderr="",
+                    ),
+                ), patch(
+                    "codex_team.cluster._wait_for_pid_exit",
+                    return_value=False,
+                ):
+                    with self.assertRaisesRegex(
+                        ClusterError,
+                        "still running after stop",
+                    ):
+                        stop_daemon(settings)
+                self.assertTrue(lock_path.exists())
+                self.assertTrue(pid_is_running(process.pid))
+            finally:
+                process.kill()
+                process.wait(timeout=5)
 
     def test_job_object_close_terminates_descendant_tree(self) -> None:
         process = subprocess.Popen(
@@ -352,6 +480,223 @@ class WindowsJobObjectTests(unittest.TestCase):
                 self.assertIsNotNone(failed["settled_at"])
                 self.assertIn("assignment failed", failed["error"])
             finally:
+                manager.close()
+
+    def test_reconcile_terminates_verified_ownerless_job_and_marks_lost(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime_mode="exec",
+            )
+            process = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                repo = _repo(base, "ownerless-live")
+                goal = manager.create_goal(
+                    repo,
+                    objective="Settle an ownerless live exec job",
+                )
+                task = team.create_task(
+                    repo,
+                    title="Ownerless live job",
+                    description="The job has identity but no local Popen.",
+                    acceptance="It is terminated once and settled lost.",
+                    kind="read",
+                    owner_role="team_explorer",
+                    goal_id=goal["goal_id"],
+                )
+                identity = process_identity(process.pid)
+                self.assertTrue(identity)
+                with team.connection() as connection:
+                    connection.execute(
+                        """
+                        INSERT INTO cluster_jobs(
+                            job_id, goal_id, task_id, kind, role, status,
+                            pid, process_creation_time, process_executable,
+                            process_instance_id, attempt, log_path,
+                            output_path, started_at
+                        ) VALUES (
+                            'J-OWNERLESS', ?, ?, 'worker', 'team_explorer',
+                            'running', ?, ?, ?, ?, 1, ?, ?, ?
+                        )
+                        """,
+                        (
+                            goal["goal_id"],
+                            task["task_id"],
+                            identity["pid"],
+                            identity["creation_time"],
+                            identity["executable"],
+                            identity["instance_id"],
+                            str(base / "ownerless.log"),
+                            str(base / "ownerless.out"),
+                            utc_now(),
+                        ),
+                    )
+
+                real_run = subprocess.run
+                commands: list[list[str]] = []
+
+                def recording_run(command, *args, **kwargs):
+                    commands.append(list(command))
+                    return real_run(command, *args, **kwargs)
+
+                with patch(
+                    "codex_team.cluster.subprocess.run",
+                    side_effect=recording_run,
+                ):
+                    manager._reconcile_jobs()
+
+                process.wait(timeout=5)
+                self.assertIn(
+                    [
+                        "taskkill",
+                        "/PID",
+                        str(identity["pid"]),
+                        "/T",
+                        "/F",
+                    ],
+                    commands,
+                )
+                lost = next(
+                    job
+                    for job in manager.get_goal(goal["goal_id"])["jobs"]
+                    if job["job_id"] == "J-OWNERLESS"
+                )
+                self.assertEqual(lost["status"], "lost")
+                self.assertEqual(lost["outcome"], "lost")
+                self.assertIsNotNone(lost["settled_at"])
+                self.assertEqual(
+                    team.get_task(task["task_id"])["status"],
+                    "ready",
+                )
+                self.assertFalse(pid_is_running(identity["pid"]))
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=5)
+                manager.close()
+
+    def test_exec_db_finalize_failure_kills_process_and_settles_failed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime_mode="exec",
+            )
+            repo = _repo(base, "exec-db-finalize-failure")
+            goal = manager.create_goal(
+                repo,
+                objective="Clean up after a DB finalize failure",
+            )
+            task = team.create_task(
+                repo,
+                title="Fail running-row finalization",
+                description="The launched process must not survive.",
+                acceptance="The process is killed and the job is failed.",
+                kind="read",
+                owner_role="team_explorer",
+                goal_id=goal["goal_id"],
+            )
+            real_connection = team.connection
+            failed_once = False
+
+            @contextmanager
+            def failing_connection(*args, **kwargs):
+                nonlocal failed_once
+                with real_connection(*args, **kwargs) as connection:
+                    class Proxy:
+                        def execute(self, sql, parameters=()):
+                            nonlocal failed_once
+                            if (
+                                not failed_once
+                                and "SET status = 'running'" in sql
+                            ):
+                                failed_once = True
+                                raise RuntimeError("database finalize failed")
+                            return connection.execute(sql, parameters)
+
+                        def __getattr__(self, name):
+                            return getattr(connection, name)
+
+                    yield Proxy()
+
+            real_popen = subprocess.Popen
+            launched: list[subprocess.Popen] = []
+            exec_command = [
+                sys.executable,
+                "-c",
+                "import time; time.sleep(60)",
+            ]
+
+            def recording_popen(*args, **kwargs):
+                process = real_popen(*args, **kwargs)
+                if args and list(args[0]) == exec_command:
+                    launched.append(process)
+                return process
+
+            try:
+                with patch.object(
+                    manager,
+                    "_build_command",
+                    return_value=exec_command,
+                ), patch.object(
+                    team,
+                    "connection",
+                    side_effect=failing_connection,
+                ), patch(
+                    "codex_team.cluster.subprocess.Popen",
+                    side_effect=recording_popen,
+                ):
+                    with self.assertRaisesRegex(
+                        ClusterError,
+                        "database finalize failed",
+                    ):
+                        manager._dispatch_worker(
+                            manager.get_goal(goal["goal_id"]),
+                            team.get_task(task["task_id"]),
+                        )
+
+                self.assertEqual(len(launched), 1)
+                self.assertFalse(pid_is_running(launched[0].pid))
+                self.assertFalse(manager.processes)
+                self.assertFalse(manager.process_jobs)
+                self.assertFalse(manager.log_threads)
+                with team.connection(write=False) as connection:
+                    failed = connection.execute(
+                        """
+                        SELECT status, outcome, error, settled_at
+                        FROM cluster_jobs
+                        WHERE goal_id = ?
+                        ORDER BY rowid DESC
+                        LIMIT 1
+                        """,
+                        (goal["goal_id"],),
+                    ).fetchone()
+                self.assertIsNotNone(failed)
+                self.assertEqual(failed["status"], "failed")
+                self.assertEqual(failed["outcome"], "failed")
+                self.assertIn("database finalize failed", failed["error"])
+                self.assertIsNotNone(failed["settled_at"])
+            finally:
+                for process in launched:
+                    if process.poll() is None:
+                        process.kill()
+                    process.wait(timeout=5)
                 manager.close()
 
     def test_exec_daemon_restart_closes_tree_and_settles_job_lost(self) -> None:

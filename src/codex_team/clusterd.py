@@ -8,7 +8,12 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-from .cluster import ClusterManager, daemon_identity, daemon_paths
+from .cluster import (
+    ClusterManager,
+    daemon_identity,
+    daemon_lock_state,
+    daemon_paths,
+)
 from .config import Settings
 from .db import utc_now
 from .processes import (
@@ -41,33 +46,49 @@ def acquire_lock(settings: Settings) -> Iterator[None]:
             descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             break
         except FileExistsError:
-            try:
-                payload = json.loads(lock_path.read_text(encoding="utf-8"))
-            except (OSError, ValueError, TypeError):
-                payload = {}
-            if not isinstance(payload, dict):
-                payload = {}
-            recorded = identity_record(payload.get("process_identity"))
-            if process_identity_matches(recorded):
-                pid = recorded["pid"]
+            lock = daemon_lock_state(settings)
+            if not lock["exists"]:
+                continue
+            if lock["process_identity_verified"]:
+                pid = lock["pid"]
                 raise RuntimeError(f"cluster daemon already running (pid {pid})")
+            if lock["unverified_live_process"]:
+                raise RuntimeError(
+                    "cluster daemon lock contains an unverified live process "
+                    f"(pid {lock['pid']}); stop the legacy daemon before "
+                    "upgrading"
+                )
+            if not lock["state_valid"]:
+                raise RuntimeError(
+                    "cluster daemon lock is corrupt and cannot be verified; "
+                    f"confirm no daemon is running and remove {lock_path}"
+                )
             try:
                 lock_path.unlink()
             except FileNotFoundError:
                 pass
     if descriptor is None:
         raise RuntimeError("could not acquire cluster daemon lock")
-    os.write(
-        descriptor,
-        json.dumps(
-            {
-                "pid": os.getpid(),
-                "process_identity": owner_identity,
-                "started_at": utc_now(),
-            }
-        ).encode("utf-8"),
-    )
-    os.close(descriptor)
+    try:
+        os.write(
+            descriptor,
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "process_identity": owner_identity,
+                    "started_at": utc_now(),
+                }
+            ).encode("utf-8"),
+        )
+    except Exception:
+        os.close(descriptor)
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    else:
+        os.close(descriptor)
     try:
         yield
     finally:

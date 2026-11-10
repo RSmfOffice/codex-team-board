@@ -27,6 +27,7 @@ from .processes import (
     persisted_identity_fields,
     persisted_process_identity,
     persisted_process_is_running,
+    pid_is_running,
     process_identity,
     process_identity_matches,
 )
@@ -3114,7 +3115,46 @@ Do not return raw logs or a full transcript.
             if process.stdin:
                 process.stdin.write(prompt)
                 process.stdin.close()
+            self.processes[job_id] = process
+            if process_job is not None:
+                self.process_jobs[job_id] = process_job
+            identity_fields = persisted_identity_fields(process_record)
+            with self.team.connection() as connection:
+                connection.execute(
+                    """
+                    UPDATE cluster_jobs
+                    SET status = 'running', pid = ?,
+                        process_creation_time = ?,
+                        process_executable = ?,
+                        process_instance_id = ?,
+                        thread_id = ?,
+                        thread_action = ?
+                    WHERE job_id = ?
+                    """,
+                    (
+                        process.pid,
+                        identity_fields["process_creation_time"],
+                        identity_fields["process_executable"],
+                        identity_fields["process_instance_id"],
+                        resume_thread_id,
+                        thread_action,
+                        job_id,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE cluster_goals
+                    SET status = CASE WHEN status = 'planning' THEN 'active' ELSE status END,
+                        updated_at = ?
+                    WHERE goal_id = ?
+                    """,
+                    (utc_now(), goal["goal_id"]),
+                )
         except Exception as exc:
+            self.processes.pop(job_id, None)
+            recorded_job = self.process_jobs.pop(job_id, None)
+            if recorded_job is not None:
+                process_job = recorded_job
             if process is not None:
                 if process_job is not None:
                     process_job.close()
@@ -3138,61 +3178,35 @@ Do not return raw logs or a full transcript.
                         stream.close()
                     except (OSError, ValueError):
                         pass
+            pump = self.log_threads.pop(job_id, None)
+            if pump is not None:
+                pump.join(timeout=5)
             safe_error = self._redact_error(str(exc))
-            with self.team.connection() as connection:
-                if self._settle_job_row(
-                    connection,
-                    job_id,
-                    status="failed",
-                    error=safe_error,
-                    exit_code=None,
-                    thread_action=thread_action,
-                ):
-                    self._event(
+            try:
+                with self.team.connection() as connection:
+                    if self._settle_job_row(
                         connection,
-                        goal["goal_id"],
-                        "job_start_failed",
-                        "teamd",
-                        {"job_id": job_id, "error": safe_error},
-                    )
+                        job_id,
+                        status="failed",
+                        error=safe_error,
+                        exit_code=None,
+                        thread_action=thread_action,
+                    ):
+                        self._event(
+                            connection,
+                            goal["goal_id"],
+                            "job_start_failed",
+                            "teamd",
+                            {"job_id": job_id, "error": safe_error},
+                        )
+            except Exception as settlement_exc:
+                settlement_error = self._redact_error(str(settlement_exc))
+                safe_error = (
+                    f"{safe_error}; failed to settle job: {settlement_error}"
+                )
             raise ClusterError(
                 f"could not start {kind} process: {safe_error}"
             ) from exc
-        self.processes[job_id] = process
-        if process_job is not None:
-            self.process_jobs[job_id] = process_job
-        identity_fields = persisted_identity_fields(process_record)
-        with self.team.connection() as connection:
-            connection.execute(
-                """
-                UPDATE cluster_jobs
-                SET status = 'running', pid = ?,
-                    process_creation_time = ?,
-                    process_executable = ?,
-                    process_instance_id = ?,
-                    thread_id = ?,
-                    thread_action = ?
-                WHERE job_id = ?
-                """,
-                (
-                    process.pid,
-                    identity_fields["process_creation_time"],
-                    identity_fields["process_executable"],
-                    identity_fields["process_instance_id"],
-                    resume_thread_id,
-                    thread_action,
-                    job_id,
-                ),
-            )
-            connection.execute(
-                """
-                UPDATE cluster_goals
-                SET status = CASE WHEN status = 'planning' THEN 'active' ELSE status END,
-                    updated_at = ?
-                WHERE goal_id = ?
-                """,
-                (utc_now(), goal["goal_id"]),
-            )
         return {
             "job_id": job_id,
             "goal_id": goal["goal_id"],
@@ -4413,16 +4427,22 @@ Do not return raw logs or a full transcript.
                 continue
             process = self.processes.get(job["job_id"])
             if self._job_timed_out(job):
-                if process is not None and process.poll() is None:
-                    self._terminate_exec_job(job, exit_code=-9)
+                terminated = self._terminate_exec_job(job, exit_code=-9)
+                if (
+                    process is None
+                    and persisted_process_is_running(job)
+                    and not terminated
+                ):
+                    continue
                 self._finish_job(job, -9, forced_error="job timeout")
                 continue
             exit_code = process.poll() if process is not None else None
             if process is not None and exit_code is None:
                 continue
-            if process is None and persisted_process_is_running(job):
-                continue
             if process is None:
+                if persisted_process_is_running(job):
+                    if not self._terminate_exec_job(job, exit_code=-9):
+                        continue
                 self._finish_job(
                     job,
                     exit_code,
@@ -5609,15 +5629,18 @@ Do not return raw logs or a full transcript.
             expected = persisted_process_identity(job)
             if not process_identity_matches(expected):
                 return False
-            result = subprocess.run(
+            subprocess.run(
                 ["taskkill", "/PID", str(expected["pid"]), "/T", "/F"],
                 capture_output=True,
                 text=True,
                 check=False,
             )
-            terminated = result.returncode == 0 or not process_identity_matches(
-                expected
-            )
+            deadline = time.monotonic() + 5
+            while process_identity_matches(expected):
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.02)
+            terminated = not process_identity_matches(expected)
         if process is not None:
             try:
                 process.wait(timeout=5)
@@ -6188,6 +6211,44 @@ def daemon_paths(settings: Settings) -> tuple[Path, Path, Path]:
     )
 
 
+def daemon_lock_state(settings: Settings) -> dict[str, Any]:
+    lock_path, _, _ = daemon_paths(settings)
+    exists = lock_path.exists()
+    payload: dict[str, Any] = {}
+    state_valid = False
+    if exists:
+        try:
+            parsed = json.loads(lock_path.read_text(encoding="utf-8"))
+            if isinstance(parsed, dict):
+                payload = parsed
+                state_valid = True
+        except (OSError, ValueError, TypeError):
+            pass
+    try:
+        pid = int(payload.get("pid") or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    recorded = identity_record(payload.get("process_identity"))
+    verified = bool(
+        pid > 0
+        and recorded
+        and int(recorded.get("pid") or 0) == pid
+        and process_identity_matches(recorded)
+    )
+    pid_running = bool(pid > 0 and pid_is_running(pid))
+    return {
+        "exists": exists,
+        "path": lock_path,
+        "payload": payload,
+        "state_valid": state_valid and pid > 0,
+        "pid": pid,
+        "process_identity": recorded,
+        "process_identity_verified": verified,
+        "pid_running": pid_running,
+        "unverified_live_process": bool(pid_running and not verified),
+    }
+
+
 def daemon_identity(settings: Settings) -> dict[str, Any]:
     runtime = _runtime_mode(os.environ.get("CODEX_TEAM_AGENT_RUNTIME"))
     model = os.environ.get("CODEX_TEAM_MODEL", "").strip()
@@ -6210,15 +6271,9 @@ def daemon_identity(settings: Settings) -> dict[str, Any]:
 
 def daemon_status(settings: Settings) -> dict[str, Any]:
     lock_path, state_path, log_path = daemon_paths(settings)
-    pid = 0
-    lock_state: dict[str, Any] = {}
-    try:
-        payload = json.loads(lock_path.read_text(encoding="utf-8"))
-        if isinstance(payload, dict):
-            lock_state = payload
-            pid = int(payload.get("pid", 0))
-    except (OSError, ValueError, TypeError):
-        pass
+    lock = daemon_lock_state(settings)
+    pid = int(lock["pid"])
+    lock_state = lock["payload"]
     state: dict[str, Any] = {}
     try:
         state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -6226,21 +6281,17 @@ def daemon_status(settings: Settings) -> dict[str, Any]:
         pass
     expected_identity = daemon_identity(settings)
     actual_identity = state.get("identity") if isinstance(state, dict) else None
-    recorded_process = identity_record(
-        lock_state.get("process_identity")
-        if isinstance(lock_state, dict)
-        else None
-    )
-    process_verified = bool(
-        recorded_process
-        and int(recorded_process.get("pid") or 0) == pid
-        and process_identity_matches(recorded_process)
-    )
+    recorded_process = lock["process_identity"]
+    process_verified = bool(lock["process_identity_verified"])
     return {
         "running": process_verified,
         "pid": pid or None,
         "process_identity": recorded_process or None,
         "process_identity_verified": process_verified,
+        "lock_state_valid": bool(lock["state_valid"]),
+        "lock_state": lock_state,
+        "pid_running": bool(lock["pid_running"]),
+        "unverified_live_process": bool(lock["unverified_live_process"]),
         "lock_path": str(lock_path),
         "state_path": str(state_path),
         "log_path": str(log_path),
@@ -6258,6 +6309,16 @@ def ensure_daemon(settings: Settings) -> dict[str, Any]:
     if current["running"]:
         return current
     lock_path, state_path, log_path = daemon_paths(settings)
+    if current["unverified_live_process"]:
+        raise ClusterError(
+            "cluster daemon lock contains an unverified live process "
+            f"(pid {current['pid']}); stop the legacy daemon before upgrading"
+        )
+    if current["lock_state_valid"] is False and lock_path.exists():
+        raise ClusterError(
+            "cluster daemon lock is corrupt and cannot be verified; "
+            f"confirm no daemon is running and remove {lock_path}"
+        )
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     package_root = settings.project_root / "src"
     environment = os.environ.copy()
@@ -6303,6 +6364,15 @@ def ensure_daemon(settings: Settings) -> dict[str, Any]:
     raise ClusterError(f"cluster daemon failed to start; see {log_path}")
 
 
+def _wait_for_pid_exit(pid: int, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while pid_is_running(pid):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.02)
+    return True
+
+
 def stop_daemon(settings: Settings) -> dict[str, Any]:
     current = daemon_status(settings)
     pid = int(current.get("pid") or 0)
@@ -6314,15 +6384,30 @@ def stop_daemon(settings: Settings) -> dict[str, Any]:
             text=True,
             check=False,
         )
-        terminated = result.returncode == 0
-        if not terminated:
-            recorded = identity_record(current.get("process_identity"))
-            if process_identity_matches(recorded):
+        if not _wait_for_pid_exit(pid):
+            if result.returncode != 0:
                 raise ClusterError(
                     f"verified cluster daemon pid {pid} did not stop"
                 )
-            terminated = True
+            raise ClusterError(
+                f"cluster daemon pid {pid} is still running after stop"
+            )
+        terminated = True
     lock_path, _, _ = daemon_paths(settings)
+    if current.get("unverified_live_process"):
+        raise ClusterError(
+            "cluster daemon lock contains an unverified live process "
+            f"(pid {pid}); stop the legacy daemon manually before removing "
+            f"{lock_path}"
+        )
+    if (
+        current.get("lock_state_valid") is False
+        and lock_path.exists()
+    ):
+        raise ClusterError(
+            "cluster daemon lock is corrupt and cannot be verified; "
+            f"confirm no daemon is running and remove {lock_path}"
+        )
     try:
         lock_path.unlink()
     except FileNotFoundError:

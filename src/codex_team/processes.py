@@ -76,9 +76,10 @@ def _identity_from_parts(
     executable: object,
 ) -> dict[str, Any]:
     creation_text = str(creation_time or "").strip()
-    executable_text = os.path.normpath(str(executable or "").strip())
-    if pid <= 0 or not creation_text or not executable_text:
+    executable_value = str(executable or "").strip()
+    if pid <= 0 or not creation_text or not executable_value:
         return {}
+    executable_text = os.path.normpath(executable_value)
     return {
         "pid": pid,
         "creation_time": creation_text,
