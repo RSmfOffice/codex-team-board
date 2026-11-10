@@ -386,18 +386,31 @@ Merge commit:
 
 ### Phase 4B：调度状态机与 Tick 流水线
 
-状态：未开始
+状态：代码与自动化验收完成，等待 Lead diff Review 和合并
 
-- [ ] 将 tick 拆成 settle/recover/control/prepare/dispatch/health/publish 阶段。
-- [ ] 每个阶段输出耗时与计数。
-- [ ] 修复 `planning` goal 在全部任务终态时直接尝试 `completed` 的非法转换；
+- [x] 将 tick 拆成 settle/recover/control/prepare/dispatch/health/publish 阶段。
+- [x] 每个阶段输出耗时、计数、成功状态和失败错误。
+- [x] 修复 `planning` goal 在全部任务终态时直接尝试 `completed` 的非法转换；
   应由 prepare 阶段显式执行可审计的 `planning -> active -> completed` 收敛。
-- [ ] 覆盖并发 tick、daemon 重启、空任务 Goal 和 terminal reconciliation。
+- [x] 覆盖并发 tick、daemon 重启、空任务 Goal 和 terminal reconciliation。
+- [x] 业务阶段失败时停止后续阶段，但仍发布失败状态与 skipped phases。
+- [x] 将 `workflow_epoch` 语义版本升级到 `workflow-v2`。
 
 验收：
 
 - 每次 tick 的阶段顺序固定，任一阶段失败能定位到具体阶段。
 - Goal 状态转换全部符合显式状态机，不再依赖调用方绕过非法转换。
+
+本轮验证：
+
+```text
+174 tests OK, 1 skipped
+dashboard-ui-smoke: ok
+compileall ok
+Core tools: team_read, team_write
+Core schema hash:
+86e78eef5f5f631094f5218d763c83997f5ab52d1ba22877f93092720f93fca6
+```
 
 ---
 

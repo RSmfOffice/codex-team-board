@@ -66,6 +66,15 @@ LEAD_TIMEOUT_SECONDS = DEFAULT_LEAD_TIMEOUT_SECONDS
 FAIRNESS_DEFERRED_INTERVAL_SECONDS = 60
 WORKER_ACTIVITY_EVENT_TYPES = ("claimed", "heartbeat", "progress")
 RUNTIME_MODES = frozenset({"exec", "app_server"})
+TICK_PHASE_ORDER = (
+    "settle",
+    "recover",
+    "control",
+    "prepare",
+    "dispatch",
+    "health",
+    "publish",
+)
 LEAD_DEVELOPER_INSTRUCTIONS = """You are the managed Lead for an automated
 Codex work cluster. Do not spawn subagents; the deterministic teamd dispatcher
 launches Workers. You may use shell tools and the stable codexTeamBoard Core
@@ -353,6 +362,7 @@ class ClusterManager:
         self.app_thread_jobs: dict[str, str] = {}
         self.app_turn_jobs: dict[str, str] = {}
         self._app_state_lock = threading.RLock()
+        self._tick_lock = threading.Lock()
         self._runtime_fallback_reason = ""
         self.runtime = runtime
         if self.runtime is None and self.agent_runtime == "app_server":
@@ -1337,26 +1347,163 @@ class ClusterManager:
             self.runtime.stop()
 
     def tick(self) -> dict[str, Any]:
-        self._apply_agent_reset_requests()
-        self._sync_project_agent_archive()
-        worktree_recovery = self.worktrees.recover_pending()
-        self._reconcile_jobs()
-        self._check_worker_health()
-        goals = self.list_goals(["planning", "active"])
-        schedulable: list[dict[str, Any]] = []
-        for goal in goals:
-            if self._prepare_goal(goal):
-                schedulable.append(goal)
-        scheduled = self._schedule_goals(schedulable)
-        self._check_goal_stalls(goals, scheduled)
-        return {
-            "tick_at": utc_now(),
-            "scheduled": scheduled,
-            "goals": len(goals),
-            "worktree_recovery": worktree_recovery,
+        with self._tick_lock:
+            return self._tick_locked()
+
+    def _tick_locked(self) -> dict[str, Any]:
+        tick_id = self._new_id("TICK")
+        phases: list[dict[str, Any]] = []
+        phase_data: dict[str, Any] = {
+            "worktree_recovery": [],
+            "scheduled": [],
+            "goals": [],
+            "failed_phase": None,
+            "error": "",
         }
 
-    def _sync_project_agent_archive(self) -> None:
+        def run_phase(name: str, action: Any) -> bool:
+            started = time.perf_counter()
+            try:
+                counts = action()
+                if not isinstance(counts, Mapping):
+                    counts = {"count": int(counts or 0)}
+                phases.append(
+                    {
+                        "name": name,
+                        "ok": True,
+                        "duration_ms": round(
+                            (time.perf_counter() - started) * 1000,
+                            3,
+                        ),
+                        "counts": dict(counts),
+                    }
+                )
+                return True
+            except Exception as exc:
+                message = self._redact_error(str(exc))
+                phase_data["failed_phase"] = name
+                phase_data["error"] = message
+                phases.append(
+                    {
+                        "name": name,
+                        "ok": False,
+                        "duration_ms": round(
+                            (time.perf_counter() - started) * 1000,
+                            3,
+                        ),
+                        "counts": {"count": 0},
+                        "error": message,
+                    }
+                )
+                return False
+
+        def settle() -> Mapping[str, Any]:
+            return self._reconcile_jobs()
+
+        def recover() -> Mapping[str, Any]:
+            recovered = self.worktrees.recover_pending()
+            phase_data["worktree_recovery"] = recovered
+            return {
+                "count": len(recovered),
+                "completed": sum(
+                    item.get("status") == "completed" for item in recovered
+                ),
+                "failed": sum(
+                    item.get("status") == "failed" for item in recovered
+                ),
+            }
+
+        def control() -> Mapping[str, Any]:
+            reset_counts = self._apply_agent_reset_requests()
+            archive_counts = self._sync_project_agent_archive()
+            return {
+                "count": int(reset_counts.get("count", 0))
+                + int(archive_counts.get("count", 0)),
+                "agent_resets": int(reset_counts.get("count", 0)),
+                "project_archives": int(
+                    archive_counts.get("count", 0)
+                ),
+            }
+
+        def prepare() -> Mapping[str, Any]:
+            goals = self.list_goals(["planning", "active"])
+            schedulable: list[dict[str, Any]] = []
+            paused = 0
+            for goal in goals:
+                try:
+                    if self._prepare_goal(goal):
+                        schedulable.append(goal)
+                except WorkflowEpochMismatch as exc:
+                    self._pause_workflow_mismatch(goal, exc)
+                    paused += 1
+            phase_data["goals"] = goals
+            phase_data["schedulable"] = schedulable
+            return {
+                "count": len(goals),
+                "schedulable": len(schedulable),
+                "paused_epoch_mismatch": paused,
+            }
+
+        def dispatch() -> Mapping[str, Any]:
+            scheduled = self._schedule_goals(
+                list(phase_data.get("schedulable") or [])
+            )
+            phase_data["scheduled"] = scheduled
+            return {"count": len(scheduled)}
+
+        def health() -> Mapping[str, Any]:
+            worker_health = self._check_worker_health()
+            goal_health = self._check_goal_stalls(
+                list(phase_data.get("goals") or []),
+                list(phase_data.get("scheduled") or []),
+            )
+            return {
+                "count": int(worker_health.get("count", 0))
+                + int(goal_health.get("count", 0)),
+                "workers": int(worker_health.get("count", 0)),
+                "alerts": int(worker_health.get("alerts", 0)),
+                "goals": int(goal_health.get("count", 0)),
+            }
+
+        business_phases = (
+            ("settle", settle),
+            ("recover", recover),
+            ("control", control),
+            ("prepare", prepare),
+            ("dispatch", dispatch),
+            ("health", health),
+        )
+        for name, action in business_phases:
+            if not run_phase(name, action):
+                break
+
+        def publish() -> Mapping[str, Any]:
+            phase_data["tick_at"] = utc_now()
+            return {"count": 1}
+
+        run_phase("publish", publish)
+        completed_names = {phase["name"] for phase in phases}
+        skipped = [
+            name for name in TICK_PHASE_ORDER if name not in completed_names
+        ]
+        failed_phase = phase_data.get("failed_phase")
+        return {
+            "ok": failed_phase is None,
+            "tick_id": tick_id,
+            "tick_at": phase_data.get("tick_at") or utc_now(),
+            "phase_order": list(TICK_PHASE_ORDER),
+            "phases": phases,
+            "failed_phase": failed_phase,
+            "skipped_phases": skipped,
+            "error": phase_data.get("error") or "",
+            "scheduled": list(phase_data.get("scheduled") or []),
+            "goals": len(phase_data.get("goals") or []),
+            "worktree_recovery": list(
+                phase_data.get("worktree_recovery") or []
+            ),
+        }
+
+    def _sync_project_agent_archive(self) -> dict[str, Any]:
         with self.team.connection(write=False) as connection:
             projects = [
                 dict(row)
@@ -1378,17 +1525,27 @@ class ClusterManager:
                     """
                 ).fetchall()
             ]
+        processed = 0
+        failed = 0
         for project in projects:
             try:
                 self.agent_pool.archive_project(
                     str(project["project_id"]),
                     project["archived_at"] is not None,
                 )
+                processed += 1
             except Exception:
                 # A live Agent can be cleaned up after the current job releases.
+                failed += 1
                 continue
+        return {
+            "count": processed + failed,
+            "processed": processed,
+            "failed": failed,
+        }
 
     def _prepare_goal(self, goal: dict[str, Any]) -> bool:
+        self._require_workflow_epoch(goal)
         goal_id = goal["goal_id"]
         root = Path(goal["root_path"])
         tasks = self.team.list_tasks(root, goal_id=goal_id, include_done=True)
@@ -1402,6 +1559,12 @@ class ClusterManager:
             and not active_workers
             and not active_lead
         ):
+            if goal["status"] == "planning":
+                self.set_goal_status(
+                    goal_id,
+                    "active",
+                    reason="terminal reconciliation",
+                )
             self.set_goal_status(goal_id, "completed", reason="all tasks completed")
             return False
         if (
@@ -1474,13 +1637,14 @@ class ClusterManager:
         self,
         goals: list[dict[str, Any]],
         scheduled: list[dict[str, Any]],
-    ) -> None:
+    ) -> dict[str, Any]:
         scheduled_goal_ids = {
             str(job.get("goal_id"))
             for job in scheduled
             if job.get("goal_id")
         }
         global_active_jobs = self._active_job_count()
+        paused = 0
         for candidate in goals:
             goal = self.get_goal(str(candidate["goal_id"]))
             if goal["status"] not in {"planning", "active"}:
@@ -1530,6 +1694,7 @@ class ClusterManager:
                     active_goal_jobs=active_goal_jobs,
                     global_active_jobs=global_active_jobs,
                 )
+                paused += 1
                 continue
             with self.team.connection() as connection:
                 connection.execute(
@@ -1540,6 +1705,10 @@ class ClusterManager:
                     """,
                     (stall_ticks, signature, goal_id),
                 )
+        return {
+            "count": len(goals),
+            "paused": paused,
+        }
 
     @staticmethod
     def _goal_stall_signature(
@@ -1784,22 +1953,7 @@ class ClusterManager:
             try:
                 return self._dispatch_lead(goal, tasks), True, True
             except WorkflowEpochMismatch as exc:
-                self.set_goal_status(
-                    goal_id,
-                    "paused",
-                    reason=str(exc),
-                )
-                with self.team.connection() as connection:
-                    self._event(
-                        connection,
-                        goal_id,
-                        "workflow_epoch_mismatch",
-                        "teamd",
-                        {
-                            "goal_epoch": goal.get("workflow_epoch"),
-                            "error": str(exc),
-                        },
-                    )
+                self._pause_workflow_mismatch(goal, exc)
                 return None, True, False
             except Exception as exc:
                 with self.team.connection() as connection:
@@ -1952,8 +2106,9 @@ class ClusterManager:
                 },
             )
 
-    def _check_worker_health(self) -> None:
+    def _check_worker_health(self) -> dict[str, Any]:
         now = datetime.now(UTC)
+        alerts = 0
         with self.team.connection(write=False) as connection:
             jobs = [
                 dict(row)
@@ -2008,6 +2163,7 @@ class ClusterManager:
                 last_activity,
             ):
                 continue
+            alerts += 1
             with self.team.connection() as connection:
                 self._event(
                     connection,
@@ -2028,6 +2184,10 @@ class ClusterManager:
                         "action": "alert",
                     },
                 )
+        return {
+            "count": len(jobs),
+            "alerts": alerts,
+        }
 
     def _worker_health_event_exists(
         self,
@@ -2250,6 +2410,29 @@ Do not return raw logs or a full transcript.
                 f"does not match current {current}; migrate it explicitly"
             )
         return current
+
+    def _pause_workflow_mismatch(
+        self,
+        goal: Mapping[str, Any],
+        error: WorkflowEpochMismatch,
+    ) -> None:
+        goal_id = str(goal["goal_id"])
+        self.set_goal_status(
+            goal_id,
+            "paused",
+            reason=str(error),
+        )
+        with self.team.connection() as connection:
+            self._event(
+                connection,
+                goal_id,
+                "workflow_epoch_mismatch",
+                "teamd",
+                {
+                    "goal_epoch": goal.get("workflow_epoch"),
+                    "error": str(error),
+                },
+            )
 
     @staticmethod
     def _worker_sandbox_mode(task: dict[str, Any]) -> str:
@@ -3813,7 +3996,7 @@ Do not return raw logs or a full transcript.
             "-",
         ]
 
-    def _apply_agent_reset_requests(self) -> None:
+    def _apply_agent_reset_requests(self) -> dict[str, Any]:
         with self.team.connection(write=False) as connection:
             pending = connection.execute(
                 """
@@ -3824,16 +4007,17 @@ Do not return raw logs or a full transcript.
                 """
             ).fetchone()
         if pending is None:
-            return
+            return {"count": 0, "applied": 0}
 
         def unsubscribe(thread_id: str) -> None:
             if self.runtime is None:
                 return
             self.runtime.unsubscribe_thread(thread_id)
 
-        self.agent_pool.apply_reset_requests(unsubscribe)
+        applied = self.agent_pool.apply_reset_requests(unsubscribe)
+        return {"count": len(applied), "applied": len(applied)}
 
-    def _reconcile_jobs(self) -> None:
+    def _reconcile_jobs(self) -> dict[str, Any]:
         with self.team.connection(write=False) as connection:
             rows = connection.execute(
                 """
@@ -3869,6 +4053,7 @@ Do not return raw logs or a full transcript.
             if process is None and job.get("pid") and pid_is_running(int(job["pid"])):
                 continue
             self._finish_job(job, exit_code)
+        return {"count": len(rows)}
 
     def _reconcile_app_server_job(self, job: dict[str, Any]) -> None:
         with self._app_state_lock:
