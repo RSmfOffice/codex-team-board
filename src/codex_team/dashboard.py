@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import ipaddress
 import threading
 import webbrowser
 from http import HTTPStatus
@@ -28,6 +29,42 @@ STATIC_FILES = {
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
     "/style.css": ("style.css", "text/css; charset=utf-8"),
 }
+
+
+def _authority_parts(value: str) -> tuple[str, int | None]:
+    parsed = urlsplit(f"//{value}")
+    if (
+        not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise ValueError("invalid Host header")
+    return parsed.hostname.rstrip(".").lower(), parsed.port
+
+
+def _is_loopback_host(hostname: str) -> bool:
+    if hostname.lower().rstrip(".") == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
+def _origin_matches_authority(origin: str, authority: str) -> bool:
+    parsed = urlsplit(origin)
+    if (
+        parsed.scheme.lower() != "http"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return False
+    host, port = _authority_parts(authority)
+    return (
+        parsed.hostname.rstrip(".").lower() == host
+        and (parsed.port or 80) == (port or 80)
+    )
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -115,6 +152,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self._send_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:  # noqa: N802
+        rejection = self._write_request_rejection()
+        if rejection is not None:
+            status, message = rejection
+            self._send_json({"error": message}, status=status)
+            return
         parsed = urlsplit(self.path)
         if parsed.path == "/api/clusters":
             self._create_cluster_goal()
@@ -164,6 +206,38 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 {"error": str(exc)},
                 status=HTTPStatus.BAD_REQUEST,
             )
+
+    def _write_request_rejection(
+        self,
+    ) -> tuple[HTTPStatus, str] | None:
+        authority = str(self.headers.get("Host") or "").strip()
+        try:
+            hostname, _ = _authority_parts(authority)
+        except ValueError:
+            return (
+                HTTPStatus.FORBIDDEN,
+                "write requests require a valid loopback Host header",
+            )
+        if not _is_loopback_host(hostname):
+            return (
+                HTTPStatus.FORBIDDEN,
+                "write requests require a loopback Host header",
+            )
+        content_type = str(
+            self.headers.get("Content-Type") or ""
+        ).split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            return (
+                HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+                "write requests require Content-Type application/json",
+            )
+        origin = str(self.headers.get("Origin") or "").strip()
+        if origin and not _origin_matches_authority(origin, authority):
+            return (
+                HTTPStatus.FORBIDDEN,
+                "write request Origin is not same-origin with Host",
+            )
+        return None
 
     def _reset_agent(self) -> None:
         try:
@@ -283,18 +357,26 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     goal_id,
                     reason="cancel requested through dashboard",
                 )
-            else:
-                status = "paused" if action == "pause" else "active"
+                daemon = daemon_status(self.team_service.settings)
+            elif action == "resume":
+                try:
+                    daemon = ensure_daemon(self.team_service.settings)
+                except Exception as exc:
+                    raise ClusterError(
+                        f"cluster daemon failed to start: {exc}"
+                    ) from exc
                 goal = cluster.set_goal_status(
                     goal_id,
-                    status,
-                    reason=f"{action} requested through dashboard",
+                    "active",
+                    reason="resume requested through dashboard",
                 )
-            daemon = (
-                ensure_daemon(self.team_service.settings)
-                if action == "resume"
-                else daemon_status(self.team_service.settings)
-            )
+            else:
+                goal = cluster.set_goal_status(
+                    goal_id,
+                    "paused",
+                    reason="pause requested through dashboard",
+                )
+                daemon = daemon_status(self.team_service.settings)
             self._send_json({"goal": goal, "daemon": daemon})
         except TeamError as exc:
             self._send_json(

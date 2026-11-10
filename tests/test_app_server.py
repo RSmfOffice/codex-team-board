@@ -352,12 +352,16 @@ class AppServerRuntimeTests(unittest.TestCase):
         base = self._temporary_base()
         secret = "claim-secret-value"
         api_secret = "api-secret-value"
+        colon_secret = "colon-secret-value"
+        colon_api_secret = "colon-api-secret-value"
         runtime = self._runtime(
             base,
             extra_env={
                 "FAKE_APP_SERVER_STDERR": (
                     f"diagnostic marker claim_token={secret} "
-                    f"OPENAI_API_KEY={api_secret}"
+                    f"OPENAI_API_KEY={api_secret} "
+                    f"claim_token: {colon_secret} "
+                    f"api_key: {colon_api_secret}"
                 ),
             },
         )
@@ -374,6 +378,8 @@ class AppServerRuntimeTests(unittest.TestCase):
         self.assertIn("[REDACTED]", logged)
         self.assertNotIn(secret, logged)
         self.assertNotIn(api_secret, logged)
+        self.assertNotIn(colon_secret, logged)
+        self.assertNotIn(colon_api_secret, logged)
 
     def test_concurrent_requests_are_correlated_by_jsonrpc_id(self) -> None:
         base = self._temporary_base()

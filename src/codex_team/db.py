@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -413,33 +414,50 @@ def utc_now() -> str:
 
 def connect(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(path, timeout=30)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute("PRAGMA foreign_keys=ON")
-    connection.execute("PRAGMA busy_timeout=5000")
-    connection.executescript(SCHEMA)
-    _upgrade_schema(connection)
-    connection.executescript(INDEXES)
-    connection.execute(
-        """
-        INSERT OR IGNORE INTO schema_migrations(version, applied_at)
-        VALUES (?, ?)
-        """,
-        (SCHEMA_VERSION, utc_now()),
-    )
-    connection.execute(
-        "INSERT OR REPLACE INTO metadata(key, value) VALUES ('schema_version', ?)",
-        (str(SCHEMA_VERSION),),
-    )
-    connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-    connection.commit()
-    return connection
+    for attempt in range(5):
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(path, timeout=30)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA foreign_keys=ON")
+            connection.execute("PRAGMA busy_timeout=5000")
+            connection.executescript(SCHEMA)
+            _upgrade_schema(connection)
+            connection.executescript(INDEXES)
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+                VALUES (?, ?)
+                """,
+                (SCHEMA_VERSION, utc_now()),
+            )
+            connection.execute(
+                "INSERT OR REPLACE INTO metadata(key, value) "
+                "VALUES ('schema_version', ?)",
+                (str(SCHEMA_VERSION),),
+            )
+            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            connection.commit()
+            return connection
+        except sqlite3.OperationalError as exc:
+            if connection is not None:
+                connection.close()
+            locked = "locked" in str(exc).lower() or "busy" in str(exc).lower()
+            if not locked or attempt == 4:
+                raise
+            time.sleep(0.05 * (2 ** attempt))
+        except Exception:
+            if connection is not None:
+                connection.close()
+            raise
+    raise sqlite3.OperationalError("database initialization retry exhausted")
 
 
 def connect_readonly(path: Path) -> sqlite3.Connection:
+    uri = path.expanduser().resolve().as_uri() + "?mode=ro"
     connection = sqlite3.connect(
-        f"file:{path.as_posix()}?mode=ro",
+        uri,
         uri=True,
         timeout=10,
     )

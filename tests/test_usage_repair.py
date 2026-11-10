@@ -2,15 +2,21 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from codex_team.config import Settings
 from codex_team.cluster import _parse_codex_log
-from codex_team.db import SCHEMA_VERSION, connect, utc_now
+from codex_team.db import (
+    SCHEMA_VERSION,
+    connect,
+    connect_readonly,
+    utc_now,
+)
 from codex_team.mcp import (
     _guard_tool_call,
     _visible_tool_definitions,
@@ -38,6 +44,69 @@ def _git(cwd: Path, *args: str) -> None:
 
 
 class UsageRepairTests(unittest.TestCase):
+    def test_database_uri_handles_special_paths_and_retries_locks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "team # data.sqlite"
+            connection = connect(path)
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO projects(
+                        project_id, name, root_path, created_at, updated_at
+                    ) VALUES ('P1', 'Special path', 'D:/special', ?, ?)
+                    """,
+                    (utc_now(), utc_now()),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            readonly = connect_readonly(path)
+            try:
+                self.assertEqual(
+                    readonly.execute(
+                        "SELECT project_id FROM projects"
+                    ).fetchone()[0],
+                    "P1",
+                )
+                with self.assertRaises(sqlite3.OperationalError):
+                    readonly.execute(
+                        "DELETE FROM projects WHERE project_id = 'P1'"
+                    )
+            finally:
+                readonly.close()
+
+            locked = Mock()
+            locked.execute.return_value = None
+            locked.executescript.side_effect = sqlite3.OperationalError(
+                "database is locked"
+            )
+            original_connect = sqlite3.connect
+            calls = 0
+
+            def factory(*args: object, **kwargs: object) -> sqlite3.Connection:
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    return locked
+                return original_connect(*args, **kwargs)
+
+            with (
+                patch("codex_team.db.sqlite3.connect", side_effect=factory),
+                patch("codex_team.db.time.sleep") as sleep,
+            ):
+                retried = connect(path)
+            try:
+                self.assertEqual(calls, 2)
+                sleep.assert_called_once_with(0.05)
+                locked.close.assert_called_once()
+                self.assertEqual(
+                    retried.execute("PRAGMA user_version").fetchone()[0],
+                    SCHEMA_VERSION,
+                )
+            finally:
+                retried.close()
+
     def test_exec_log_normalizes_first_and_final_usage(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             log = Path(temporary) / "job.jsonl"

@@ -66,11 +66,20 @@ class DashboardClusterControlTests(unittest.TestCase):
         self.thread.join(timeout=5)
         self.temporary.cleanup()
 
-    def post(self, path: str, payload: object) -> tuple[int, dict[str, object]]:
+    def post(
+        self,
+        path: str,
+        payload: object,
+        *,
+        content_type: str = "application/json",
+        extra_headers: dict[str, str] | None = None,
+    ) -> tuple[int, dict[str, object]]:
+        headers = {"Content-Type": content_type}
+        headers.update(extra_headers or {})
         request = urllib.request.Request(
             self.base_url + path,
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             method="POST",
         )
         try:
@@ -81,6 +90,54 @@ class DashboardClusterControlTests(unittest.TestCase):
                 return exc.code, json.loads(exc.read().decode("utf-8"))
             finally:
                 exc.close()
+
+    def test_write_requests_require_loopback_same_origin_json(self) -> None:
+        payload = {
+            "project_id": self.project["project_id"],
+            "objective": "Rejected unless local JSON",
+        }
+        status, body = self.post(
+            "/api/clusters",
+            payload,
+            extra_headers={"Host": "attacker.example"},
+        )
+        self.assertEqual(status, 403)
+        self.assertIn("loopback Host", body["error"])
+
+        status, body = self.post(
+            "/api/clusters",
+            payload,
+            extra_headers={"Origin": "https://attacker.example"},
+        )
+        self.assertEqual(status, 403)
+        self.assertIn("same-origin", body["error"])
+
+        status, body = self.post(
+            "/api/clusters",
+            payload,
+            content_type="text/plain",
+        )
+        self.assertEqual(status, 415)
+        self.assertIn("application/json", body["error"])
+        with self.team.connection(write=False) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM cluster_goals"
+                ).fetchone()[0],
+                0,
+            )
+
+        with patch(
+            "codex_team.dashboard.ensure_daemon",
+            return_value={"running": True, "pid": 1234},
+        ):
+            status, body = self.post(
+                "/api/clusters",
+                payload,
+                extra_headers={"Origin": self.base_url},
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["goal"]["status"], "planning")
 
     def get(self, path: str) -> dict[str, object]:
         with urllib.request.urlopen(self.base_url + path, timeout=5) as response:
@@ -483,6 +540,33 @@ class DashboardClusterControlTests(unittest.TestCase):
         self.assertEqual(
             json.loads(events[0]["data_json"])["reason"],
             "manual diagnostics reset",
+        )
+
+    def test_resume_daemon_failure_keeps_goal_paused(self) -> None:
+        cluster = ClusterManager(self.settings, team=self.team)
+        goal = cluster.create_goal(
+            self.repo,
+            objective="Resume only after daemon is healthy",
+        )
+        cluster.set_goal_status(
+            goal["goal_id"],
+            "paused",
+            reason="pause before resume failure",
+        )
+        with patch(
+            "codex_team.dashboard.ensure_daemon",
+            side_effect=RuntimeError("daemon start failed"),
+        ) as start_daemon:
+            status, body = self.post(
+                "/api/clusters/control",
+                {"goal_id": goal["goal_id"], "action": "resume"},
+            )
+        self.assertEqual(status, 409)
+        self.assertIn("failed to start", body["error"])
+        start_daemon.assert_called_once_with(self.settings)
+        self.assertEqual(
+            cluster.get_goal(goal["goal_id"])["status"],
+            "paused",
         )
 
     def test_malformed_json_returns_json_error(self) -> None:

@@ -18,7 +18,7 @@ from .prompt_contract import (
 
 CORE_SURFACE_VERSION = "core-v1"
 CACHE_PROFILE_PREFIX = "cache-v1"
-WORKFLOW_EPOCH_VERSION = "workflow-v2"
+WORKFLOW_EPOCH_VERSION = "workflow-v3"
 SURFACES = frozenset({"core", "admin", "legacy"})
 CURRENT_MANIFEST_HASH = bundled_manifest_hash()
 
