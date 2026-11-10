@@ -464,7 +464,7 @@ Merge commit:
 
 ### Phase 4D：Read Model 与 Dashboard 扩容
 
-状态：实现完成，待 Lead Review、合并和正式库 migration-v4
+状态：已完成并通过 Lead Review、主分支集成测试和正式库 migration-v4
 
 - [x] split dashboard API：summary、tasks、goals、events、agents、attempts。
 - [x] 使用 revision/ETag/cursor，避免每 2 秒读取全量 board。
@@ -493,12 +493,17 @@ Merge commit:
 - Core tool schema hash 保持
   `86e78eef5f5f631094f5218d763c83997f5ab52d1ba22877f93092720f93fca6`；
   Core schema 和数据库 schema 20 均未变化。
-- `WORKFLOW_EPOCH_VERSION` 升级为 `workflow-v4`；Live epoch 在 Lead 合并后
-  checkpoint、迁移并回填。
+- `WORKFLOW_EPOCH_VERSION` 升级为 `workflow-v4`；正式库已 checkpoint 并迁移到
+  `workflow-v4:72ec3d80b30cf89482fe1e119b48bf03`。
 - 130 个任务和 40 个事件的大 fixture 下，分区响应不超过 `limit`，事件连续
   两页无重复，summary payload 小于完整 board 的 1/4。
 - summary 请求门禁小于 5 秒，board 请求门禁小于 20 秒（本机测试远低于上限）。
 - task detail 不再依赖全局事件窗口。
+- Worker commit：`2b084c5cc88e3a5281f9e61d7cd51b0a19b11b0b`。
+- Lead merge：`1a372605b6171c2306250e2219c33935c443c796`。
+- Migration 前备份：
+  `team.sqlite.pre-workflow-v4-20261110T131221Z.bak`，备份
+  `PRAGMA integrity_check=ok`。
 
 ---
 
