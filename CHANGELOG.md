@@ -69,6 +69,11 @@
   偶然出现 task ID 仍保持 `missing`，未知/缺失状态不能 claim。
 - native Thread 可显示 runtime、prompt 状态、Agent 身份和父 Thread，避免把
   “已建线程但任务未送达”误判为正常 idle。
+- managed Thread 卡片派生显示 `contract current` 或
+  `contract historical · not reusable`，旧 profile 继续保留但默认明确标识。
+- write task 在 claim、submit 和 approve 时验证 worktree 路径归属、branch
+  归属、实际 checkout branch、主仓库隔离和 clean 状态；跨 task worktree 或
+  错误 branch 会在业务状态迁移前被拒绝。
 
 ### Database
 

@@ -96,6 +96,7 @@ expectText(css, ".cluster-card.archived", "style.css");
 expectText(css, ".cluster-diagnostic.heartbeat-warning", "style.css");
 expectText(css, ".cluster-diagnostic.heartbeat-critical", "style.css");
 expectText(css, ".agent-thread-card.busy", "style.css");
+expectText(css, ".agent-profile.historical", "style.css");
 expectText(css, ".task-runtime", "style.css");
 const agentThreadsMarkup = between(
   html,
@@ -398,6 +399,7 @@ const firstBoard = {
       display_name: "Diagnostic Worker",
       status: "busy",
       role: "team_worker",
+      profile_contract_status: "current",
       workstream_key: "webui-agent-diagnostics",
       thread_id: "thread-agent-busy",
       current_goal_id: "G-WARNING",
@@ -422,6 +424,7 @@ const firstBoard = {
       display_name: "Idle Reviewer",
       status: "idle",
       role: "team_reviewer",
+      profile_contract_status: "current",
       workstream_key: "review-queue",
       thread_id: "thread-agent-idle",
       current_goal_id: null,
@@ -444,6 +447,7 @@ const firstBoard = {
       display_name: "Superseded Explorer",
       status: "superseded",
       role: "team_explorer",
+      profile_contract_status: "historical",
       workstream_key: "retired",
       thread_id: "thread-agent-superseded",
       current_goal_id: null,
@@ -465,6 +469,7 @@ const firstBoard = {
       display_name: "Archived Reviewer",
       status: "stored",
       role: "team_reviewer",
+      profile_contract_status: "historical",
       workstream_key: "archived",
       thread_id: "thread-agent-archived",
       current_goal_id: null,
@@ -595,6 +600,8 @@ assert.match(clusterHtmlBefore, /无需调度/);
 assert.equal(fakeElements.get("agent-thread-count").textContent, 4);
 assert.match(agentThreadHtml, /Diagnostic Worker/);
 assert.match(agentThreadHtml, /thread thread-agent-busy/);
+assert.match(agentThreadHtml, /contract current/);
+assert.match(agentThreadHtml, /contract historical · not reusable/);
 assert.match(agentThreadHtml, /context/);
 assert.match(agentThreadHtml, /cache/);
 assert.match(agentThreadHtml, /uncached/);

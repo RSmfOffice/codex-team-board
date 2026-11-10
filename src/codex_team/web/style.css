@@ -472,6 +472,10 @@ input[type="text"]:focus {
   border-radius: 5px;
   overflow-wrap: anywhere;
 }
+.agent-thread-meta span.agent-profile.historical {
+  color: var(--amber);
+  border-color: rgba(244, 191, 101, 0.45);
+}
 .agent-thread-task {
   margin-top: 8px;
   color: #cbd8e8;

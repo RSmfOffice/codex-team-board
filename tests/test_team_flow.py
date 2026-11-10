@@ -376,6 +376,91 @@ class TeamFlowTests(unittest.TestCase):
             [item["event_type"] for item in history["events"]],
         )
 
+    def test_write_claim_requires_owned_branch_and_clean_worktree(self) -> None:
+        task = self.team.create_task(
+            self.repo,
+            title="Assignment boundary branch",
+            description="A task must claim only its assigned branch.",
+            acceptance="Wrong branch and dirty worktrees are rejected.",
+            kind="write",
+            owner_role="team_worker",
+        )
+        worktree = self.worktrees.create(
+            task["task_id"],
+            repo=self.repo,
+            worktree_path=self.base / "assignment-boundary-branch",
+        )
+        isolated = Path(worktree["worktree_path"])
+
+        git(isolated, "switch", "-c", "codex/team/manual-unassigned")
+        with self.assertRaisesRegex(TeamError, "does not match its assignment"):
+            self.team.claim_task(task["task_id"], actor="worker-1")
+        git(isolated, "switch", worktree["branch"])
+
+        (isolated / "uncommitted.txt").write_text("dirty\n", encoding="utf-8")
+        with self.assertRaisesRegex(TeamError, "must be clean"):
+            self.team.claim_task(task["task_id"], actor="worker-1")
+
+    def test_write_claim_rejects_cross_task_worktree_and_main_checkout(self) -> None:
+        first = self.team.create_task(
+            self.repo,
+            title="First worktree owner",
+            description="Own the first isolated worktree.",
+            acceptance="Ownership is unique.",
+            kind="write",
+            owner_role="team_worker",
+        )
+        second = self.team.create_task(
+            self.repo,
+            title="Second worktree owner",
+            description="Must not claim another task's worktree.",
+            acceptance="Cross-task assignment is rejected.",
+            kind="write",
+            owner_role="team_worker",
+        )
+        first_worktree = self.worktrees.create(
+            first["task_id"],
+            repo=self.repo,
+            worktree_path=self.base / "assignment-owner-a",
+        )
+        second_worktree = self.worktrees.create(
+            second["task_id"],
+            repo=self.repo,
+            worktree_path=self.base / "assignment-owner-b",
+        )
+
+        with self.team.connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET branch = ? WHERE task_id = ?",
+                (first_worktree["branch"], second["task_id"]),
+            )
+        with self.assertRaisesRegex(TeamError, "branch is already assigned"):
+            self.team.claim_task(second["task_id"], actor="worker-2")
+
+        with self.team.connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET branch = ? WHERE task_id = ?",
+                (second_worktree["branch"], second["task_id"]),
+            )
+            connection.execute(
+                "UPDATE tasks SET worktree_path = ? WHERE task_id = ?",
+                (first_worktree["worktree_path"], second["task_id"]),
+            )
+        with self.assertRaisesRegex(TeamError, "worktree is already assigned"):
+            self.team.claim_task(second["task_id"], actor="worker-2")
+
+        with self.team.connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET worktree_path = ?, branch = ? WHERE task_id = ?",
+                (
+                    str(self.repo.resolve()),
+                    "codex/team/manual-main-copy",
+                    second["task_id"],
+                ),
+            )
+        with self.assertRaisesRegex(TeamError, "isolated from the main checkout"):
+            self.team.claim_task(second["task_id"], actor="worker-2")
+
     def test_review_rejects_merge_without_submitted_commit(self) -> None:
         task, worktree, _, worker_commit = self._create_write_task_in_review(
             name="unrelated merge",
@@ -1144,6 +1229,7 @@ class TeamFlowTests(unittest.TestCase):
         self.assertEqual(agent["current_task_title"], "Inspect token usage")
         self.assertEqual(agent["current_goal_objective"], "Inspect Agent continuity")
         self.assertEqual(agent["thread_id"], "thread-diag")
+        self.assertEqual(agent["profile_contract_status"], "historical")
         self.assertEqual(agent["model"], "test-model")
         self.assertEqual(agent["model_provider"], "test-provider")
         self.assertEqual(agent["model_context_window"], 128000)

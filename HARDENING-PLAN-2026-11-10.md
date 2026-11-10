@@ -284,22 +284,22 @@ Phase 4B 可以在全量基线通过后开始；Phase 4C 以后按共享文件�
 
 ### Phase 4A：Assignment Boundary Hardening
 
-状态：下一批首选
+状态：代码与自动化验收完成，等待 Lead diff Review 和合并
 
 目标：不拆新版架构、不删除历史数据，只保证旧 Thread、旧 worktree/branch
 和历史任务对象不会进入新任务的分配链。
 
-- [ ] 固化 Agent 分配边界：只允许 `runtime=managed`、状态可复用且 cache
+- [x] 固化 Agent 分配边界：只允许 `runtime=managed`、状态可复用且 cache
   profile 与当前 Prompt Contract 完全一致的历史 Thread。
-- [ ] 增加旧 `legacy`、`v0.5` 和“只匹配部分 profile”的反向回归，确认
+- [x] 增加旧 `legacy`、`v0.5` 和“只匹配部分 profile”的反向回归，确认
   `continuity_mode=reuse` 也不会退化为模糊匹配。
-- [ ] 固化 worktree/branch 分配边界：新任务只能使用自己的 task worktree；
+- [x] 固化 worktree/branch 分配边界：新任务只能使用自己的 task worktree；
   已被其他 task 使用的路径或 branch 必须拒绝。
-- [ ] 固化 native Thread 边界：同一 native thread/actor 只能绑定同一 task；
+- [x] 固化 native Thread 边界：同一 native thread/actor 只能绑定同一 task；
   prompt 未 delivered 时不能 claim。
-- [ ] Dashboard 默认明确标识旧 profile Thread 为不可复用历史；是否提供
+- [x] Dashboard 默认明确标识旧 profile Thread 为不可复用历史；是否提供
   “显示历史 Thread”由展示筛选实现，不新增第二套 Thread 状态。
-- [ ] 用当前正式库上 8 个 `legacy`、13 个 `v0.5` Thread 做只读兼容性验证。
+- [x] 用当前正式库上 8 个 `legacy`、13 个 `v0.5` Thread 做只读兼容性验证。
 
 验收：
 
@@ -307,6 +307,21 @@ Phase 4B 可以在全量基线通过后开始；Phase 4C 以后按共享文件�
 - 旧 task/worktree/branch 不会被新 task 隐式接管。
 - native Thread 不能跨 task 复用。
 - 所有旧 Agent、job、usage 和事件继续保留，可查询但不参与新分配。
+
+本轮验证：
+
+```text
+165 tests OK, 1 skipped
+dashboard-ui-smoke: ok
+compileall ok
+Core tools: team_read, team_write
+Core schema hash:
+86e78eef5f5f631094f5218d763c83997f5ab52d1ba22877f93092720f93fca6
+Live historical managed Threads:
+21 / 21
+Live current-contract managed Threads:
+0
+```
 
 ---
 

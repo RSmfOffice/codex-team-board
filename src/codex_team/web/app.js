@@ -847,6 +847,14 @@ function renderAgentThreads(agents, events = []) {
     const nativePrompt = agent.runtime === "native"
       ? agent.prompt_status || "unknown"
       : "";
+    const profileContract = agent.runtime === "native"
+      ? ""
+      : agent.profile_contract_status || "";
+    const profileContractLabel = profileContract === "current"
+      ? "contract current"
+      : profileContract === "historical"
+        ? "contract historical · not reusable"
+        : "";
     const nativeIdentity = agent.runtime === "native"
       ? agent.agent_nickname || agent.agent_path || ""
       : "";
@@ -877,6 +885,9 @@ function renderAgentThreads(agents, events = []) {
         <div class="agent-thread-meta">
           <span>role ${escapeHtml(agent.role || "—")}</span>
           <span>runtime ${escapeHtml(agent.runtime || "managed")}</span>
+          ${profileContractLabel
+            ? `<span class="agent-profile ${escapeHtml(profileContract)}">${escapeHtml(profileContractLabel)}</span>`
+            : ""}
           ${nativePrompt ? `<span>prompt ${escapeHtml(nativePrompt)}</span>` : ""}
           ${nativeIdentity ? `<span>agent ${escapeHtml(nativeIdentity)}</span>` : ""}
           <span>workstream ${escapeHtml(workstream)}</span>

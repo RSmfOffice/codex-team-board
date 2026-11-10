@@ -12,6 +12,7 @@ from codex_team.cache_contract import (
     READ_OPERATIONS,
     WRITE_OPERATIONS,
     agent_cache_profile,
+    cache_profile_contract_status,
     core_tool_definitions,
     core_tool_schema_hash,
     operation_help,
@@ -494,6 +495,46 @@ class CacheContractTests(unittest.TestCase):
                     runtime_version="0.5.0",
                     runtime_identity="codex app-server exe-b",
                 ),
+            )
+
+    def test_profile_contract_status_quarantines_old_profiles(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            policy = Path(temporary) / "AGENTS.md"
+            policy.write_text("policy-v1", encoding="utf-8")
+            current = agent_cache_profile(
+                "role-v1",
+                policy_path=policy,
+                sandbox_mode="workspace-write",
+                surface="core",
+                access_mode="full",
+                runtime_version="0.5.0",
+                runtime_identity="codex app-server exe-a",
+            )
+        self.assertEqual(
+            cache_profile_contract_status(current),
+            "current",
+        )
+        for historical in [
+            None,
+            "",
+            "legacy",
+            "v0.5",
+            "cache-v1;core-v1",
+            current.replace(
+                "manifest=",
+                "manifest=not-current-",
+                1,
+            ),
+            current.replace(
+                f"contract={PROMPT_CONTRACT_VERSION}",
+                "contract=prompt-v0",
+                1,
+            ),
+        ]:
+            expected = "unknown" if not historical else "historical"
+            self.assertEqual(
+                cache_profile_contract_status(historical),
+                expected,
             )
 
 
