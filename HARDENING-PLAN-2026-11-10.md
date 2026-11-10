@@ -509,7 +509,7 @@ Merge commit:
 
 ### Phase 4D-1：Native Agent Threads 自动发现补强
 
-状态：实现完成，待 Lead Review、合并和正式库回填验证
+状态：已完成并通过 Lead Review、主分支集成测试和正式库回填
 
 - [x] 扫描近期 Codex `session_meta`，只接受 `source.subagent.thread_spawn`。
 - [x] 按 session `cwd` 匹配已登记活动项目，未知或归档项目跳过。
@@ -524,6 +524,14 @@ Merge commit:
 - 主 Thread、非 subagent session、未知项目不会进入 `cluster_agents`。
 - native discovery、API 幂等、failed 保留和 UI 自动触发有回归测试。
 - 不改数据库 schema，不引入第二状态源。
+- 183 tests OK, 1 skipped；UI smoke、JS syntax、compileall、diff check 通过。
+- Core tool schema hash 保持
+  `86e78eef5f5f631094f5218d763c83997f5ab52d1ba22877f93092720f93fca6`。
+- Worker commit：`71f3b8b1e15b015f129f9e5d18aad15f284f3e34`。
+- Lead merge：`873ebfdfdd1e7b352c08afcf5125f6d84851658b`。
+- 正式库首次同步发现并登记 6 个 native Thread；第二次同步新增 0、跳过 6，
+  幂等验证通过。当前 5 个 `cache_prefix_review` thread 均可见，原有 failed
+  managed Thread 保持保留。
 
 ---
 
