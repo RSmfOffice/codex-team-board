@@ -18,39 +18,25 @@ from .cache_contract import (
 )
 from .config import Settings
 from .cluster import ClusterManager, daemon_status as cluster_daemon_status, ensure_daemon
+from .prompt_contract import (
+    CORE_INSTRUCTIONS,
+    INSTRUCTIONS,
+    configured_access_mode,
+    instructions_for_surface,
+)
 from .service import TeamError, TeamService
 from .validation import SchemaValidationError, validate_input_schema
 from .worktrees import WorktreeManager
 
 LOGGER = logging.getLogger("codex_team.mcp")
 PROTOCOL_VERSION = "2025-06-18"
-INSTRUCTIONS = (
-    "This MCP server is the shared task and worktree source of truth for a Codex team. "
-    "For an initialized team project, call team_cluster_ensure before non-trivial development "
-    "work so every project has one persistent cluster goal. Then call team_status or "
-    "team_list_tasks before planning; "
-    "reuse existing tasks when possible. The lead creates tasks, creates a worktree for every "
-    "write task, assigns a role, and "
-    "is the only reviewer allowed to mark tasks done. Workers must claim a task, keep its "
-    "claim_token private, send heartbeats, and submit to review with commit and test evidence. "
-    "Never edit outside an assigned worktree."
-)
-CORE_INSTRUCTIONS = (
-    "This MCP server is the shared Team Board task and worktree source. "
-    "Use only the stable `team_read` and `team_write` tools. Call "
-    "team_read(operation='help') once after initialization to discover the "
-    "available operations and argument names. Keep claim tokens private, never "
-    "edit outside an assigned worktree, and preserve the Lead-only review rules."
-)
 
 
 def _access_mode() -> str:
-    mode = os.environ.get("CODEX_TEAM_MCP_ACCESS", "full").strip().lower()
-    if mode not in {"full", "read_only", "off"}:
-        raise TeamError(
-            "CODEX_TEAM_MCP_ACCESS must be full, read_only, or off"
-        )
-    return mode
+    try:
+        return configured_access_mode()
+    except ValueError as exc:
+        raise TeamError(str(exc)) from exc
 
 
 def _surface_mode() -> str:
@@ -61,7 +47,10 @@ def _surface_mode() -> str:
 
 
 def _instructions_for_surface() -> str:
-    return CORE_INSTRUCTIONS if _surface_mode() == "core" else INSTRUCTIONS
+    return instructions_for_surface(
+        _surface_mode(),
+        _access_mode(),
+    )
 
 
 def _visible_tool_definitions() -> list[dict[str, Any]]:
@@ -758,6 +747,46 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "additionalProperties": False,
             },
         },
+        {
+            "name": "team_agent_register_native",
+            "description": (
+                "Register or refresh a native Codex subagent Thread in the shared "
+                "AgentThread registry. The native session is inspected for prompt "
+                "delivery, parent identity, agent path, nickname, and last-seen time. "
+                "Native threads are monitored but remain same_task_only and are not "
+                "eligible for managed automatic reuse."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo_root": repo,
+                    "thread_id": {"type": "string", "minLength": 1},
+                    "role": {
+                        "type": "string",
+                        "enum": [
+                            "lead",
+                            "team_explorer",
+                            "team_worker",
+                            "team_reviewer",
+                        ],
+                    },
+                    "workstream_key": {"type": "string", "minLength": 1},
+                    "actor": {"type": "string", "minLength": 1},
+                    "task_id": {"type": "string"},
+                    "display_name": {"type": "string"},
+                    "model": {"type": "string"},
+                    "model_provider": {"type": "string"},
+                },
+                "required": [
+                    "repo_root",
+                    "thread_id",
+                    "role",
+                    "workstream_key",
+                    "actor",
+                ],
+                "additionalProperties": False,
+            },
+        },
     ]
 
 
@@ -1033,6 +1062,18 @@ class TeamMcpServer:
                     "reason",
                     "manual reset requested through MCP",
                 ),
+            )
+        if name == "team_agent_register_native":
+            return self.cluster.register_native_agent(
+                arguments["repo_root"],
+                arguments["thread_id"],
+                arguments["role"],
+                arguments["workstream_key"],
+                actor=arguments["actor"],
+                task_id=arguments.get("task_id"),
+                display_name=arguments.get("display_name"),
+                model=arguments.get("model", ""),
+                model_provider=arguments.get("model_provider", ""),
             )
         raise TeamError(f"unknown tool: {name}")
 

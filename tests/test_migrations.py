@@ -211,6 +211,39 @@ class MigrationTests(unittest.TestCase):
                     """
                 ).fetchone()
                 self.assertIsNotNone(operation_table)
+                event_columns = {
+                    row["name"]
+                    for row in reopened.execute(
+                        "PRAGMA table_info(task_events)"
+                    ).fetchall()
+                }
+                self.assertTrue(
+                    {
+                        "thread_id",
+                        "job_id",
+                        "correlation_id",
+                        "assignment_id",
+                    }.issubset(event_columns)
+                )
+                agent_columns = {
+                    row["name"]
+                    for row in reopened.execute(
+                        "PRAGMA table_info(cluster_agents)"
+                    ).fetchall()
+                }
+                self.assertTrue(
+                    {
+                        "runtime",
+                        "parent_thread_id",
+                        "agent_path",
+                        "agent_nickname",
+                        "actor",
+                        "prompt_hash",
+                        "prompt_status",
+                        "native_session_path",
+                        "last_seen_at",
+                    }.issubset(agent_columns)
+                )
                 goal_columns = {
                     row["name"]
                     for row in reopened.execute(

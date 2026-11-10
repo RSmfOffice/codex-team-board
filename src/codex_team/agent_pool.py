@@ -220,6 +220,10 @@ class AgentPool:
                 (thread_id,),
             ).fetchone()
             if existing is not None:
+                if existing["runtime"] != "managed":
+                    raise AgentPoolError(
+                        f"thread {thread_id} is already registered as native"
+                    )
                 identity = (
                     existing["project_id"],
                     existing["role"],
@@ -278,6 +282,230 @@ class AgentPool:
                     "profile": profile,
                     "model": model,
                     "model_provider": model_provider,
+                },
+                created_at=now,
+            )
+            return self._agent_dict(self._row(connection, agent_id))
+
+    def register_native_thread(
+        self,
+        project_id: str,
+        role: str,
+        workstream_key: str,
+        thread_id: str,
+        actor: str,
+        *,
+        task_id: str | None = None,
+        parent_thread_id: str | None = None,
+        agent_path: str | None = None,
+        agent_nickname: str | None = None,
+        display_name: str | None = None,
+        model: str = "",
+        model_provider: str = "",
+        prompt_hash: str = "",
+        prompt_status: str = "unknown",
+        native_session_path: str | None = None,
+        last_seen_at: str | None = None,
+    ) -> dict[str, Any]:
+        project_id = self._require_text(project_id, "project_id")
+        role = self._require_text(role, "role").lower()
+        if role not in self.ROLES:
+            raise AgentPoolError(f"unsupported role: {role}")
+        workstream_key = self._require_text(workstream_key, "workstream_key")
+        thread_id = self._require_text(thread_id, "thread_id")
+        actor = self._require_text(actor, "actor")
+        prompt_status = self._require_text(
+            prompt_status,
+            "prompt_status",
+        ).lower()
+        if prompt_status not in {"unknown", "delivered", "missing"}:
+            raise AgentPoolError(
+                "prompt_status must be unknown, delivered, or missing"
+            )
+        model = self._normalize_model(model)
+        model_provider = self._normalize_model(model_provider)
+        now = utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            project = connection.execute(
+                "SELECT project_id, archived_at FROM projects WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            if project is None:
+                raise AgentPoolError(f"project not found: {project_id}")
+            if project["archived_at"] is not None:
+                raise AgentPoolError(
+                    "project is archived; restore it before registering agents"
+                )
+            current_goal_id: str | None = None
+            if task_id:
+                task = connection.execute(
+                    """
+                    SELECT project_id, goal_id, archived_at
+                    FROM tasks WHERE task_id = ?
+                    """,
+                    (task_id,),
+                ).fetchone()
+                if task is None or task["project_id"] != project_id:
+                    raise AgentPoolError("task does not belong to this project")
+                if task["archived_at"] is not None:
+                    raise AgentPoolError(
+                        "archived task cannot bind a native thread"
+                    )
+                current_goal_id = task["goal_id"]
+            actor_conflict = connection.execute(
+                """
+                SELECT thread_id
+                FROM cluster_agents
+                WHERE project_id = ? AND actor = ? AND runtime = 'native'
+                  AND thread_id != ?
+                LIMIT 1
+                """,
+                (project_id, actor, thread_id),
+            ).fetchone()
+            if actor_conflict is not None:
+                raise AgentPoolError(
+                    f"native actor {actor} is already bound to thread {actor_conflict['thread_id']}"
+                )
+            existing = connection.execute(
+                "SELECT * FROM cluster_agents WHERE thread_id = ?",
+                (thread_id,),
+            ).fetchone()
+            if existing is not None:
+                if existing["runtime"] != "native":
+                    raise AgentPoolError(
+                        f"thread {thread_id} is already registered as managed"
+                    )
+                identity = (
+                    existing["project_id"],
+                    existing["role"],
+                    existing["workstream_key"],
+                )
+                requested = (project_id, role, workstream_key)
+                if identity != requested:
+                    raise AgentPoolError(
+                        f"thread {thread_id} is registered with different native metadata"
+                    )
+                if (
+                    existing["current_task_id"]
+                    and task_id
+                    and existing["current_task_id"] != task_id
+                ):
+                    raise AgentPoolError(
+                        "native thread is same_task_only and cannot switch tasks"
+                    )
+                connection.execute(
+                    """
+                    UPDATE cluster_agents
+                    SET display_name = ?, model = ?, model_provider = ?,
+                        current_task_id = COALESCE(?, current_task_id),
+                        current_goal_id = COALESCE(?, current_goal_id),
+                        parent_thread_id = COALESCE(?, parent_thread_id),
+                        agent_path = COALESCE(?, agent_path),
+                        agent_nickname = COALESCE(?, agent_nickname),
+                        actor = ?, prompt_hash = ?,
+                        prompt_status = ?, native_session_path = ?,
+                        last_seen_at = ?, last_used_at = ?, updated_at = ?
+                    WHERE agent_id = ?
+                    """,
+                    (
+                        display_name
+                        or existing["display_name"]
+                        or agent_nickname
+                        or agent_path
+                        or thread_id,
+                        model or existing["model"],
+                        model_provider or existing["model_provider"],
+                        task_id,
+                        current_goal_id,
+                        parent_thread_id,
+                        agent_path,
+                        agent_nickname,
+                        actor,
+                        prompt_hash,
+                        prompt_status,
+                        native_session_path,
+                        last_seen_at or now,
+                        now,
+                        now,
+                        existing["agent_id"],
+                    ),
+                )
+                self._event(
+                    connection,
+                    existing["agent_id"],
+                    "native_refreshed",
+                    actor,
+                    {
+                        "thread_id": thread_id,
+                        "task_id": task_id,
+                        "prompt_status": prompt_status,
+                        "session_path": native_session_path,
+                    },
+                    created_at=now,
+                )
+                return self._agent_dict(
+                    self._row(connection, existing["agent_id"])
+                )
+            agent_id = f"A-{uuid.uuid4().hex[:12].upper()}"
+            connection.execute(
+                """
+                INSERT INTO cluster_agents(
+                    agent_id, project_id, role, workstream_key, display_name,
+                    thread_id, runtime, parent_thread_id, agent_path,
+                    agent_nickname, actor, prompt_hash, prompt_status,
+                    native_session_path, last_seen_at, profile, status,
+                    model, model_provider, current_goal_id, current_task_id,
+                    last_loaded_at, last_used_at, created_at, updated_at
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, 'native', ?, ?, ?, ?, ?, ?, ?, ?,
+                    'native', 'loaded', ?, ?, ?, ?, ?, ?, ?, ?
+                )
+                """,
+                (
+                    agent_id,
+                    project_id,
+                    role,
+                    workstream_key,
+                    display_name
+                    or agent_nickname
+                    or agent_path
+                    or thread_id,
+                    thread_id,
+                    parent_thread_id,
+                    agent_path,
+                    agent_nickname,
+                    actor,
+                    prompt_hash,
+                    prompt_status,
+                    native_session_path,
+                    last_seen_at or now,
+                    model,
+                    model_provider,
+                    current_goal_id,
+                    task_id,
+                    now,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            self._event(
+                connection,
+                agent_id,
+                "native_registered",
+                actor,
+                {
+                    "project_id": project_id,
+                    "role": role,
+                    "workstream_key": workstream_key,
+                    "thread_id": thread_id,
+                    "task_id": task_id,
+                    "parent_thread_id": parent_thread_id,
+                    "agent_path": agent_path,
+                    "agent_nickname": agent_nickname,
+                    "prompt_status": prompt_status,
+                    "session_path": native_session_path,
                 },
                 created_at=now,
             )
@@ -398,6 +626,7 @@ class AgentPool:
                 FROM cluster_agents
                 WHERE project_id = ? AND role = ? AND workstream_key = ?
                   AND profile = ? AND model = ? AND model_provider = ?
+                  AND runtime = 'managed'
                   AND status IN ({", ".join("?" for _ in self.IDLE_STATUSES)})
                   AND archived_at IS NULL
                   AND reset_requested_at IS NULL
@@ -713,6 +942,10 @@ class AgentPool:
             agent = self._row(connection, agent_id)
             if agent["archived_at"] is not None:
                 raise AgentPoolError("archived agents cannot be reset")
+            if agent["runtime"] != "managed":
+                raise AgentPoolError(
+                    "native threads are same_task_only and cannot be reset by the managed runtime"
+                )
             if agent["status"] in {"starting", "busy"}:
                 raise AgentPoolError("busy agents cannot be reset")
             if agent["status"] == "superseded":

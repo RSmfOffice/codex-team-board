@@ -80,20 +80,86 @@ class TeamService:
         event_type: str,
         actor: str,
         data: dict[str, Any] | None = None,
+        *,
+        thread_id: str | None = None,
+        job_id: str | None = None,
+        correlation_id: str | None = None,
+        assignment_id: str | None = None,
     ) -> None:
+        context = TeamService._event_context(
+            connection,
+            task_id,
+            actor,
+        )
         connection.execute(
             """
-            INSERT INTO task_events(task_id, event_type, actor, data_json, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO task_events(
+                task_id, event_type, actor, thread_id, job_id,
+                correlation_id, assignment_id, data_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
                 event_type,
                 actor,
+                thread_id or context.get("thread_id"),
+                job_id or context.get("job_id"),
+                correlation_id or context.get("correlation_id"),
+                assignment_id or context.get("assignment_id"),
                 json.dumps(data or {}, ensure_ascii=False, sort_keys=True),
                 utc_now(),
             ),
         )
+
+    @staticmethod
+    def _event_context(
+        connection: sqlite3.Connection,
+        task_id: str,
+        actor: str,
+    ) -> dict[str, str]:
+        task = connection.execute(
+            "SELECT project_id FROM tasks WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        if task is None:
+            return {}
+        context: dict[str, str] = {}
+        job = connection.execute(
+            """
+            SELECT job_id, thread_id, correlation_id
+            FROM cluster_jobs
+            WHERE task_id = ? AND actor = ?
+            ORDER BY started_at DESC, job_id DESC
+            LIMIT 1
+            """,
+            (task_id, actor),
+        ).fetchone()
+        if job is not None:
+            context["job_id"] = str(job["job_id"])
+            if job["thread_id"]:
+                context["thread_id"] = str(job["thread_id"])
+            if job["correlation_id"]:
+                context["correlation_id"] = str(job["correlation_id"])
+        if "thread_id" not in context:
+            agent = connection.execute(
+                """
+                SELECT thread_id
+                FROM cluster_agents
+                WHERE project_id = ? AND actor = ?
+                ORDER BY
+                    CASE WHEN current_task_id = ? THEN 0 ELSE 1 END,
+                    updated_at DESC,
+                    agent_id
+                LIMIT 1
+                """,
+                (task["project_id"], actor, task_id),
+            ).fetchone()
+            if agent is not None:
+                thread_id = str(agent["thread_id"])
+                context["thread_id"] = thread_id
+                context["correlation_id"] = f"native:{thread_id}"
+                context["assignment_id"] = thread_id
+        return context
 
     @staticmethod
     def _cache_hit_rate(
@@ -631,7 +697,8 @@ class TeamService:
                 raise TeamError(f"task not found: {task_id}")
             rows = connection.execute(
                 """
-                SELECT event_id, event_type, actor, data_json, created_at
+                SELECT event_id, event_type, actor, thread_id, job_id,
+                       correlation_id, assignment_id, data_json, created_at
                 FROM task_events
                 WHERE task_id = ?
                 ORDER BY event_id DESC
@@ -1497,8 +1564,9 @@ class TeamService:
             if project_id:
                 event_rows = connection.execute(
                     f"""
-                    SELECT e.event_id, e.task_id, e.event_type, e.actor, e.data_json,
-                           e.created_at
+                    SELECT e.event_id, e.task_id, e.event_type, e.actor,
+                           e.thread_id, e.job_id, e.correlation_id,
+                           e.assignment_id, e.data_json, e.created_at
                     FROM task_events e
                     JOIN tasks t ON t.task_id = e.task_id
                     WHERE t.project_id = ?
@@ -1514,8 +1582,9 @@ class TeamService:
                 )
                 event_rows = connection.execute(
                     f"""
-                    SELECT e.event_id, e.task_id, e.event_type, e.actor, e.data_json,
-                           e.created_at
+                    SELECT e.event_id, e.task_id, e.event_type, e.actor,
+                           e.thread_id, e.job_id, e.correlation_id,
+                           e.assignment_id, e.data_json, e.created_at
                     FROM task_events e
                     JOIN tasks t ON t.task_id = e.task_id
                     JOIN projects p ON p.project_id = t.project_id
@@ -1639,6 +1708,29 @@ class TeamService:
                 raise TeamError("task is archived; restore it before claiming")
             if task["project_archived_at"]:
                 raise TeamError("project is archived; restore it before claiming tasks")
+            native = connection.execute(
+                """
+                SELECT prompt_status, current_task_id
+                FROM cluster_agents
+                WHERE project_id = ? AND actor = ? AND runtime = 'native'
+                ORDER BY updated_at DESC, agent_id
+                LIMIT 1
+                """,
+                (task["project_id"], actor),
+            ).fetchone()
+            if native is not None:
+                if (
+                    native["current_task_id"]
+                    and native["current_task_id"] != task_id
+                ):
+                    raise TeamError(
+                        "native thread is same_task_only and cannot claim another task"
+                    )
+                if native["prompt_status"] != "delivered":
+                    raise TeamError(
+                        "native thread prompt has not been verified as delivered; "
+                        "resend the task and refresh native registration"
+                    )
             if task["status"] in TERMINAL_STATUSES:
                 raise TeamError(f"cannot claim terminal task: {task['status']}")
             if task["status"] == "review":

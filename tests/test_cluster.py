@@ -16,6 +16,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+from codex_team import __version__
 from codex_team.cluster import (
     _ClusterAppServerEvents,
     ClusterManager,
@@ -72,6 +73,28 @@ def _repo(base: Path, name: str) -> Path:
     git(repo, "config", "user.email", "cluster-test@example.invalid")
     git(repo, "config", "user.name", "Cluster Test")
     return repo
+
+
+def _manager_profile(
+    manager: ClusterManager,
+    goal: Mapping[str, object],
+    role: str,
+    instructions: str,
+    *,
+    cwd: Path,
+) -> str:
+    _, profile = _agent_cache_profile(
+        goal,
+        role,
+        instructions,
+        cwd=cwd,
+        sandbox_mode="danger-full-access",
+        runtime_version=__version__,
+        runtime_identity=(
+            f"{manager.agent_runtime}:" + " ".join(manager.agent_command)
+        ),
+    )
+    return profile
 
 
 def _iso_seconds_ago(seconds: int) -> str:
@@ -2668,12 +2691,12 @@ class ClusterSchedulerTests(unittest.TestCase):
                 workstream_key="profile-workstream",
             )
             pool = AgentPool(settings)
-            _, current_profile = _agent_cache_profile(
+            current_profile = _manager_profile(
+                manager,
                 goal,
                 "lead",
                 LEAD_DEVELOPER_INSTRUCTIONS,
                 cwd=repo,
-                sandbox_mode="danger-full-access",
             )
             legacy = pool.register_thread(
                 project["project_id"],
@@ -2765,12 +2788,12 @@ class ClusterSchedulerTests(unittest.TestCase):
                 workstream_key="resume-workstream",
             )
             pool = AgentPool(settings)
-            _, current_profile = _agent_cache_profile(
+            current_profile = _manager_profile(
+                manager,
                 goal,
                 "lead",
                 LEAD_DEVELOPER_INSTRUCTIONS,
                 cwd=repo,
-                sandbox_mode="danger-full-access",
             )
             old_agent = pool.register_thread(
                 project["project_id"],
@@ -2840,12 +2863,12 @@ class ClusterSchedulerTests(unittest.TestCase):
                 objective="Compatibility surface must not reuse",
                 workstream_key="legacy-surface",
             )
-            _, profile = _agent_cache_profile(
+            profile = _manager_profile(
+                manager,
                 goal,
                 "lead",
                 LEAD_DEVELOPER_INSTRUCTIONS,
                 cwd=repo,
-                sandbox_mode="danger-full-access",
             )
             pool = AgentPool(settings)
             old_agent = pool.register_thread(
@@ -3453,12 +3476,12 @@ class ClusterSchedulerTests(unittest.TestCase):
                 ),
             )
             pool = AgentPool(settings)
-            _, current_profile = _agent_cache_profile(
+            current_profile = _manager_profile(
+                manager,
                 goal,
                 "lead",
                 LEAD_DEVELOPER_INSTRUCTIONS,
                 cwd=repo,
-                sandbox_mode="danger-full-access",
             )
             old_agent = pool.register_thread(
                 project["project_id"],
@@ -4527,6 +4550,19 @@ class ClusterSchedulerTests(unittest.TestCase):
             self.assertEqual(settled["outcome"], "completed")
             self.assertIsNotNone(settled["settled_at"])
             self.assertEqual(settled["thread_action"], "fresh")
+            events = team.get_task_events(task["task_id"])["events"]
+            claimed_event = next(
+                event
+                for event in reversed(events)
+                if event["event_type"] == "claimed"
+                and event["job_id"] == dispatched["job_id"]
+            )
+            self.assertEqual(claimed_event["job_id"], dispatched["job_id"])
+            self.assertEqual(claimed_event["thread_id"], dispatched["thread_id"])
+            self.assertEqual(
+                claimed_event["correlation_id"],
+                dispatched["job_id"],
+            )
 
     def test_default_runtime_is_app_server_and_workstream_contract_is_persisted(
         self,
@@ -4910,6 +4946,7 @@ class ClusterSchedulerTests(unittest.TestCase):
         tool_names = {item["name"] for item in _tool_definitions()}
         self.assertTrue(
             {
+                "team_agent_register_native",
                 "team_agent_list",
                 "team_agent_reset",
                 "team_goal_set_checkpoint",
@@ -4974,6 +5011,60 @@ class ClusterSchedulerTests(unittest.TestCase):
                 },
             )
             self.assertIsNotNone(reset["reset_requested_at"])
+            task = team.create_task(
+                repo,
+                title="Native MCP registration",
+                description="Register a native thread through Core dispatcher.",
+                acceptance="Native metadata is persisted.",
+                kind="read",
+                owner_role="team_explorer",
+                goal_id=goal["goal_id"],
+            )
+            thread_id = "01a1cafe-2222-7333-8444-955566667777"
+            sessions = base / "native-sessions"
+            session = sessions / f"rollout-{thread_id}.jsonl"
+            session.parent.mkdir(parents=True)
+            session.write_text(
+                json.dumps(
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": f"Execute {task['task_id']}",
+                                }
+                            ],
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with patch.dict(
+                os.environ,
+                {"CODEX_NATIVE_SESSIONS_ROOT": str(sessions)},
+                clear=False,
+            ):
+                native = server.call_tool(
+                    "team_agent_register_native",
+                    {
+                        "repo_root": str(repo),
+                        "thread_id": thread_id,
+                        "role": "team_explorer",
+                        "workstream_key": "native-mcp",
+                        "actor": "native-mcp-worker",
+                        "task_id": task["task_id"],
+                    },
+                )
+            self.assertEqual(native["agent"]["runtime"], "native")
+            self.assertEqual(
+                native["agent"]["prompt_status"],
+                "delivered",
+            )
+            self.assertTrue(native["same_task_only"])
 
     def test_agent_cache_benchmark_emits_json_markdown_and_gate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -17,6 +17,15 @@
   cache profile、thread action、outcome 和 settled time。
 - 新增 `external_operations` durable intent 表；worktree 创建可跨数据库/Git
   中断恢复，并发创建由唯一 active intent 约束。
+- 新增版本化 Prompt Contract manifest；MCP、角色/项目指令、工具 schema、
+  access mode、运行时身份和 policy 共同进入 Agent cache profile。
+- 统一 `cluster_agents` Thread Registry，用 `runtime=managed|native` 区分托管
+  复用线程与 Codex 原生子 Agent。
+- 新增 `team_agent_register_native` Core operation 和
+  `agent register-native` CLI；登记时检查 session parent/path/nickname、task
+  prompt 是否由用户消息真实送达及 prompt hash。
+- `task_events` 增加结构化 `thread_id`、`job_id`、`correlation_id` 和
+  `assignment_id`，Dashboard/API 直接返回关联字段。
 
 ### Changed
 
@@ -24,6 +33,10 @@
   workstream/cache profile 下自动复用；Worker 的 auto 策略继续保持 fresh。
 - Agent profile 现绑定实际执行目录的 worktree AGENTS、sandbox mode 和 MCP
   surface；`admin`/`legacy` 兼容工具面强制 fresh，不复用旧 thread。
+- cache profile 进一步绑定 Prompt Contract manifest、MCP instructions、
+  access mode 和运行时身份；升级或 instructions 变化不会误用旧 thread。
+- 自动 AgentPool 只选择 `runtime=managed` 的可用 Thread；native Thread 仅支持
+  same-task follow-up，不参与 managed reset 或自动复用。
 - `cluster ensure` 不再隐式初始化或重写项目 AGENTS、角色模板和 marker；
   bootstrap/policy 写入必须显式执行。
 - Worker、Explorer 和 Reviewer 的 Markdown/native TOML 模板全部改用
@@ -52,11 +65,18 @@
 - completed/failed/interrupted/lost job 统一经过 settlement，写入 outcome、
   settled_at 和可用 usage；Dashboard 对 failed Agent 优先投影 latest job。
 - 前端保留 unknown 语义，`null` token/cache 显示为 `—`，不再变成 0/0%。
+- native prompt 检测只接受真实 user message；assistant 输出、工具输出或日志中
+  偶然出现 task ID 仍保持 `missing`，未知/缺失状态不能 claim。
+- native Thread 可显示 runtime、prompt 状态、Agent 身份和父 Thread，避免把
+  “已建线程但任务未送达”误判为正常 idle。
 
 ### Database
 
-- schema 升级到 18；`cluster_jobs` 新增 correlation、prompt/profile、
-  thread action、outcome 和 settled 字段，并新增 `external_operations`。
+- schema 升级到 19；`cluster_agents` 新增 runtime、parent/path/nickname、
+  actor、prompt hash/status、native session path 和 last-seen；
+  `task_events` 新增 thread/job/correlation/assignment 关联字段。
+- schema 18 的 `cluster_jobs` attempt ledger 和 `external_operations`
+  保持兼容，schema 19 migration 不删除或重写历史任务状态。
 - schema 17 引入的 `cluster_goals.stall_ticks`、`stall_signature` 和
   `stalled_at` 保持兼容并继续用于跨 daemon 停滞检测。
 

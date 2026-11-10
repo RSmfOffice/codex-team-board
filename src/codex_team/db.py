@@ -5,7 +5,7 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
@@ -65,6 +65,10 @@ CREATE TABLE IF NOT EXISTS task_events (
     task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
     event_type TEXT NOT NULL,
     actor TEXT NOT NULL,
+    thread_id TEXT,
+    job_id TEXT,
+    correlation_id TEXT,
+    assignment_id TEXT,
     data_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
@@ -113,6 +117,7 @@ CREATE TABLE IF NOT EXISTS cluster_jobs (
     task_id TEXT REFERENCES tasks(task_id) ON DELETE SET NULL,
     kind TEXT NOT NULL CHECK(kind IN ('lead', 'worker')),
     role TEXT NOT NULL,
+    actor TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL CHECK(status IN (
         'starting', 'running', 'completed', 'failed', 'interrupted', 'lost'
     )),
@@ -176,6 +181,15 @@ CREATE TABLE IF NOT EXISTS cluster_agents (
     workstream_key TEXT NOT NULL,
     display_name TEXT NOT NULL,
     thread_id TEXT NOT NULL UNIQUE,
+    runtime TEXT NOT NULL DEFAULT 'managed',
+    parent_thread_id TEXT,
+    agent_path TEXT,
+    agent_nickname TEXT,
+    actor TEXT,
+    prompt_hash TEXT NOT NULL DEFAULT '',
+    prompt_status TEXT NOT NULL DEFAULT 'unknown',
+    native_session_path TEXT,
+    last_seen_at TEXT,
     profile TEXT NOT NULL DEFAULT 'legacy',
     status TEXT NOT NULL CHECK(status IN (
         'starting', 'busy', 'loaded', 'idle', 'stored',
@@ -249,6 +263,10 @@ CREATE INDEX IF NOT EXISTS idx_dependencies_depends_on
     ON task_dependencies(depends_on);
 CREATE INDEX IF NOT EXISTS idx_events_task
     ON task_events(task_id, event_id);
+CREATE INDEX IF NOT EXISTS idx_task_events_thread
+    ON task_events(thread_id, event_id);
+CREATE INDEX IF NOT EXISTS idx_task_events_correlation
+    ON task_events(correlation_id, event_id);
 CREATE INDEX IF NOT EXISTS idx_messages_project
     ON messages(project_id, message_id);
 CREATE INDEX IF NOT EXISTS idx_cluster_jobs_goal
@@ -259,6 +277,13 @@ CREATE INDEX IF NOT EXISTS idx_cluster_goals_archived
     ON cluster_goals(project_id, archived_at, updated_at);
 CREATE INDEX IF NOT EXISTS idx_cluster_agents_pool
     ON cluster_agents(project_id, role, workstream_key, status, last_used_at);
+CREATE INDEX IF NOT EXISTS idx_cluster_agents_runtime
+    ON cluster_agents(runtime, status, project_id);
+CREATE INDEX IF NOT EXISTS idx_cluster_agents_actor
+    ON cluster_agents(actor, project_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cluster_agents_native_actor
+    ON cluster_agents(project_id, actor)
+    WHERE runtime = 'native' AND actor IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_cluster_jobs_turn
     ON cluster_jobs(thread_id, turn_id);
 CREATE INDEX IF NOT EXISTS idx_cluster_jobs_agent_started
@@ -306,6 +331,13 @@ TASK_MIGRATION_COLUMNS = {
     "continuity_mode": "TEXT NOT NULL DEFAULT 'auto'",
 }
 
+TASK_EVENT_MIGRATION_COLUMNS = {
+    "thread_id": "TEXT",
+    "job_id": "TEXT",
+    "correlation_id": "TEXT",
+    "assignment_id": "TEXT",
+}
+
 PROJECT_MIGRATION_COLUMNS = {
     "archived_at": "TEXT",
 }
@@ -323,6 +355,7 @@ CLUSTER_GOAL_MIGRATION_COLUMNS = {
 
 CLUSTER_JOB_MIGRATION_COLUMNS = {
     "agent_id": "TEXT",
+    "actor": "TEXT NOT NULL DEFAULT ''",
     "turn_id": "TEXT",
     "runtime": "TEXT NOT NULL DEFAULT 'exec'",
     "runtime_generation": "INTEGER",
@@ -350,6 +383,15 @@ CLUSTER_JOB_MIGRATION_COLUMNS = {
 
 CLUSTER_AGENT_MIGRATION_COLUMNS = {
     "profile": "TEXT NOT NULL DEFAULT 'legacy'",
+    "runtime": "TEXT NOT NULL DEFAULT 'managed'",
+    "parent_thread_id": "TEXT",
+    "agent_path": "TEXT",
+    "agent_nickname": "TEXT",
+    "actor": "TEXT",
+    "prompt_hash": "TEXT NOT NULL DEFAULT ''",
+    "prompt_status": "TEXT NOT NULL DEFAULT 'unknown'",
+    "native_session_path": "TEXT",
+    "last_seen_at": "TEXT",
 }
 
 
@@ -417,6 +459,17 @@ def _upgrade_schema(connection: sqlite3.Connection) -> None:
             connection.execute(
                 f"ALTER TABLE tasks ADD COLUMN {name} {declaration}"
             )
+    event_columns = {
+        row["name"]
+        for row in connection.execute(
+            "PRAGMA table_info(task_events)"
+        ).fetchall()
+    }
+    for name, declaration in TASK_EVENT_MIGRATION_COLUMNS.items():
+        if name not in event_columns:
+            connection.execute(
+                f"ALTER TABLE task_events ADD COLUMN {name} {declaration}"
+            )
     project_columns = {
         row["name"]
         for row in connection.execute("PRAGMA table_info(projects)").fetchall()
@@ -476,8 +529,19 @@ def _upgrade_schema(connection: sqlite3.Connection) -> None:
     connection.execute(
         """
         UPDATE cluster_agents
-        SET profile = 'legacy'
-        WHERE profile IS NULL OR TRIM(profile) = ''
+        SET profile = CASE
+                WHEN profile IS NULL OR TRIM(profile) = '' THEN 'legacy'
+                ELSE profile
+            END,
+            runtime = CASE
+                WHEN runtime IS NULL OR TRIM(runtime) = '' THEN 'managed'
+                ELSE runtime
+            END,
+            prompt_status = CASE
+                WHEN prompt_status IS NULL OR TRIM(prompt_status) = ''
+                THEN 'unknown'
+                ELSE prompt_status
+            END
         """
     )
     _backfill_goal_archive_tasks(connection)

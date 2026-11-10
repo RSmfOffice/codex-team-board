@@ -222,21 +222,39 @@ Jobs missing correlation:
 
 ### Phase 3：Prompt Contract 与 Agent Thread 统一
 
-状态：未开始
+状态：代码与自动化验收完成，等待 Lead diff Review 和合并
 
-- [ ] 建立单一 Prompt Contract manifest。
-- [ ] 从 manifest 生成 AGENTS、角色 Markdown/TOML 和 MCP instructions 引用。
-- [ ] cache profile 自动绑定所有 model-visible stable inputs。
-- [ ] 建立 managed/native 两个 Thread Adapter。
-- [ ] native thread 默认 `same_task_only` 或 `never` 自动复用。
-- [ ] native spawn 必须验证任务正文送达并收到 claim/ack。
-- [ ] task_events 增加结构化 `thread_id/job_id/assignment_id/correlation_id`。
+- [x] 建立单一 Prompt Contract manifest；MCP instructions 直接由 manifest 加载。
+- [x] AGENTS、角色 Markdown/TOML、工具 schema、policy 内容和运行时身份进入同一
+  cache profile；实际文件或 instruction 变化都会失配。
+- [x] cache profile 自动绑定 access mode、MCP instructions、manifest/contract、
+  runtime version/identity、surface、sandbox、AGENTS 和角色 instructions。
+- [x] 用 `cluster_agents.runtime=managed|native` 建立统一 Thread Registry，并由
+  managed AgentPool 与 native session adapter 分别维护生命周期。
+- [x] native Thread 默认 `same_task_only`，不会进入 managed 自动复用池或 managed
+  reset 路径。
+- [x] native spawn 通过 session JSONL 的 user message 验证任务正文送达；
+  `missing/unknown` 阻断 claim，成功 claim 事件作为执行确认。
+- [x] task_events 增加结构化 `thread_id/job_id/assignment_id/correlation_id`，
+  Dashboard/API 同时返回这些字段。
 
 验收：
 
 - full/read_only、版本、AGENTS、instructions 任一变化都会使旧 profile 失配。
 - native thread 可看、可追溯，但不进入 managed 自动复用池。
 - `fork_turns=none` 不再出现“线程创建但任务未送达”。
+
+本轮验证：
+
+```text
+161 tests OK, 1 skipped
+dashboard-ui-smoke: ok
+compileall ok
+schema 19 (worktree)
+Core tools: team_read, team_write
+Core schema hash:
+86e78eef5f5f631094f5218d763c83997f5ab52d1ba22877f93092720f93fca6
+```
 
 ---
 

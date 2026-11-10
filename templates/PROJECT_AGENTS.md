@@ -19,6 +19,10 @@
   Agent 回复不视为交付，必须重试或标记失败。
 - 已完成的子 Agent thread 不得用 follow-up 开启另一个任务；新材料和新审查必须
   创建新 thread。60 秒未 claim 应提醒，5 分钟无 heartbeat 应标记异常。
+- Native subagent 创建后必须通过
+  `team_write(operation="team_agent_register_native", arguments={{...}})`
+  登记 thread/task。只有 `prompt_status=delivered` 才可继续等待 claim；missing
+  时必须补发任务并重新登记。Native thread 为 same-task-only，不进入 managed 复用池。
 - 只读探索使用 `team_explorer`，写入使用 `team_worker`，独立审查使用
   `team_reviewer`。当前 Codex 版本不能自动加载角色 TOML 时，先调用
   `team_read(operation="team_role_prompt", arguments={{...}})`，把返回的角色

@@ -1,0 +1,36 @@
+{
+  "contract_version": "prompt-v1",
+  "core_surface_version": "core-v1",
+  "surfaces": [
+    "core",
+    "admin",
+    "legacy"
+  ],
+  "access_modes": [
+    "full",
+    "read_only",
+    "off"
+  ],
+  "mcp_instructions": {
+    "admin": "This MCP server is the shared task and worktree source of truth for a Codex team. For an initialized team project, call team_cluster_ensure before non-trivial development work so every project has one persistent cluster goal. Then call team_status or team_list_tasks before planning; reuse existing tasks when possible. The lead creates tasks, creates a worktree for every write task, assigns a role, and is the only reviewer allowed to mark tasks done. Workers must claim a task, keep its claim_token private, send heartbeats, and submit to review with commit and test evidence. Never edit outside an assigned worktree.",
+    "core_full": "This MCP server is the shared Team Board task and worktree source. Use only the stable `team_read` and `team_write` tools. Call team_read(operation='help') once after initialization to discover the available operations and argument names. Keep claim tokens private, never edit outside an assigned worktree, and preserve the Lead-only review rules.",
+    "core_read_only": "This MCP server is the shared Team Board read-only source. Use only the stable `team_read` tool. Call team_read(operation='help') once after initialization to discover read operations. Do not attempt claims, reviews, archive operations, or any other Team Board mutation.",
+    "disabled": "The Codex Team Board MCP surface is disabled for this session. No Team Board tools are available."
+  },
+  "stable_sections": [
+    "role_instructions",
+    "thread_scope",
+    "mcp_instructions",
+    "tool_schema",
+    "policy_files",
+    "sandbox",
+    "runtime_identity"
+  ],
+  "dynamic_sections": [
+    "goal",
+    "task",
+    "board",
+    "checkpoint"
+  ],
+  "native_thread_reuse": "same_task_only"
+}

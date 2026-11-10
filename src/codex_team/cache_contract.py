@@ -6,6 +6,13 @@ import os
 from pathlib import Path
 from typing import Any, Iterable
 
+from .prompt_contract import (
+    PROMPT_CONTRACT_VERSION,
+    bundled_manifest_hash,
+    configured_access_mode,
+    instructions_for_surface,
+)
+
 
 CORE_SURFACE_VERSION = "core-v1"
 CACHE_PROFILE_PREFIX = "cache-v1"
@@ -45,6 +52,7 @@ WRITE_OPERATIONS = frozenset(
         "team_cluster_control",
         "team_goal_set_workstream",
         "team_goal_set_checkpoint",
+        "team_agent_register_native",
         "team_agent_reset",
     }
 )
@@ -155,18 +163,35 @@ def agent_cache_profile(
     sandbox_mode: str,
     surface: str | None = None,
     tool_schema_hash: str | None = None,
+    access_mode: str | None = None,
+    mcp_instructions: str | None = None,
+    runtime_version: str = "",
+    runtime_identity: str = "",
 ) -> str:
     """Build a compact exact compatibility identity for one Agent thread."""
 
     selected_surface, surface_hash = tool_surface_identity(surface)
+    selected_access = access_mode or configured_access_mode()
+    instruction_text = mcp_instructions or instructions_for_surface(
+        selected_surface,
+        selected_access,
+    )
     tools_hash = tool_schema_hash or surface_hash
     role_hash = sha256_text(developer_instructions)
     policy_hash = file_hash(policy_path)
     sandbox_hash = sha256_text(str(sandbox_mode).strip().lower())
+    instructions_hash = sha256_text(instruction_text)
+    runtime_version_hash = sha256_text(str(runtime_version).strip())
+    runtime_identity_hash = sha256_text(str(runtime_identity).strip())
+    manifest_hash = bundled_manifest_hash()
     return (
         f"{CACHE_PROFILE_PREFIX};{CORE_SURFACE_VERSION};surface={selected_surface};"
         f"tools={tools_hash};policy={policy_hash};role={role_hash};"
-        f"sandbox={sandbox_hash}"
+        f"sandbox={sandbox_hash};access={selected_access};"
+        f"instructions={instructions_hash};manifest={manifest_hash};"
+        f"contract={PROMPT_CONTRACT_VERSION};"
+        f"runtime_version={runtime_version_hash};"
+        f"runtime_identity={runtime_identity_hash}"
     )
 
 
