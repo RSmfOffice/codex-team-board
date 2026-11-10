@@ -567,7 +567,7 @@ Merge commit:
 
 ### Phase 4D-3：不可复用 Agent Thread 清理
 
-状态：实现完成，待 Lead Review、合并和正式库归档
+状态：已完成并通过 Lead Review、主分支集成测试和正式库归档
 
 - [x] 识别 failed、superseded 和历史 cache profile 的 managed Thread。
 - [x] 保留 Native、current reusable、busy/starting 和活动引用记录。
@@ -581,6 +581,13 @@ Merge commit:
 - dry-run 不产生数据库写入。
 - apply 后目标归档，Native 与 current Thread 保持可见。
 - 归档项目、busy/starting 和活动引用记录跳过。
+- 186 tests OK, 1 skipped；UI smoke、JS syntax、compileall、diff check 通过。
+- Worker commit：`7e78b820e01d8d44ec76f0c0cff89a3f2c1974fb`。
+- Lead merge：`2b3cc1017f1fd6210d9c8525f29e2902e30eb73e`。
+- 正式库 dry-run 识别 23 个目标、0 skipped；apply 后归档 23 个。
+- 默认 Agent Threads 从 29 降为 6 个 Native；第二次 apply 新增 0。
+- 归档前备份：`team.sqlite.pre-agent-cleanup-20261110T140308Z.bak`，
+  `PRAGMA integrity_check=ok`。
 
 ---
 
