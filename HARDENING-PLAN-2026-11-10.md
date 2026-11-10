@@ -332,7 +332,7 @@ Merge commit:
 
 ### Phase 4A2：Workflow Epoch 与稳定前缀 cohort
 
-状态：代码与自动化验收完成，等待 Lead diff Review 和合并
+状态：已完成并通过 Lead Review、主分支集成和正式库迁移验证
 
 目标：让新 Goal/Task 只进入当前稳定前缀 cohort；旧 cohort 不被静默改写，
 也不能继续 claim、dispatch 或运行。
@@ -372,6 +372,14 @@ schema 20
 Core tools: team_read, team_write
 Core schema hash:
 86e78eef5f5f631094f5218d763c83997f5ab52d1ba22877f93092720f93fca6
+Live schema after migration:
+20
+Legacy-unbound rows:
+20 goals / 114 tasks / 108 jobs
+Worker commit:
+b5e3c5de5b5b8d61f96c3c6680ac3746081b4184
+Merge commit:
+84e6db48b0dcf9db6c7510fbb67dd3bbecb4aec7
 ```
 
 ---
