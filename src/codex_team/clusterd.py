@@ -11,7 +11,11 @@ from typing import Iterator
 from .cluster import ClusterManager, daemon_identity, daemon_paths
 from .config import Settings
 from .db import utc_now
-from .processes import pid_is_running
+from .processes import (
+    current_process_identity,
+    identity_record,
+    process_identity_matches,
+)
 
 
 def write_json_atomic(path: Path, value: object) -> None:
@@ -29,16 +33,23 @@ def acquire_lock(settings: Settings) -> Iterator[None]:
     lock_path, _, _ = daemon_paths(settings)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     descriptor: int | None = None
+    owner_identity = current_process_identity()
+    if not owner_identity:
+        raise RuntimeError("could not verify cluster daemon process identity")
     for _ in range(2):
         try:
             descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             break
         except FileExistsError:
             try:
-                pid = int(json.loads(lock_path.read_text(encoding="utf-8")).get("pid", 0))
+                payload = json.loads(lock_path.read_text(encoding="utf-8"))
             except (OSError, ValueError, TypeError):
-                pid = 0
-            if pid_is_running(pid):
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            recorded = identity_record(payload.get("process_identity"))
+            if process_identity_matches(recorded):
+                pid = recorded["pid"]
                 raise RuntimeError(f"cluster daemon already running (pid {pid})")
             try:
                 lock_path.unlink()
@@ -48,7 +59,13 @@ def acquire_lock(settings: Settings) -> Iterator[None]:
         raise RuntimeError("could not acquire cluster daemon lock")
     os.write(
         descriptor,
-        json.dumps({"pid": os.getpid(), "started_at": utc_now()}).encode("utf-8"),
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "process_identity": owner_identity,
+                "started_at": utc_now(),
+            }
+        ).encode("utf-8"),
     )
     os.close(descriptor)
     try:
@@ -56,7 +73,8 @@ def acquire_lock(settings: Settings) -> Iterator[None]:
     finally:
         try:
             data = json.loads(lock_path.read_text(encoding="utf-8"))
-            if int(data.get("pid", -1)) == os.getpid():
+            recorded = identity_record(data.get("process_identity"))
+            if process_identity_matches(recorded, owner_identity):
                 lock_path.unlink()
         except (FileNotFoundError, OSError, ValueError, TypeError):
             pass
@@ -68,6 +86,7 @@ def run(interval: float = 5.0, once: bool = False) -> int:
     _, state_path, _ = daemon_paths(settings)
     manager = ClusterManager(settings)
     identity = daemon_identity(settings)
+    process_identity = current_process_identity()
     try:
         with acquire_lock(settings):
             while True:
@@ -77,6 +96,7 @@ def run(interval: float = 5.0, once: bool = False) -> int:
                         "ok": True,
                         **result,
                         "pid": os.getpid(),
+                        "process_identity": process_identity,
                         "identity": identity,
                     }
                 except Exception as exc:
@@ -84,6 +104,7 @@ def run(interval: float = 5.0, once: bool = False) -> int:
                         "ok": False,
                         "tick_at": utc_now(),
                         "pid": os.getpid(),
+                        "process_identity": process_identity,
                         "identity": identity,
                         "error": str(exc),
                     }

@@ -6,7 +6,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
@@ -126,6 +126,9 @@ CREATE TABLE IF NOT EXISTS cluster_jobs (
         'starting', 'running', 'completed', 'failed', 'interrupted', 'lost'
     )),
     pid INTEGER,
+    process_creation_time TEXT,
+    process_executable TEXT,
+    process_instance_id TEXT,
     thread_id TEXT,
     attempt INTEGER NOT NULL DEFAULT 1,
     log_path TEXT NOT NULL,
@@ -369,6 +372,9 @@ CLUSTER_JOB_MIGRATION_COLUMNS = {
     "workflow_epoch": "TEXT NOT NULL DEFAULT ''",
     "agent_id": "TEXT",
     "actor": "TEXT NOT NULL DEFAULT ''",
+    "process_creation_time": "TEXT",
+    "process_executable": "TEXT",
+    "process_instance_id": "TEXT",
     "turn_id": "TEXT",
     "runtime": "TEXT NOT NULL DEFAULT 'exec'",
     "runtime_generation": "INTEGER",

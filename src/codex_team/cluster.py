@@ -21,7 +21,15 @@ from .cache_contract import agent_cache_profile, configured_surface
 from .config import Settings
 from .db import connect, connect_readonly, utc_now
 from .native_threads import discover_native_sessions, inspect_native_session
-from .processes import pid_is_running
+from .processes import (
+    ProcessJob,
+    identity_record,
+    persisted_identity_fields,
+    persisted_process_identity,
+    persisted_process_is_running,
+    process_identity,
+    process_identity_matches,
+)
 from .prompt_contract import (
     configured_access_mode,
     instructions_for_surface,
@@ -357,6 +365,7 @@ class ClusterManager:
         )
         self.lead_cooldown_seconds = max(0.0, float(lead_cooldown_seconds))
         self.processes: dict[str, subprocess.Popen[str]] = {}
+        self.process_jobs: dict[str, ProcessJob] = {}
         self.log_threads: dict[str, threading.Thread] = {}
         self.app_turns: dict[str, dict[str, Any]] = {}
         self.app_thread_jobs: dict[str, str] = {}
@@ -881,7 +890,9 @@ class ClusterManager:
                 for row in connection.execute(
                     """
                     SELECT job_id, goal_id, pid, role, task_id, agent_id,
-                           thread_id, turn_id, runtime
+                           thread_id, turn_id, runtime,
+                           process_creation_time, process_executable,
+                           process_instance_id
                     FROM cluster_jobs
                     WHERE goal_id = ? AND status IN ('starting', 'running')
                     """,
@@ -899,18 +910,10 @@ class ClusterManager:
                 ).fetchall()
             ]
         for job in active_jobs:
-            self.processes.pop(job["job_id"], None)
             if job.get("runtime") == "app_server":
                 self._interrupt_app_turn(job, reason)
                 continue
-            pid = int(job.get("pid") or 0)
-            if pid and pid_is_running(pid):
-                subprocess.run(
-                    ["taskkill", "/PID", str(pid), "/T", "/F"],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
+            self._terminate_exec_job(job, exit_code=-9)
         now = utc_now()
         with self.team.connection() as connection:
             for job in active_jobs:
@@ -1593,8 +1596,33 @@ class ClusterManager:
             raise ClusterError(str(exc)) from exc
 
     def close(self) -> None:
-        if self.runtime is not None:
-            self.runtime.stop()
+        try:
+            for job in list(self.process_jobs.values()):
+                job.close()
+            self.process_jobs.clear()
+            for process in list(self.processes.values()):
+                try:
+                    process.wait(timeout=5)
+                except (OSError, ValueError, subprocess.TimeoutExpired):
+                    pass
+                for stream in (
+                    process.stdin,
+                    process.stdout,
+                    process.stderr,
+                ):
+                    if stream is None or stream.closed:
+                        continue
+                    try:
+                        stream.close()
+                    except (OSError, ValueError):
+                        pass
+            self.processes.clear()
+            for pump in list(self.log_threads.values()):
+                pump.join(timeout=5)
+            self.log_threads.clear()
+        finally:
+            if self.runtime is not None:
+                self.runtime.stop()
 
     def tick(self) -> dict[str, Any]:
         with self._tick_lock:
@@ -3037,6 +3065,9 @@ Do not return raw logs or a full transcript.
             getattr(subprocess, "CREATE_NO_WINDOW", 0)
             | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         )
+        process: subprocess.Popen[str] | None = None
+        process_job: ProcessJob | None = None
+        process_record: dict[str, Any] = {}
         try:
             with log_path.open("a", encoding="utf-8") as log_stream:
                 log_stream.write(
@@ -3055,6 +3086,21 @@ Do not return raw logs or a full transcript.
                 creationflags=creationflags,
                 close_fds=True,
             )
+            try:
+                process_job = ProcessJob.attach(process)
+            except Exception:
+                if process.poll() is None:
+                    raise
+            process_record = process_identity(process.pid)
+            if (
+                os.name == "nt"
+                and getattr(process, "_handle", None)
+                and not process_record
+                and process.poll() is None
+            ):
+                raise ClusterError(
+                    f"could not verify {kind} process identity"
+                )
             if process.stdout is None:
                 raise ClusterError(f"could not capture {kind} output")
             pump = threading.Thread(
@@ -3069,6 +3115,29 @@ Do not return raw logs or a full transcript.
                 process.stdin.write(prompt)
                 process.stdin.close()
         except Exception as exc:
+            if process is not None:
+                if process_job is not None:
+                    process_job.close()
+                else:
+                    try:
+                        process.kill()
+                    except (OSError, ValueError):
+                        pass
+                try:
+                    process.wait(timeout=5)
+                except (OSError, ValueError, subprocess.TimeoutExpired):
+                    pass
+                for stream in (
+                    process.stdin,
+                    process.stdout,
+                    process.stderr,
+                ):
+                    if stream is None or stream.closed:
+                        continue
+                    try:
+                        stream.close()
+                    except (OSError, ValueError):
+                        pass
             safe_error = self._redact_error(str(exc))
             with self.team.connection() as connection:
                 if self._settle_job_row(
@@ -3090,15 +3159,30 @@ Do not return raw logs or a full transcript.
                 f"could not start {kind} process: {safe_error}"
             ) from exc
         self.processes[job_id] = process
+        if process_job is not None:
+            self.process_jobs[job_id] = process_job
+        identity_fields = persisted_identity_fields(process_record)
         with self.team.connection() as connection:
             connection.execute(
                 """
                 UPDATE cluster_jobs
-                SET status = 'running', pid = ?, thread_id = ?,
+                SET status = 'running', pid = ?,
+                    process_creation_time = ?,
+                    process_executable = ?,
+                    process_instance_id = ?,
+                    thread_id = ?,
                     thread_action = ?
                 WHERE job_id = ?
                 """,
-                (process.pid, resume_thread_id, thread_action, job_id),
+                (
+                    process.pid,
+                    identity_fields["process_creation_time"],
+                    identity_fields["process_executable"],
+                    identity_fields["process_instance_id"],
+                    resume_thread_id,
+                    thread_action,
+                    job_id,
+                ),
             )
             connection.execute(
                 """
@@ -3145,6 +3229,9 @@ Do not return raw logs or a full transcript.
                 """
                 UPDATE cluster_jobs
                 SET runtime = 'exec', status = 'starting', pid = NULL,
+                    process_creation_time = NULL,
+                    process_executable = NULL,
+                    process_instance_id = NULL,
                     thread_id = NULL, agent_id = NULL, turn_id = NULL,
                     runtime_generation = NULL, cache_profile = '',
                     thread_action = 'fallback_exec', error = ?
@@ -3286,6 +3373,17 @@ Do not return raw logs or a full transcript.
         except Exception:
             return {}
         return health if isinstance(health, Mapping) else {}
+
+    def _runtime_process_identity(self, runtime: Any) -> dict[str, Any]:
+        health = self._runtime_health(runtime)
+        record = identity_record(health.get("process_identity"))
+        if record:
+            return record
+        pid = health.get("pid")
+        try:
+            return process_identity(int(pid or 0))
+        except (TypeError, ValueError):
+            return {}
 
     def _current_runtime_generation(
         self,
@@ -3865,6 +3963,10 @@ Do not return raw logs or a full transcript.
                 raise _AppServerJobStartError(
                     "App Server runtime did not report an active generation"
                 )
+            runtime_process_identity = self._runtime_process_identity(runtime)
+            runtime_identity_fields = persisted_identity_fields(
+                runtime_process_identity
+            )
             with self._app_state_lock:
                 self.app_turns[job_id] = {
                     "thread_id": thread_id,
@@ -3885,7 +3987,10 @@ Do not return raw logs or a full transcript.
                     UPDATE cluster_jobs
                     SET status = 'running', thread_id = ?, agent_id = ?,
                         runtime_generation = ?, cache_profile = ?,
-                        thread_action = ?
+                        thread_action = ?, pid = ?,
+                        process_creation_time = ?,
+                        process_executable = ?,
+                        process_instance_id = ?
                     WHERE job_id = ?
                     """,
                     (
@@ -3894,6 +3999,10 @@ Do not return raw logs or a full transcript.
                         runtime_generation,
                         cache_profile,
                         thread_action,
+                        runtime_process_identity.get("pid"),
+                        runtime_identity_fields["process_creation_time"],
+                        runtime_identity_fields["process_executable"],
+                        runtime_identity_fields["process_instance_id"],
                         job_id,
                     ),
                 )
@@ -3948,6 +4057,10 @@ Do not return raw logs or a full transcript.
             ) from exc
         turn_id = turn["turn_id"]
         active_generation = self._current_runtime_generation(runtime)
+        active_process_identity = self._runtime_process_identity(runtime)
+        active_identity_fields = persisted_identity_fields(
+            active_process_identity
+        )
         with self._app_state_lock:
             state = self.app_turns.setdefault(job_id, {})
             state["thread_id"] = thread_id
@@ -3969,10 +4082,22 @@ Do not return raw logs or a full transcript.
                 """
                 UPDATE cluster_jobs
                 SET turn_id = ?,
-                    runtime_generation = COALESCE(?, runtime_generation)
+                    runtime_generation = COALESCE(?, runtime_generation),
+                    pid = COALESCE(?, pid),
+                    process_creation_time = COALESCE(?, process_creation_time),
+                    process_executable = COALESCE(?, process_executable),
+                    process_instance_id = COALESCE(?, process_instance_id)
                 WHERE job_id = ?
                 """,
-                (turn_id, active_generation, job_id),
+                (
+                    turn_id,
+                    active_generation,
+                    active_process_identity.get("pid"),
+                    active_identity_fields["process_creation_time"],
+                    active_identity_fields["process_executable"],
+                    active_identity_fields["process_instance_id"],
+                    job_id,
+                ),
             )
             connection.execute(
                 """
@@ -4289,20 +4414,25 @@ Do not return raw logs or a full transcript.
             process = self.processes.get(job["job_id"])
             if self._job_timed_out(job):
                 if process is not None and process.poll() is None:
-                    subprocess.run(
-                        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                        capture_output=True,
-                        text=True,
-                        check=False,
-                    )
+                    self._terminate_exec_job(job, exit_code=-9)
                 self._finish_job(job, -9, forced_error="job timeout")
                 continue
             exit_code = process.poll() if process is not None else None
             if process is not None and exit_code is None:
                 continue
-            if process is None and job.get("pid") and pid_is_running(int(job["pid"])):
+            if process is None and persisted_process_is_running(job):
                 continue
-            self._finish_job(job, exit_code)
+            if process is None:
+                self._finish_job(
+                    job,
+                    exit_code,
+                    forced_error=(
+                        "exec job process is not owned by this daemon instance"
+                    ),
+                    forced_status="lost",
+                )
+            else:
+                self._finish_job(job, exit_code)
         return {"count": len(rows)}
 
     def _reconcile_app_server_job(self, job: dict[str, Any]) -> None:
@@ -5234,10 +5364,28 @@ Do not return raw logs or a full transcript.
         forced_error: str = "",
         agent_already_failed: bool = False,
         context_overflow: bool = False,
+        forced_status: str | None = None,
     ) -> None:
+        if forced_status not in {
+            None,
+            "completed",
+            "failed",
+            "interrupted",
+            "lost",
+        }:
+            raise ClusterError(f"invalid forced job status: {forced_status}")
+        process = self.processes.get(str(job["job_id"]))
+        if process is not None:
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
         pump = self.log_threads.pop(job["job_id"], None)
         if pump is not None:
             pump.join(timeout=5)
+        process_job = self.process_jobs.pop(job["job_id"], None)
+        if process_job is not None:
+            process_job.close()
         for path_key in ("log_path", "output_path"):
             path_value = job.get(path_key)
             if path_value:
@@ -5287,7 +5435,9 @@ Do not return raw logs or a full transcript.
         if job["kind"] == "worker":
             task = self.team.get_task(job["task_id"])
             worker_ok = task["status"] in {"review", "done", "blocked"}
-            status = "completed" if process_ok and worker_ok else "failed"
+            status = forced_status or (
+                "completed" if process_ok and worker_ok else "failed"
+            )
             error = ""
             if not worker_ok:
                 error = "worker exited without submitting or blocking its task"
@@ -5340,7 +5490,7 @@ Do not return raw logs or a full transcript.
                 self._handle_worker_failure(job, error or process_error or "worker failure")
             return
 
-        status = "completed" if process_ok else "failed"
+        status = forced_status or ("completed" if process_ok else "failed")
         error = "" if process_ok else process_error or (
             f"lead process exited with code {exit_code}" if exit_code is not None else "lead process lost"
         )
@@ -5441,6 +5591,47 @@ Do not return raw logs or a full transcript.
             else self.worker_timeout_seconds
         )
         return (datetime.now(UTC) - started).total_seconds() > timeout
+
+    def _terminate_exec_job(
+        self,
+        job: Mapping[str, Any],
+        *,
+        exit_code: int,
+    ) -> bool:
+        job_id = str(job.get("job_id") or "")
+        process = self.processes.pop(job_id, None)
+        process_job = self.process_jobs.pop(job_id, None)
+        terminated = False
+        if process_job is not None:
+            terminated = process_job.terminate(exit_code)
+            process_job.close()
+        else:
+            expected = persisted_process_identity(job)
+            if not process_identity_matches(expected):
+                return False
+            result = subprocess.run(
+                ["taskkill", "/PID", str(expected["pid"]), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            terminated = result.returncode == 0 or not process_identity_matches(
+                expected
+            )
+        if process is not None:
+            try:
+                process.wait(timeout=5)
+                terminated = True
+            except subprocess.TimeoutExpired:
+                pass
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is None or stream.closed:
+                    continue
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    pass
+        return terminated
 
     def _handle_worker_failure(self, job: dict[str, Any], reason: str) -> None:
         task = self.team.get_task(job["task_id"])
@@ -6020,8 +6211,12 @@ def daemon_identity(settings: Settings) -> dict[str, Any]:
 def daemon_status(settings: Settings) -> dict[str, Any]:
     lock_path, state_path, log_path = daemon_paths(settings)
     pid = 0
+    lock_state: dict[str, Any] = {}
     try:
-        pid = int(json.loads(lock_path.read_text(encoding="utf-8")).get("pid", 0))
+        payload = json.loads(lock_path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            lock_state = payload
+            pid = int(payload.get("pid", 0))
     except (OSError, ValueError, TypeError):
         pass
     state: dict[str, Any] = {}
@@ -6031,17 +6226,28 @@ def daemon_status(settings: Settings) -> dict[str, Any]:
         pass
     expected_identity = daemon_identity(settings)
     actual_identity = state.get("identity") if isinstance(state, dict) else None
+    recorded_process = identity_record(
+        lock_state.get("process_identity")
+        if isinstance(lock_state, dict)
+        else None
+    )
+    process_verified = bool(
+        recorded_process
+        and int(recorded_process.get("pid") or 0) == pid
+        and process_identity_matches(recorded_process)
+    )
     return {
-        "running": bool(pid and pid_is_running(pid)),
+        "running": process_verified,
         "pid": pid or None,
+        "process_identity": recorded_process or None,
+        "process_identity_verified": process_verified,
         "lock_path": str(lock_path),
         "state_path": str(state_path),
         "log_path": str(log_path),
         "state": state,
         "expected_identity": expected_identity,
         "config_mismatch": bool(
-            pid
-            and pid_is_running(pid)
+            process_verified
             and actual_identity != expected_identity
         ),
     }
@@ -6100,19 +6306,35 @@ def ensure_daemon(settings: Settings) -> dict[str, Any]:
 def stop_daemon(settings: Settings) -> dict[str, Any]:
     current = daemon_status(settings)
     pid = int(current.get("pid") or 0)
-    if pid and pid_is_running(pid):
-        subprocess.run(
+    terminated = False
+    if current.get("running") and pid:
+        result = subprocess.run(
             ["taskkill", "/PID", str(pid), "/T", "/F"],
             capture_output=True,
             text=True,
             check=False,
         )
+        terminated = result.returncode == 0
+        if not terminated:
+            recorded = identity_record(current.get("process_identity"))
+            if process_identity_matches(recorded):
+                raise ClusterError(
+                    f"verified cluster daemon pid {pid} did not stop"
+                )
+            terminated = True
     lock_path, _, _ = daemon_paths(settings)
     try:
         lock_path.unlink()
     except FileNotFoundError:
         pass
-    return {"ok": True, "stopped_pid": pid or None}
+    return {
+        "ok": True,
+        "stopped_pid": pid if terminated else None,
+        "stale_pid": pid if pid and not terminated else None,
+        "process_identity_verified": bool(
+            current.get("process_identity_verified")
+        ),
+    }
 
 
 def restart_daemon(

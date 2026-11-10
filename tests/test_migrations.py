@@ -96,6 +96,9 @@ class MigrationTests(unittest.TestCase):
                         "uncached_input_tokens",
                         "model_context_window",
                         "workflow_epoch",
+                        "process_creation_time",
+                        "process_executable",
+                        "process_instance_id",
                     }.issubset(job_columns)
                 )
                 agent_columns = {
@@ -207,6 +210,9 @@ class MigrationTests(unittest.TestCase):
                         "outcome",
                         "settled_at",
                         "workflow_epoch",
+                        "process_creation_time",
+                        "process_executable",
+                        "process_instance_id",
                     }.issubset(columns)
                 )
                 operation_table = reopened.execute(
@@ -266,6 +272,70 @@ class MigrationTests(unittest.TestCase):
                 )
             finally:
                 reopened.close()
+
+    def test_schema_20_active_job_gains_null_process_identity_idempotently(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "schema-20-process-identity.sqlite"
+            connection = sqlite3.connect(path)
+            connection.executescript(
+                """
+                CREATE TABLE schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                );
+                INSERT INTO schema_migrations(version, applied_at)
+                VALUES (20, '2026-11-10T00:00:00Z');
+                CREATE TABLE cluster_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    goal_id TEXT NOT NULL,
+                    task_id TEXT,
+                    kind TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    pid INTEGER,
+                    thread_id TEXT,
+                    log_path TEXT NOT NULL,
+                    output_path TEXT NOT NULL,
+                    started_at TEXT NOT NULL
+                );
+                INSERT INTO cluster_jobs(
+                    job_id, goal_id, kind, role, status, pid,
+                    log_path, output_path, started_at
+                ) VALUES (
+                    'J-ACTIVE', 'G-20', 'worker', 'team_worker', 'running',
+                    4242, 'active.log', 'active.out', '2026-11-10T00:00:00Z'
+                );
+                PRAGMA user_version = 20;
+                """
+            )
+            connection.commit()
+            connection.close()
+
+            for _ in range(2):
+                upgraded = connect(path)
+                try:
+                    active = upgraded.execute(
+                        """
+                        SELECT status, pid, process_creation_time,
+                               process_executable, process_instance_id
+                        FROM cluster_jobs WHERE job_id = 'J-ACTIVE'
+                        """
+                    ).fetchone()
+                    self.assertEqual(active["status"], "running")
+                    self.assertEqual(active["pid"], 4242)
+                    self.assertIsNone(active["process_creation_time"])
+                    self.assertIsNone(active["process_executable"])
+                    self.assertIsNone(active["process_instance_id"])
+                    self.assertEqual(
+                        upgraded.execute(
+                            "PRAGMA user_version"
+                        ).fetchone()[0],
+                        SCHEMA_VERSION,
+                    )
+                finally:
+                    upgraded.close()
 
     def test_schema_17_goal_stall_columns_migrate_idempotently(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
