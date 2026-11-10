@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
+from .cache_contract import cache_profile_contract_status
 from .db import connect, connect_readonly, utc_now
 
 
@@ -249,6 +250,121 @@ class AgentPool:
                 agent_id,
             ),
         )
+
+    def archive_stale_managed_agents(
+        self,
+        *,
+        actor: str = "human",
+        reason: str = "archive failed and non-reusable managed agents",
+        apply: bool = False,
+    ) -> dict[str, Any]:
+        actor = self._require_text(actor, "actor")
+        reason = self._require_text(reason, "reason")
+        if len(reason) > 2000:
+            raise AgentPoolError("reason must not exceed 2000 characters")
+        now = utc_now()
+        candidates: list[dict[str, Any]] = []
+        skipped: list[dict[str, str]] = []
+        archived: list[str] = []
+        with self._connection(write=apply) as connection:
+            if apply:
+                connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                SELECT a.*, p.archived_at AS project_archived_at
+                FROM cluster_agents a
+                JOIN projects p ON p.project_id = a.project_id
+                WHERE a.runtime = 'managed' AND a.archived_at IS NULL
+                ORDER BY a.updated_at, a.agent_id
+                """
+            ).fetchall()
+            for row in rows:
+                agent_id = str(row["agent_id"])
+                contract = cache_profile_contract_status(row["profile"])
+                reasons: list[str] = []
+                if row["status"] == "failed":
+                    reasons.append("failed")
+                if row["status"] == "superseded":
+                    reasons.append("superseded")
+                if contract != "current":
+                    reasons.append(f"profile_{contract}")
+                if not reasons:
+                    continue
+                if row["status"] in {"starting", "busy"}:
+                    skipped.append(
+                        {
+                            "agent_id": agent_id,
+                            "reason": f"active_status:{row['status']}",
+                        }
+                    )
+                    continue
+                if row["project_archived_at"] is not None:
+                    skipped.append(
+                        {
+                            "agent_id": agent_id,
+                            "reason": "project_archived",
+                        }
+                    )
+                    continue
+                if any(
+                    row[field] is not None
+                    for field in (
+                        "current_goal_id",
+                        "current_task_id",
+                        "current_job_id",
+                    )
+                ):
+                    skipped.append(
+                        {
+                            "agent_id": agent_id,
+                            "reason": "active_reference",
+                        }
+                    )
+                    continue
+                candidates.append(
+                    {
+                        "agent_id": agent_id,
+                        "thread_id": str(row["thread_id"]),
+                        "role": str(row["role"]),
+                        "status": str(row["status"]),
+                        "contract": contract,
+                        "reasons": reasons,
+                    }
+                )
+            if apply:
+                for candidate in candidates:
+                    agent_id = str(candidate["agent_id"])
+                    updated = connection.execute(
+                        """
+                        UPDATE cluster_agents
+                        SET archived_at = ?, updated_at = ?
+                        WHERE agent_id = ? AND archived_at IS NULL
+                        """,
+                        (now, now, agent_id),
+                    )
+                    if updated.rowcount != 1:
+                        continue
+                    archived.append(agent_id)
+                    self._event(
+                        connection,
+                        agent_id,
+                        "archived_stale",
+                        actor,
+                        {
+                            "reason": reason,
+                            "reasons": candidate["reasons"],
+                            "contract": candidate["contract"],
+                        },
+                        created_at=now,
+                    )
+        return {
+            "apply": apply,
+            "candidate_count": len(candidates),
+            "candidates": candidates,
+            "skipped": skipped,
+            "archived_count": len(archived),
+            "archived": archived,
+        }
 
     def register_thread(
         self,

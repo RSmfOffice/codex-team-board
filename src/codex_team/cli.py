@@ -230,6 +230,13 @@ def build_parser() -> argparse.ArgumentParser:
     agent_reset.add_argument("agent_id")
     agent_reset.add_argument("--actor", default="human")
     agent_reset.add_argument("--reason", default="manual reset requested through CLI")
+    agent_archive_stale = agent_sub.add_parser("archive-stale")
+    agent_archive_stale.add_argument("--actor", default="human")
+    agent_archive_stale.add_argument(
+        "--reason",
+        default="archive failed and non-reusable managed agents",
+    )
+    agent_archive_stale.add_argument("--apply", action="store_true")
     native_register = agent_sub.add_parser("register-native")
     native_register.add_argument("--repo", default=".")
     native_register.add_argument("--thread-id", required=True)
@@ -545,6 +552,14 @@ def main(argv: list[str] | None = None) -> int:
                         args.agent_id,
                         actor=args.actor,
                         reason=args.reason,
+                    )
+                )
+            elif args.agent_command == "archive-stale":
+                _print(
+                    team.archive_stale_agents(
+                        actor=args.actor,
+                        reason=args.reason,
+                        apply=args.apply,
                     )
                 )
             elif args.agent_command == "register-native":

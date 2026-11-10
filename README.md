@@ -816,6 +816,20 @@ CLI、MCP、ClusterManager 和 WebUI 的 reset 都统一进入
 `AgentPool.request_reset`；`starting`/`busy`、`superseded` 和已归档 Agent
 会被拒绝，避免重置正在执行或已失效的 thread。
 
+清理不可复用的 managed Thread 使用：
+
+```powershell
+.\scripts\team.ps1 agent archive-stale `
+  --actor human `
+  --reason "clean historical failed Agent threads"
+```
+
+命令默认只返回 dry-run 候选，不写数据库；确认后追加 `--apply`。清理范围是
+`failed`、`superseded` 以及 cache profile contract 非 `current` 的 managed
+Thread。Native Thread、current reusable Thread、`busy/starting` 和仍绑定活动
+Goal/Task/Job 的记录不会归档。归档是可恢复软删除：默认诊断隐藏，include-archived
+仍可查询，Agent events、cluster jobs 和 Codex session 文件全部保留。
+
 ### Native 子 Agent 登记
 
 Codex 原生子 Agent 不会进入 managed AgentPool 的自动复用池。创建 thread 后，
