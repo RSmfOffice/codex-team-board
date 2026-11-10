@@ -177,7 +177,7 @@ Merge commit:
 
 ### Phase 2：Assignment、外部副作用 Saga 和统一 Settlement
 
-状态：实现与自动化验收完成，等待 Lead diff Review 和合并
+状态：已完成并通过 Lead Review、合并和真实库迁移验证
 
 目标：把一次执行收敛成可追踪的 attempt。
 
@@ -206,6 +206,16 @@ compileall ok
 schema 18
 Core schema hash:
 86e78eef5f5f631094f5218d763c83997f5ab52d1ba22877f93092720f93fca6
+Worker commit:
+397525b99eb67d2264373cdb5ba87247ab7b6d5e
+Merge commit:
+602e98ce7c11136dc7fbfb547ef819302aeb762d
+Live schema after migration:
+18
+Terminal jobs missing settlement:
+0
+Jobs missing correlation:
+0
 ```
 
 ---
