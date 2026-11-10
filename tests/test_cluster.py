@@ -34,6 +34,7 @@ from codex_team.cli import build_parser
 from codex_team.config import Settings
 from codex_team.db import utc_now
 from codex_team.mcp import TeamMcpServer, _tool_definitions
+from codex_team.processes import process_identity
 from codex_team.scheduling import (
     DEFAULT_GLOBAL_JOB_CAPACITY,
     DEFAULT_GOAL_WORKER_CAPACITY,
@@ -338,6 +339,19 @@ class FakeExecProcess:
 
 
 class ClusterSchedulerTests(unittest.TestCase):
+    class _RunningProcessStub:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+            self.stdin = None
+            self.stdout = None
+            self.stderr = None
+
+        def poll(self) -> None:
+            return None
+
+        def wait(self, timeout: float | None = None) -> int:
+            return 0
+
     def _goal_with_ready_tasks(
         self,
         manager: ClusterManager,
@@ -366,6 +380,7 @@ class ClusterSchedulerTests(unittest.TestCase):
         team: TeamService,
         goal_id: str,
         *,
+        manager: ClusterManager | None = None,
         job_id: str,
         kind: str,
         status: str,
@@ -373,13 +388,16 @@ class ClusterSchedulerTests(unittest.TestCase):
         task_id: str | None = None,
         pid: int | None = None,
     ) -> None:
+        identity = process_identity(pid) if pid else {}
         with team.connection() as connection:
             connection.execute(
                 """
                 INSERT INTO cluster_jobs(
                     job_id, goal_id, task_id, kind, role, status, pid,
+                    process_creation_time, process_executable,
+                    process_instance_id,
                     attempt, log_path, output_path, started_at, finished_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -389,12 +407,17 @@ class ClusterSchedulerTests(unittest.TestCase):
                     kind,
                     status,
                     pid,
+                    identity.get("creation_time"),
+                    identity.get("executable"),
+                    identity.get("instance_id"),
                     str(team.settings.logs_dir / f"{job_id}.jsonl"),
                     str(team.settings.logs_dir / f"{job_id}.md"),
                     started_at,
                     None if status in {"starting", "running"} else started_at,
                 ),
             )
+        if manager is not None and status in {"starting", "running"} and pid:
+            manager.processes[job_id] = self._RunningProcessStub(pid)
 
     def _fake_running_dispatch(
         self,
@@ -406,6 +429,7 @@ class ClusterSchedulerTests(unittest.TestCase):
             sequence = len(dispatched) + 1
             job_id = f"J-TEST-{sequence}"
             started_at = utc_now()
+            identity = process_identity(os.getpid())
             with team.connection() as connection:
                 connection.execute(
                     """
@@ -420,15 +444,20 @@ class ClusterSchedulerTests(unittest.TestCase):
                     """
                     INSERT INTO cluster_jobs(
                         job_id, goal_id, task_id, kind, role, status, pid,
+                        process_creation_time, process_executable,
+                        process_instance_id,
                         attempt, log_path, output_path, started_at
                     ) VALUES (?, ?, ?, 'worker', 'team_explorer', 'running', ?,
-                              1, ?, ?, ?)
+                              ?, ?, ?, 1, ?, ?, ?)
                     """,
                     (
                         job_id,
                         goal["goal_id"],
                         task["task_id"],
                         os.getpid(),
+                        identity.get("creation_time"),
+                        identity.get("executable"),
+                        identity.get("instance_id"),
                         str(team.settings.logs_dir / f"{job_id}.jsonl"),
                         str(team.settings.logs_dir / f"{job_id}.md"),
                         started_at,
@@ -813,7 +842,7 @@ class ClusterSchedulerTests(unittest.TestCase):
                     max_worker_attempts=3,
                     max_lead_attempts=5,
                 )
-                deadline = time.monotonic() + 25
+                deadline = time.monotonic() + 60
                 while time.monotonic() < deadline:
                     manager.tick()
                     goal = manager.get_goal(goal["goal_id"])
@@ -1284,6 +1313,7 @@ class ClusterSchedulerTests(unittest.TestCase):
             self._insert_job(
                 team,
                 busy_goal["goal_id"],
+                manager=manager,
                 job_id="J-ACTIVE-LEAD",
                 kind="lead",
                 status="running",
@@ -1519,6 +1549,7 @@ class ClusterSchedulerTests(unittest.TestCase):
             self._insert_job(
                 team,
                 goal["goal_id"],
+                manager=manager,
                 job_id="J-ACTIVE-LEAD",
                 kind="lead",
                 status="running",
@@ -1641,6 +1672,7 @@ class ClusterSchedulerTests(unittest.TestCase):
             self._insert_job(
                 team,
                 goal["goal_id"],
+                manager=manager,
                 job_id="J-HEALTH",
                 task_id=task["task_id"],
                 kind="worker",

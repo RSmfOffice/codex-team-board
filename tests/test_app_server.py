@@ -176,6 +176,9 @@ class AppServerRuntimeTests(unittest.TestCase):
             service_name="codex-team-test",
         )
         self.assertEqual(thread_id, "thread-1")
+        health = runtime.health()
+        self.assertTrue(health["process_identity"])
+        self.assertEqual(health["job_object"], os.name == "nt")
         wait_for(lambda: bool(events.thread_started))
         self.assertEqual(events.thread_started[0][0], thread_id)
 

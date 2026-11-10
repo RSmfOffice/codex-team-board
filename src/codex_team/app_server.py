@@ -14,6 +14,10 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence, TypedDict
 
 from . import __version__
+from .processes import (
+    ProcessJob,
+    process_identity as get_process_identity,
+)
 from .redaction import redact_sensitive_text
 
 
@@ -349,6 +353,8 @@ class AppServerRuntime:
         self._state_lock = threading.RLock()
         self._write_lock = threading.Lock()
         self._process: subprocess.Popen | None = None
+        self._process_job: ProcessJob | None = None
+        self._process_identity: dict[str, Any] = {}
         self._reader_thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
         self._event_queue: queue.Queue[_EventDispatch | None] | None = None
@@ -435,6 +441,12 @@ class AppServerRuntime:
                 "initialized": initialized,
                 "healthy": initialized,
                 "pid": process.pid if process_running and process is not None else None,
+                "process_identity": (
+                    dict(self._process_identity)
+                    if process_running and self._process_identity
+                    else None
+                ),
+                "job_object": self._process_job is not None,
                 "generation": self._generation,
                 "restart_count": self._restart_count,
                 "last_return_code": self._last_return_code,
@@ -611,13 +623,56 @@ class AppServerRuntime:
             with self._state_lock:
                 self._last_error = message
             raise AppServerStartupError(message) from exc
+        try:
+            process_job = ProcessJob.attach(process)
+        except Exception as exc:
+            try:
+                process.kill()
+                process.wait(timeout=self.stop_timeout)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is None or stream.closed:
+                    continue
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    pass
+            message = f"failed to assign App Server Job Object: {exc}"
+            with self._state_lock:
+                self._last_error = message
+            raise AppServerStartupError(message) from exc
+        process_identity = get_process_identity(process.pid)
+        if not process_identity:
+            if process_job is not None:
+                process_job.close()
+            try:
+                process.kill()
+                process.wait(timeout=self.stop_timeout)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is None or stream.closed:
+                    continue
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    pass
+            message = "failed to verify App Server process identity"
+            with self._state_lock:
+                self._last_error = message
+            raise AppServerStartupError(message)
         if process.stdin is None or process.stdout is None or process.stderr is None:
+            if process_job is not None:
+                process_job.close()
             process.kill()
             raise AppServerStartupError("App Server stdio pipes were not created")
 
         with self._state_lock:
             self._generation = generation
             self._process = process
+            self._process_job = process_job
+            self._process_identity = dict(process_identity)
         event_queue: queue.Queue[_EventDispatch | None] = queue.Queue()
         event_thread = threading.Thread(
             target=self._dispatch_events,
@@ -670,6 +725,7 @@ class AppServerRuntime:
     def _stop_locked(self) -> None:
         with self._state_lock:
             process = self._process
+            process_job = self._process_job
             self._stopping = True
             self._initialized = False
             self._fail_pending_locked(
@@ -684,23 +740,27 @@ class AppServerRuntime:
             try:
                 process.wait(timeout=self.stop_timeout)
             except subprocess.TimeoutExpired:
-                try:
-                    process.terminate()
-                except OSError:
-                    pass
+                if not (process_job is not None and process_job.terminate()):
+                    try:
+                        process.terminate()
+                    except OSError:
+                        pass
                 try:
                     process.wait(timeout=self.stop_timeout)
                 except subprocess.TimeoutExpired:
-                    try:
-                        process.kill()
-                    except OSError:
-                        pass
+                    if not (process_job is not None and process_job.terminate()):
+                        try:
+                            process.kill()
+                        except OSError:
+                            pass
                     try:
                         process.wait(timeout=self.stop_timeout)
                     except subprocess.TimeoutExpired:
                         pass
             except OSError:
                 pass
+        if process_job is not None:
+            process_job.close()
         with self._state_lock:
             reader = self._reader_thread
             stderr_reader = self._stderr_thread
@@ -725,6 +785,8 @@ class AppServerRuntime:
         with self._state_lock:
             if self._process is process:
                 self._process = None
+                self._process_job = None
+                self._process_identity = {}
                 self._reader_thread = None
                 self._stderr_thread = None
             if self._event_queue is event_queue:
@@ -1055,9 +1117,12 @@ class AppServerRuntime:
         process: subprocess.Popen,
         generation: int,
     ) -> None:
+        process_job: ProcessJob | None = None
         with self._state_lock:
             if process is not self._process or generation != self._generation:
                 return
+            process_job = self._process_job
+            self._process_job = None
             return_code = process.poll()
             self._last_return_code = return_code
             self._initialized = False
@@ -1068,6 +1133,8 @@ class AppServerRuntime:
             self._fail_pending_locked(
                 AppServerDisconnectedError("App Server disconnected")
             )
+        if process_job is not None:
+            process_job.close()
 
     def _fail_pending_locked(self, error: AppServerError) -> None:
         pending = list(self._pending.values())
