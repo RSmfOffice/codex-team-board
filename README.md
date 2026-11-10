@@ -871,6 +871,8 @@ Native session 的 token 数据来自 `subagent_history_start_ordinal` 之后的
 `token_usage_record` 和 `token_count`。Dashboard 显示最近一次 input/cached/
 uncached/context 和累计 cache rate；session 尚无 usage 事件时显示 `—`，不会把
 数据库默认 `0` 误报成真实用量。显式记录的零值仍保持为 `0`。
+已经在 `cluster_agents` 登记的 native Thread 即使超过自动发现时间窗，也仍会
+检查其 session 并刷新 usage。
 
 ### Workstream checkpoint
 
