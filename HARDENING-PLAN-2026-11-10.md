@@ -537,7 +537,7 @@ Merge commit:
 
 ### Phase 4D-2：Native Session Token Usage
 
-状态：实现完成，待 Lead Review、合并和正式库 usage 刷新
+状态：已完成并通过 Lead Review、主分支集成测试和正式库 usage 回填
 
 - [x] 以 `subagent_history_start_ordinal` 隔离父 Thread 历史。
 - [x] 解析 `token_usage_record` 与 `token_count` 的 last/total usage。
@@ -553,6 +553,15 @@ Merge commit:
 - 首次无 usage 的 native Agent 在追加 token 事件后可自动刷新。
 - UI smoke 验证 native context/cache/uncached 与 unknown 语义。
 - 不改数据库 schema，不引入第二 usage 状态源。
+- 185 tests OK, 1 skipped；UI smoke、JS syntax、compileall、diff check 通过。
+- Core tool schema hash 保持
+  `86e78eef5f5f631094f5218d763c83997f5ab52d1ba22877f93092720f93fca6`。
+- Parser Worker：`ddc2b9784f7b6aae9a0a6dc4ba57f0e3d6472f31`；Merge：
+  `869ef9909be0aa323bbfa6d22d55da99dfa409d4`。
+- 窗口外刷新 Worker：`fa55a88e5ef7971d48e1f7b0cf6d2843fae5928d`；Merge：
+  `d8b94503f61ad95fb1dd13a45aa298447afd6ddf`。
+- 正式库 6 个 native Agent 全部 `usage_available=true`；其中 5 个
+  `cache_prefix_review` 显示真实 context/cache/uncached，错误为 0。
 
 ---
 
