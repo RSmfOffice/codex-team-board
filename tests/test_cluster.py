@@ -5282,7 +5282,7 @@ class ClusterSchedulerTests(unittest.TestCase):
                 },
             )
             self.assertTrue(
-                migrated["workflow_epoch"].startswith("workflow-v3:")
+                migrated["workflow_epoch"].startswith("workflow-v4:")
             )
             listed = server.call_tool(
                 "team_agent_list",

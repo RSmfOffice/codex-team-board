@@ -54,6 +54,8 @@ let pollFailures = 0;
 let refreshQueued = false;
 let queuedForceRender = false;
 let lastBoardSignature = "";
+let lastBoardRevision = "";
+let detailRequestVersion = 0;
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -71,10 +73,13 @@ function timeText(value) {
 }
 
 function ageText(seconds) {
-  if (!seconds) return "刚刚";
-  if (seconds < 60) return `${seconds} 秒`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)} 分钟`;
-  return `${Math.floor(seconds / 3600)} 小时`;
+  if (seconds === null || seconds === undefined || seconds === "") return "—";
+  const parsed = Number(seconds);
+  if (!Number.isFinite(parsed)) return "—";
+  if (parsed <= 0) return "刚刚";
+  if (parsed < 60) return `${Math.floor(parsed)} 秒`;
+  if (parsed < 3600) return `${Math.floor(parsed / 60)} 分钟`;
+  return `${Math.floor(parsed / 3600)} 小时`;
 }
 
 function nonNegativeNumber(value, fallback = 0) {
@@ -133,6 +138,7 @@ function workflowEpochText(value) {
 function jobRuntimeHtml(job) {
   if (!job) return "";
   const runtime = String(job.runtime || "").trim();
+  const threadAction = String(job.thread_action || "").trim().toLowerCase();
   const thread = job.thread_id ?? job.thread;
   const turn = job.turn_id ?? job.turn;
   const cached = job.cached_input_tokens ?? job.cached_tokens;
@@ -142,8 +148,20 @@ function jobRuntimeHtml(job) {
   const hasCacheRate = job.cache_hit_rate !== undefined
     && job.cache_hit_rate !== null;
   const badges = [];
-  if (runtime) {
-    badges.push(`<span>${runtime === "app_server" ? "thread reuse" : "fresh exec"}</span>`);
+  const actionLabels = {
+    fresh: "fresh thread",
+    resume: "resume thread",
+    fresh_exec: "fresh exec",
+    fallback_exec: "fallback exec",
+  };
+  if (threadAction) {
+    badges.push(
+      `<span>${escapeHtml(actionLabels[threadAction] || `action ${threadAction}`)}</span>`,
+    );
+  } else if (runtime) {
+    badges.push(
+      `<span>${runtime === "app_server" ? "thread reuse" : "exec runtime"}</span>`,
+    );
   }
   if (thread !== undefined && thread !== null && thread !== "") {
     badges.push(`<span>thread ${escapeHtml(thread)}</span>`);
@@ -339,6 +357,7 @@ function syncProjectSelection(projectId, { refresh = true } = {}) {
     clusterSelect.value = selectedProject;
   }
   closeDetail();
+  lastBoardRevision = "";
   if (refresh) void requestImmediateRefresh();
 }
 
@@ -383,6 +402,7 @@ function summaryNumber(summary, keys, fallback) {
       continue;
     }
     const value = summary[key];
+    if (value === null || value === undefined || value === "") continue;
     if (Array.isArray(value)) return value.length;
     if (typeof value === "boolean") return value ? 1 : 0;
     const number = Number(value);
@@ -953,21 +973,8 @@ function renderMessages(messages) {
     </article>`).join("");
 }
 
-function showDetail(taskId) {
-  const task = tasksById.get(taskId);
-  if (!task) return;
-  selectedTaskId = taskId;
-  const dependencies = task.blocked_by?.length
-    ? task.blocked_by.map((item) => `${item.task_id} (${item.status})`).join(", ")
-    : "无";
-  const body = document.getElementById("detail-body");
-  const events = (eventsByTask.get(taskId) || []).slice(-12).reverse();
-  const runtime = task.active_job
-    ? `${task.active_job.kind}:${task.active_job.role} · ${task.active_job.status} · PID ${task.active_job.pid || "—"}`
-    : task.status === "ready"
-      ? `等待认领 ${ageText(task.claim_wait_seconds)}`
-      : "—";
-  const timeline = events.length
+function renderDetailTimeline(events) {
+  return events.length
     ? events.map((event) => `
         <div class="timeline-row">
           <span>${escapeHtml(event.event_type)}</span>
@@ -975,6 +982,19 @@ function showDetail(taskId) {
           <time>${escapeHtml(timeText(event.created_at))}</time>
         </div>`).join("")
     : '<div class="empty">暂无事件</div>';
+}
+
+function renderTaskDetail(task, events) {
+  const dependencies = task.blocked_by?.length
+    ? task.blocked_by.map((item) => `${item.task_id} (${item.status})`).join(", ")
+    : "无";
+  const body = document.getElementById("detail-body");
+  const orderedEvents = [...events].slice(-12).reverse();
+  const runtime = task.active_job
+    ? `${task.active_job.kind}:${task.active_job.role} · ${task.active_job.status} · PID ${task.active_job.pid || "—"}`
+    : task.status === "ready"
+      ? `等待认领 ${ageText(task.claim_wait_seconds)}`
+      : "—";
   body.innerHTML = `
     <div class="eyebrow">${escapeHtml(task.task_id)} · ${escapeHtml(task.status)}${task.archived_at ? " · 已归档" : ""}</div>
     <h2>${escapeHtml(task.title)}</h2>
@@ -998,12 +1018,52 @@ function showDetail(taskId) {
     <div class="detail-section"><h3>结果</h3><p>${escapeHtml(task.result || "—")}</p></div>
     <div class="detail-section"><h3>测试</h3><p>${escapeHtml(task.tests || "—")}</p></div>
     <div class="detail-section"><h3>Review</h3><p>${escapeHtml(task.review_notes || "—")}</p></div>
-    <div class="detail-section"><h3>交接事件</h3><div class="timeline">${timeline}</div></div>`;
+    <div class="detail-section"><h3>交接事件</h3><div class="timeline">${renderDetailTimeline(orderedEvents)}</div></div>`;
   document.getElementById("detail").classList.remove("hidden");
   updateArchiveButton();
 }
 
+async function hydrateTaskDetailEvents(taskId, requestVersion) {
+  const params = new URLSearchParams({ limit: "12" });
+  try {
+    const data = await requestJson(
+      `/api/tasks/${encodeURIComponent(taskId)}/events?${params.toString()}`,
+      { cache: "no-store" },
+      "task events",
+    );
+    if (
+      requestVersion !== detailRequestVersion
+      || selectedTaskId !== taskId
+      || !tasksById.has(taskId)
+    ) {
+      return;
+    }
+    renderTaskDetail(
+      tasksById.get(taskId),
+      Array.isArray(data.events) ? data.events : [],
+    );
+  } catch (error) {
+    if (requestVersion === detailRequestVersion && selectedTaskId === taskId) {
+      const timeline = document.querySelector(".timeline");
+      if (timeline) {
+        timeline.innerHTML = `<div class="empty">事件读取失败：${escapeHtml(error.message)}</div>`;
+      }
+    }
+  }
+}
+
+function showDetail(taskId) {
+  const task = tasksById.get(taskId);
+  if (!task) return;
+  selectedTaskId = taskId;
+  detailRequestVersion += 1;
+  const requestVersion = detailRequestVersion;
+  renderTaskDetail(task, eventsByTask.get(taskId) || []);
+  void hydrateTaskDetailEvents(taskId, requestVersion);
+}
+
 function closeDetail() {
+  detailRequestVersion += 1;
   selectedTaskId = "";
   document.getElementById("detail").classList.add("hidden");
   updateArchiveButton();
@@ -1069,16 +1129,29 @@ async function pollBoard({ forceRender = false } = {}) {
     if (selectedProject) params.set("project_id", selectedProject);
     if (includeArchived) params.set("include_archived", "1");
     const suffix = params.size ? `?${params.toString()}` : "";
-    const data = await requestJson(
-      `/api/board${suffix}`,
+    const summary = await requestJson(
+      `/api/summary${suffix}`,
       { cache: "no-store", signal: activeRequest.signal },
-      "board",
+      "summary",
     );
-    renderBoard(data, { force: forceRender });
+    const revision = String(summary.revision || "");
+    const boardRequired = forceRender
+      || !lastBoardRevision
+      || revision !== lastBoardRevision
+      || tasksById.size === 0;
+    if (boardRequired) {
+      const data = await requestJson(
+        `/api/board${suffix}`,
+        { cache: "no-store", signal: activeRequest.signal },
+        "board",
+      );
+      renderBoard(data, { force: forceRender });
+      lastBoardRevision = String(data.revision || revision);
+    }
     const downBefore = pollFailures > 0;
     pollFailures = 0;
     setConnectionState(
-      `已同步 ${new Date().toLocaleTimeString("zh-CN")}${downBefore ? " · 已恢复" : ""}`,
+      `${boardRequired ? "已同步" : "已检查 · 无变化"} ${new Date().toLocaleTimeString("zh-CN")}${downBefore ? " · 已恢复" : ""}`,
       "ok",
     );
     schedulePoll(POLL_INTERVAL_MS);
@@ -1126,6 +1199,7 @@ function handleVisibilityChange() {
     return;
   }
   refreshQueued = false;
+  lastBoardRevision = "";
   void pollBoard();
 }
 
@@ -1364,6 +1438,7 @@ function initializeDashboard() {
     const project = projectsById.get(selectedProject);
     if (!includeArchived && project?.archived_at) selectedProject = "";
     projectsLoaded = false;
+    lastBoardRevision = "";
     void requestImmediateRefresh();
   });
   document.getElementById("archive-target").addEventListener(
@@ -1383,6 +1458,7 @@ function initializeDashboard() {
 
 if (typeof window !== "undefined") {
   window.TeamBoardTestHooks = Object.freeze({
+    ageText,
     backoffDelay,
     buildBoardSignature,
     buildClusterMetrics,
@@ -1390,9 +1466,12 @@ if (typeof window !== "undefined") {
     goalHeartbeatInfo,
     goalHealth,
     goalQueueReason,
+    jobRuntimeHtml,
     nextActionText,
     renderBoard,
     renderAgentThreads,
+    summaryNumber,
+    tokenText,
     waitDurationText,
     workflowEpochText,
   });

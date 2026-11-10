@@ -57,7 +57,9 @@ expectText(app, "/api/clusters/control", "app.js");
 expectText(app, "/api/clusters/archive", "app.js");
 expectText(app, "/api/agents/reset", "app.js");
 expectText(app, "/api/board", "app.js");
+expectText(app, "/api/summary", "app.js");
 expectText(app, "/api/projects", "app.js");
+expectText(app, "/api/tasks/${encodeURIComponent(taskId)}/events", "app.js");
 expectText(app, "data.cluster_summary", "app.js");
 expectText(app, "goal?.health", "app.js");
 expectText(app, "goal?.next_action", "app.js");
@@ -157,7 +159,9 @@ assert.ok(
   !pollBoardSource.includes("/api/projects"),
   "pollBoard must not fetch projects after the one-time project load",
 );
-assert.ok(pollBoardSource.includes("/api/board"), "pollBoard must fetch the board");
+expectText(pollBoardSource, "/api/summary", "pollBoard summary probe");
+expectText(pollBoardSource, "boardRequired", "pollBoard revision gate");
+expectText(pollBoardSource, "/api/board", "pollBoard conditional board fetch");
 
 const visibilitySource = between(
   app,
@@ -242,7 +246,7 @@ const firstBoard = {
     kind: "write",
     owner_role: "team_worker",
     priority: 1,
-    workflow_epoch: "workflow-v3:taskcohort1234567890",
+    workflow_epoch: "workflow-v4:taskcohort1234567890",
     project_name: "Demo",
     blocked_by: [],
     claim_wait_seconds: 62,
@@ -253,7 +257,7 @@ const firstBoard = {
       role: "team_worker",
       status: "running",
       runtime: "app_server",
-      workflow_epoch: "workflow-v3:taskcohort1234567890",
+      workflow_epoch: "workflow-v4:taskcohort1234567890",
       thread_id: "thread-task-1",
       turn_id: "turn-3",
       cached_input_tokens: 1500,
@@ -305,7 +309,7 @@ const firstBoard = {
       objective: "验证两个并发目标的警告心跳与全局容量队列",
       project_name: "Demo",
       autonomy: "auto",
-      workflow_epoch: "workflow-v3:goalcohort1234567890",
+      workflow_epoch: "workflow-v4:goalcohort1234567890",
       lead_ticks: 2,
       health: { state: "warning", label: "Worker 心跳延迟" },
       next_action: { action: "检查 Worker 进度" },
@@ -323,7 +327,7 @@ const firstBoard = {
       objective: "验证关键心跳、目标容量排队与完整卡片展示",
       project_name: "Demo",
       autonomy: "supervised",
-      workflow_epoch: "workflow-v3:goalcohort1234567890",
+      workflow_epoch: "workflow-v4:goalcohort1234567890",
       lead_ticks: 5,
       health: { state: "critical", label: "心跳严重超时" },
       next_action: { action: "排查卡住的 Worker" },
@@ -339,7 +343,7 @@ const firstBoard = {
       objective: "保留暂停目标控制",
       project_name: "Demo",
       autonomy: "supervised",
-      workflow_epoch: "workflow-v3:goalcohort1234567890",
+      workflow_epoch: "workflow-v4:goalcohort1234567890",
       lead_ticks: 1,
       active_job_count: 0,
       heartbeat_state: "idle",
@@ -353,7 +357,7 @@ const firstBoard = {
       objective: "可归档的已完成目标",
       project_name: "Demo",
       autonomy: "auto",
-      workflow_epoch: "workflow-v3:goalcohort1234567890",
+      workflow_epoch: "workflow-v4:goalcohort1234567890",
       lead_ticks: 4,
       active_job_count: 0,
       heartbeat_state: "idle",
@@ -368,7 +372,7 @@ const firstBoard = {
       objective: "已归档且可恢复的目标",
       project_name: "Demo",
       autonomy: "auto",
-      workflow_epoch: "workflow-v3:goalcohort1234567890",
+      workflow_epoch: "workflow-v4:goalcohort1234567890",
       lead_ticks: 2,
       active_job_count: 0,
       heartbeat_state: "idle",
@@ -423,7 +427,7 @@ const firstBoard = {
       total_cached_input_tokens: 2400,
       total_uncached_input_tokens: 800,
       cache_hit_rate: 0.75,
-      latest_job_workflow_epoch: "workflow-v3:taskcohort1234567890",
+      latest_job_workflow_epoch: "workflow-v4:taskcohort1234567890",
       turn_count: 6,
       last_used_at: "2026-11-07T10:00:00Z",
       reset_requested_at: null,
@@ -606,7 +610,7 @@ assert.match(clusterHtmlBefore, /data-archived="true"/);
 assert.match(clusterHtmlBefore, /已归档/);
 assert.match(clusterHtmlBefore, /目标已结束/);
 assert.match(clusterHtmlBefore, /无需调度/);
-assert.match(clusterHtmlBefore, /workflow workflow-v3:goalcohort/);
+assert.match(clusterHtmlBefore, /workflow workflow-v4:goalcohort/);
 assert.equal(fakeElements.get("agent-thread-count").textContent, 4);
 assert.match(agentThreadHtml, /Diagnostic Worker/);
 assert.match(agentThreadHtml, /thread thread-agent-busy/);
@@ -664,15 +668,15 @@ assert.equal(
 
 assert.match(taskCardHtml, /thread thread-task-1/);
 assert.match(taskCardHtml, /thread reuse/);
-assert.match(taskCardHtml, /workflow workflow-v3:taskcohort/);
+assert.match(taskCardHtml, /workflow workflow-v4:taskcohort/);
 assert.match(taskCardHtml, /turn turn-3/);
 assert.match(taskCardHtml, /cache 75%/);
 assert.match(taskCardHtml, /1,500 cached/);
 assert.match(taskCardHtml, /500 uncached/);
 assert.doesNotMatch(taskCardHtml, /undefined/);
 assert.equal(
-  hooks.workflowEpochText("workflow-v3:abcdefghijklmnopqrstuvwxyz"),
-  "workflow workflow-v3:abcdefghij…",
+  hooks.workflowEpochText("workflow-v4:abcdefghijklmnopqrstuvwxyz"),
+  "workflow workflow-v4:abcdefghij…",
 );
 assert.equal(hooks.workflowEpochText(""), "workflow unbound");
 assert.equal(
@@ -785,6 +789,28 @@ assert.deepEqual(
 assert.equal(hooks.waitDurationText(0), "0 秒");
 assert.equal(hooks.waitDurationText(125), "2 分钟");
 assert.equal(hooks.waitDurationText(undefined), "—");
+assert.equal(hooks.summaryNumber({ value: null }, ["value"], 7), 7);
+assert.equal(hooks.summaryNumber({ value: 0 }, ["value"], 7), 0);
+assert.equal(hooks.tokenText(0), "0");
+assert.equal(hooks.tokenText(null), "—");
+assert.equal(hooks.ageText(null), "—");
+assert.equal(hooks.ageText(0), "刚刚");
+assert.match(
+  hooks.jobRuntimeHtml({ thread_action: "fresh" }),
+  /fresh thread/,
+);
+assert.match(
+  hooks.jobRuntimeHtml({ thread_action: "resume" }),
+  /resume thread/,
+);
+assert.match(
+  hooks.jobRuntimeHtml({ thread_action: "fresh_exec" }),
+  /fresh exec/,
+);
+assert.match(
+  hooks.jobRuntimeHtml({ thread_action: "fallback_exec" }),
+  /fallback exec/,
+);
 assert.deepEqual(
   {
     idle: hooks.goalHeartbeatInfo({ heartbeat_state: "idle" }).label,

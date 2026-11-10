@@ -36,6 +36,13 @@
   `duration_ms`、`counts`、失败阶段和跳过阶段。
 - Dashboard 写接口新增 loopback Host、same-origin Origin 和
   `application/json` 校验；无 Origin 的 CLI 客户端保持兼容。
+- Dashboard 读模型新增 `/api/summary`、`/api/tasks`、`/api/goals`、
+  `/api/agents`、`/api/attempts`、`/api/events` 和
+  `/api/tasks/<task-id>/events`；完整 `/api/board` 保持向后兼容。
+- Read API 支持 `limit` 上限 500、列表 cursor、事件 `event_id` cursor、
+  revision、ETag 和 `If-None-Match` 304。
+- WebUI 常规轮询先读取 summary revision，未变化时不下载完整 board；任务详情
+  改为按任务异步读取事件，不再依赖全局最新 500 条窗口。
 
 ### Changed
 
@@ -54,6 +61,8 @@
 - App Server usage delta 的 baseline 改为读取已完成 attempt ledger，不再依赖
   Agent 累计字段是否在成功 release 时更新。
 - Goal resume 先确保 daemon 启动成功，再迁移到 active；daemon 失败保持 paused。
+- Dashboard 运行动作现在区分 `fresh`、`resume`、`fresh_exec` 和
+  `fallback_exec`；Token/cache 的 unknown、真实 0 与不可用语义继续分离。
 
 ### Fixed
 
@@ -96,6 +105,11 @@
 - 数据库初始化对 locked/busy 做指数退避重试；只读连接使用编码 URI，兼容空格和
   `#` 路径。
 - 脱敏补充未加引号的冒号格式凭据。
+- Dashboard revision 覆盖任务版本、Goal/Agent 更新时间、job 状态与 usage、
+  Task/Goal/Agent 事件序列和消息序列；事件分页使用严格半开 cursor，避免重复或
+  漏项。
+- 大任务库回归门禁验证分区响应受 `limit` 约束、summary 显著小于完整 board，
+  并对 summary/board 延迟设置明确上限。
 
 ### Database
 
@@ -103,8 +117,9 @@
   `workflow_epoch`；旧记录一次性回填为 `legacy-unbound`。
 - `workflow_epoch` 语义版本升级到 `workflow-v2`，覆盖新的 tick 状态机与阶段
   流水线。
-- `workflow_epoch` 当前升级到 `workflow-v3`，覆盖安全、归档事务和 resume
-  顺序变化。
+- `workflow_epoch` 升级到 `workflow-v4`，覆盖分区 Read Model、summary 轮询、
+  ETag/cursor 和任务详情事件读取语义；v3 继续作为安全与归档事务阶段的历史
+  cohort。
 - schema 19 的 `cluster_agents` runtime、parent/path/nickname、
   actor、prompt hash/status、native session path 和 last-seen；
   `task_events` 新增 thread/job/correlation/assignment 关联字段。
