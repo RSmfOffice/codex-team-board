@@ -366,7 +366,8 @@ Goal 保持 paused。项目或任务归档与 claim 在同一个 `BEGIN IMMEDIAT
 
 ### 集群健康与 attention
 
-`/api/board` 的 `cluster_summary` 汇总目标、任务、活动进程和 attention：
+`/api/summary` 与 `/api/board` 的 `cluster_summary` 汇总目标、任务、活动进程和
+attention：
 
 ```text
 goals_total
@@ -514,16 +515,49 @@ MCP 的 `team_cluster_control.action` 除 `pause`、`resume`、`cancel` 外，�
 
 ### 轮询效率
 
-页面首次加载会读取一次 `/api/projects`，之后常规轮询只请求 `/api/board`。
-项目归档状态或“显示已归档”筛选变化时才重新加载项目列表。
+Dashboard 读接口按用途拆分，完整 `/api/board` 继续保留用于兼容：
+
+```text
+GET /api/summary
+GET /api/tasks
+GET /api/goals
+GET /api/agents
+GET /api/attempts
+GET /api/events
+GET /api/tasks/<task-id>/events
+GET /api/board
+```
+
+`/api/summary`、`/api/board` 和列表接口接受 `project_id` 与
+`include_archived=1`。列表接口默认返回 100 条，`limit` 最大 500；失败时返回
+结构化 `400`，不会静默扩大响应。`/api/tasks`、`/api/goals`、`/api/agents`
+和 `/api/attempts` 使用返回的最后一项 ID 作为 `cursor`；事件接口使用
+`event_id`：
+
+```text
+/api/events?limit=100&cursor=<oldest-event-id>
+/api/tasks/<task-id>/events?limit=12
+```
+
+`/api/summary` 只返回项目、计数、容量、心跳和 revision，不返回任务行、Agent
+行或事件体。`/api/board` 与 `/api/summary` 都返回 revision 和 ETag；客户端带上
+`If-None-Match` 时，状态未变化会得到 `304` 且没有 JSON body。
+
+页面首次加载会读取一次 `/api/projects`，之后每 2 秒先读取 `/api/summary`。
+summary revision 未变化时不请求 `/api/board`；只有 revision 变化、首次加载、
+项目筛选变化或显式强制刷新时才下载完整 board。任务详情不依赖全局最新 500
+条事件，而是异步读取该任务自己的分页事件。
 
 看板默认每 2 秒轮询一次，并有以下保护：
 
-- 同一时间只有一个 board 请求在途；队列中的刷新会合并。
+- 同一时间只有一个 summary/board 请求序列在途；队列中的刷新会合并。
 - 页面隐藏时停止定时器并取消在途请求，返回页面时立即刷新。
 - 请求失败后按 2、4、8、16、30 秒退避，成功响应后恢复 2 秒间隔。
 - 只有 board 内容签名变化时才重绘；正常轮询中的 claim 年龄和
   `generated_at` 更新不会单独触发表格重绘。
+- Token/cache 缺失保持 `null` 并显示 `—`，真实零值显示 `0`；运行时动作区分
+  `fresh`、`resume`、`fresh_exec` 和 `fallback_exec`，不再把所有非复用路径
+  都显示成 `fresh exec`。
 
 ### 项目、任务与集群目标归档
 

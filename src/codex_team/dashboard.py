@@ -8,7 +8,7 @@ import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import __version__
 from .cluster import (
@@ -29,6 +29,61 @@ STATIC_FILES = {
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
     "/style.css": ("style.css", "text/css; charset=utf-8"),
 }
+
+
+def _query_flag(query: dict[str, list[str]], key: str) -> bool:
+    return query.get(key, ["0"])[0].lower() in {"1", "true"}
+
+
+def _query_int(
+    query: dict[str, list[str]],
+    key: str,
+    *,
+    default: int | None = None,
+    minimum: int = 1,
+    maximum: int = 500,
+) -> int | None:
+    raw = query.get(key, [""])[0].strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{key} must be an integer") from exc
+    if not minimum <= value <= maximum:
+        raise ValueError(
+            f"{key} must be between {minimum} and {maximum}"
+        )
+    return value
+
+
+def _etag_matches(header: str, etag: str) -> bool:
+    candidates = [
+        item.strip()
+        for item in str(header or "").split(",")
+        if item.strip()
+    ]
+    if "*" in candidates:
+        return True
+    target = etag[2:].strip() if etag.startswith("W/") else etag
+    for candidate in candidates:
+        if candidate.startswith("W/"):
+            candidate = candidate[2:].strip()
+        if candidate == target:
+            return True
+    return False
+
+
+def _contextual_revision(base: str, context: object) -> str:
+    digest = hashlib.sha256(
+        json.dumps(
+            {"base": base, "context": context},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"{base}:api-{digest}"
 
 
 def _authority_parts(value: str) -> tuple[str, int | None]:
@@ -127,27 +182,140 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/projects":
             query = parse_qs(parsed.query)
-            include_archived = query.get("include_archived", ["0"])[0] in {"1", "true"}
-            data = self.team_service.dashboard_snapshot(
-                include_archived=include_archived
+            include_archived = _query_flag(query, "include_archived")
+            data = self.team_service.dashboard_summary(
+                include_archived=include_archived,
             )
             self._send_json(
                 {
                     "projects": data["projects"],
+                    "revision": data["revision"],
                     "generated_at": data["generated_at"],
                 }
             )
             return
+        if parsed.path == "/api/summary":
+            query = parse_qs(parsed.query)
+            project_id = query.get("project_id", [""])[0] or None
+            include_archived = _query_flag(query, "include_archived")
+            data = self.team_service.dashboard_summary(
+                project_id,
+                include_archived=include_archived,
+            )
+            runtime = self._cluster_runtime()
+            data["cluster_runtime"] = runtime
+            data["revision"] = _contextual_revision(
+                data["revision"],
+                runtime,
+            )
+            self._send_revisable_json(data)
+            return
         if parsed.path == "/api/board":
             query = parse_qs(parsed.query)
             project_id = query.get("project_id", [""])[0] or None
-            include_archived = query.get("include_archived", ["0"])[0] in {"1", "true"}
+            include_archived = _query_flag(query, "include_archived")
             data = self.team_service.dashboard_snapshot(
                 project_id,
                 include_archived=include_archived,
             )
-            data["cluster_runtime"] = self._cluster_runtime()
-            self._send_json(data)
+            runtime = self._cluster_runtime()
+            data["cluster_runtime"] = runtime
+            data["revision"] = _contextual_revision(
+                data["revision"],
+                runtime,
+            )
+            self._send_revisable_json(data)
+            return
+        partitions = {
+            "/api/tasks": "tasks",
+            "/api/goals": "goals",
+            "/api/agents": "agents",
+            "/api/attempts": "attempts",
+        }
+        if parsed.path in partitions:
+            try:
+                query = parse_qs(parsed.query)
+                project_id = query.get("project_id", [""])[0] or None
+                include_archived = _query_flag(query, "include_archived")
+                limit = _query_int(query, "limit", default=100)
+                cursor = query.get("cursor", [""])[0].strip() or None
+                data = self.team_service.dashboard_partition(
+                    partitions[parsed.path],
+                    project_id,
+                    include_archived=include_archived,
+                    limit=int(limit or 100),
+                    cursor=cursor,
+                )
+                data["partition"] = partitions[parsed.path]
+                self._send_json(data)
+            except (TeamError, ValueError) as exc:
+                self._send_json(
+                    {"error": str(exc)},
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+            return
+        if parsed.path == "/api/events":
+            try:
+                query = parse_qs(parsed.query)
+                project_id = query.get("project_id", [""])[0] or None
+                include_archived = _query_flag(query, "include_archived")
+                limit = _query_int(query, "limit", default=100)
+                before_event_id = _query_int(
+                    query,
+                    "cursor",
+                    default=None,
+                )
+                data = self.team_service.dashboard_events(
+                    project_id,
+                    include_archived=include_archived,
+                    limit=int(limit or 100),
+                    before_event_id=before_event_id,
+                )
+                self._send_json(data)
+            except ValueError as exc:
+                self._send_json(
+                    {"error": str(exc)},
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+            return
+        task_events_prefix = "/api/tasks/"
+        task_events_suffix = "/events"
+        if (
+            parsed.path.startswith(task_events_prefix)
+            and parsed.path.endswith(task_events_suffix)
+        ):
+            try:
+                query = parse_qs(parsed.query)
+                limit = _query_int(query, "limit", default=100)
+                before_event_id = _query_int(
+                    query,
+                    "cursor",
+                    default=None,
+                )
+                encoded_task_id = parsed.path[
+                    len(task_events_prefix) : -len(task_events_suffix)
+                ]
+                task_id = unquote(encoded_task_id).strip().upper()
+                if not task_id:
+                    raise ValueError("task_id is required")
+                data = self.team_service.get_task_events(
+                    task_id,
+                    limit=int(limit or 100),
+                    before_event_id=before_event_id,
+                )
+                self._send_json(data)
+            except TeamError as exc:
+                status = (
+                    HTTPStatus.NOT_FOUND
+                    if str(exc).startswith("task not found:")
+                    else HTTPStatus.BAD_REQUEST
+                )
+                self._send_json({"error": str(exc)}, status=status)
+            except ValueError as exc:
+                self._send_json(
+                    {"error": str(exc)},
+                    status=HTTPStatus.BAD_REQUEST,
+                )
             return
         self._send_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
@@ -466,11 +634,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(content)
 
+    def _send_revisable_json(self, value: dict[str, object]) -> None:
+        etag = f'W/"{value["revision"]}"'
+        if _etag_matches(str(self.headers.get("If-None-Match") or ""), etag):
+            self.send_response(HTTPStatus.NOT_MODIFIED)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            return
+        self._send_json(value, headers={"ETag": etag})
+
     def _send_json(
         self,
         value: object,
         *,
         status: HTTPStatus = HTTPStatus.OK,
+        headers: dict[str, str] | None = None,
     ) -> None:
         content = json.dumps(value, ensure_ascii=False, indent=2).encode("utf-8")
         self.send_response(status)
@@ -478,6 +658,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(content)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        for name, header_value in (headers or {}).items():
+            self.send_header(name, header_value)
         self.end_headers()
         self.wfile.write(content)
 

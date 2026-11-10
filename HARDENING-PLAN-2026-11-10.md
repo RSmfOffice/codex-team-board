@@ -464,18 +464,40 @@ Merge commit:
 
 ### Phase 4D：Read Model 与 Dashboard 扩容
 
-状态：未开始
+状态：实现完成，待 Lead Review、合并和正式库 migration-v4
 
-- [ ] split dashboard API：summary、tasks、goal、events、agents、attempts。
-- [ ] 使用 version/ETag/cursor，避免每 2 秒读取全量 board。
-- [ ] task detail 按 task 读取事件，不再依赖全局最新 500 条。
-- [ ] unknown、真实 0、unavailable 分离。
-- [ ] fresh/resume/fallback_exec 分离展示。
-- [ ] 为大任务库和事件历史建立轮询大小、延迟和结果正确性门禁。
+- [x] split dashboard API：summary、tasks、goals、events、agents、attempts。
+- [x] 使用 revision/ETag/cursor，避免每 2 秒读取全量 board。
+- [x] task detail 按 task 读取事件，不再依赖全局最新 500 条。
+- [x] unknown、真实 0、unavailable 分离。
+- [x] fresh/resume/fresh_exec/fallback_exec 分离展示。
+- [x] 为大任务库和事件历史建立响应大小、延迟、cursor 正确性和 304 门禁。
+
+实现要点：
+
+- `/api/board` 保持兼容，并新增 revision、ETag 和 `If-None-Match` 304。
+- `/api/summary` 只承载 revision、计数、容量和心跳摘要。
+- `/api/tasks|goals|agents|attempts` 默认 100 条、最大 500 条，并使用最后一项
+  ID 作为下一页 cursor。
+- `/api/events` 与 `/api/tasks/<task-id>/events` 使用严格
+  `event_id < before_event_id` 半开游标。
+- revision 覆盖任务版本、Goal/Agent 更新时间、job 状态与 usage、Task/Goal/Agent
+  事件序列和消息序列，避免状态已变化但 summary 不触发 board 刷新。
+- WebUI 每 2 秒先读 summary；revision 未变化时不下载 board。任务详情异步读取
+  自己的最近事件。
 
 验收：
 
-- 大任务库下 board 轮询大小和延迟有明确上限。
+- 181 tests OK, 1 skipped；dashboard UI smoke、JS syntax、compileall 和
+  `git diff --check` 通过。
+- Core tool schema hash 保持
+  `86e78eef5f5f631094f5218d763c83997f5ab52d1ba22877f93092720f93fca6`；
+  Core schema 和数据库 schema 20 均未变化。
+- `WORKFLOW_EPOCH_VERSION` 升级为 `workflow-v4`；Live epoch 在 Lead 合并后
+  checkpoint、迁移并回填。
+- 130 个任务和 40 个事件的大 fixture 下，分区响应不超过 `limit`，事件连续
+  两页无重复，summary payload 小于完整 board 的 1/4。
+- summary 请求门禁小于 5 秒，board 请求门禁小于 20 秒（本机测试远低于上限）。
 - task detail 不再依赖全局事件窗口。
 
 ---

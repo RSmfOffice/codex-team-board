@@ -978,8 +978,19 @@ class TeamService:
             task.pop("claim_token", None)
             return task
 
-    def get_task_events(self, task_id: str, *, limit: int = 100) -> dict[str, Any]:
+    def get_task_events(
+        self,
+        task_id: str,
+        *,
+        limit: int = 100,
+        before_event_id: int | None = None,
+    ) -> dict[str, Any]:
         limit = max(1, min(int(limit), 500))
+        where = ["task_id = ?"]
+        parameters: list[Any] = [task_id]
+        if before_event_id is not None:
+            where.append("event_id < ?")
+            parameters.append(int(before_event_id))
         with self.connection(write=False) as connection:
             task = connection.execute(
                 "SELECT task_id, title FROM tasks WHERE task_id = ?",
@@ -988,18 +999,20 @@ class TeamService:
             if task is None:
                 raise TeamError(f"task not found: {task_id}")
             rows = connection.execute(
-                """
+                f"""
                 SELECT event_id, event_type, actor, thread_id, job_id,
                        correlation_id, assignment_id, data_json, created_at
                 FROM task_events
-                WHERE task_id = ?
+                WHERE {' AND '.join(where)}
                 ORDER BY event_id DESC
                 LIMIT ?
                 """,
-                (task_id, limit),
+                (*parameters, limit + 1),
             ).fetchall()
+        has_more = len(rows) > limit
+        page = rows[:limit]
         events = []
-        for row in reversed(rows):
+        for row in reversed(page):
             item = dict(row)
             try:
                 item["data"] = json.loads(item.pop("data_json"))
@@ -1007,7 +1020,16 @@ class TeamService:
                 item["data"] = {}
                 item.pop("data_json", None)
             events.append(item)
-        return {"task": dict(task), "events": events}
+        return {
+            "task": dict(task),
+            "events": events,
+            "has_more": has_more,
+            "next_cursor": (
+                min(int(row["event_id"]) for row in page)
+                if has_more and page
+                else None
+            ),
+        }
 
     def list_tasks(
         self,
@@ -1091,6 +1113,572 @@ class TeamService:
             "counts": counts,
             "tasks": tasks,
             "generated_at": utc_now(),
+        }
+
+    @staticmethod
+    def _dashboard_revision(
+        connection: sqlite3.Connection,
+        project_id: str | None,
+        include_archived: bool,
+    ) -> str:
+        project_where = ["1 = 1"]
+        project_params: list[Any] = []
+        if project_id:
+            project_where.append("project_id = ?")
+            project_params.append(project_id)
+        elif not include_archived:
+            project_where.append("archived_at IS NULL")
+
+        task_where = ["1 = 1"]
+        task_params: list[Any] = []
+        if project_id:
+            task_where.append("t.project_id = ?")
+            task_params.append(project_id)
+        elif not include_archived:
+            task_where.append("p.archived_at IS NULL")
+        if not include_archived:
+            task_where.extend(
+                [
+                    "t.archived_at IS NULL",
+                    "(g.goal_id IS NULL OR g.archived_at IS NULL)",
+                ]
+            )
+
+        goal_where = ["1 = 1"]
+        goal_params: list[Any] = []
+        if project_id:
+            goal_where.append("g.project_id = ?")
+            goal_params.append(project_id)
+        elif not include_archived:
+            goal_where.append("p.archived_at IS NULL")
+        if not include_archived:
+            goal_where.append("g.archived_at IS NULL")
+
+        agent_where = ["1 = 1"]
+        agent_params: list[Any] = []
+        if project_id:
+            agent_where.append("a.project_id = ?")
+            agent_params.append(project_id)
+        elif not include_archived:
+            agent_where.append("p.archived_at IS NULL")
+        if not include_archived:
+            agent_where.append("a.archived_at IS NULL")
+
+        message_where = ["1 = 1"]
+        message_params: list[Any] = []
+        if project_id:
+            message_where.append("m.project_id = ?")
+            message_params.append(project_id)
+        elif not include_archived:
+            message_where.append("p.archived_at IS NULL")
+        if not include_archived:
+            message_where.append(
+                "(t.task_id IS NULL OR t.archived_at IS NULL)"
+            )
+
+        signature = {
+            "projects": connection.execute(
+                f"""
+                SELECT COUNT(*) AS count,
+                       COALESCE(MAX(updated_at), '') AS latest
+                FROM projects
+                WHERE {' AND '.join(project_where)}
+                """,
+                tuple(project_params),
+            ).fetchone(),
+            "tasks": connection.execute(
+                f"""
+                SELECT COUNT(*) AS count,
+                       COALESCE(MAX(t.updated_at), '') AS latest,
+                       COALESCE(SUM(t.version), 0) AS versions
+                FROM tasks t
+                JOIN projects p ON p.project_id = t.project_id
+                LEFT JOIN cluster_goals g ON g.goal_id = t.goal_id
+                WHERE {' AND '.join(task_where)}
+                """,
+                tuple(task_params),
+            ).fetchone(),
+            "goals": connection.execute(
+                f"""
+                SELECT COUNT(*) AS count,
+                       COALESCE(MAX(g.updated_at), '') AS latest,
+                       COALESCE(SUM(g.lead_ticks), 0) AS lead_ticks
+                FROM cluster_goals g
+                JOIN projects p ON p.project_id = g.project_id
+                WHERE {' AND '.join(goal_where)}
+                """,
+                tuple(goal_params),
+            ).fetchone(),
+            "agents": connection.execute(
+                f"""
+                SELECT COUNT(*) AS count,
+                       COALESCE(MAX(a.updated_at), '') AS latest,
+                       COALESCE(SUM(a.turn_count), 0) AS turns,
+                       COALESCE(SUM(a.total_cached_input_tokens), 0)
+                           AS cached_input_tokens,
+                       COALESCE(SUM(a.total_uncached_input_tokens), 0)
+                           AS uncached_input_tokens
+                FROM cluster_agents a
+                JOIN projects p ON p.project_id = a.project_id
+                WHERE {' AND '.join(agent_where)}
+                """,
+                tuple(agent_params),
+            ).fetchone(),
+            "jobs": connection.execute(
+                f"""
+                SELECT COUNT(*) AS count,
+                       COALESCE(
+                           MAX(COALESCE(j.finished_at, j.started_at)),
+                           ''
+                       ) AS latest,
+                       SUM(CASE WHEN j.status = 'starting' THEN 1 ELSE 0 END)
+                           AS starting,
+                       SUM(CASE WHEN j.status = 'running' THEN 1 ELSE 0 END)
+                           AS running,
+                       SUM(CASE WHEN j.status = 'failed' THEN 1 ELSE 0 END)
+                           AS failed,
+                       COALESCE(SUM(j.input_tokens), 0) AS input_tokens,
+                       COALESCE(SUM(j.cached_input_tokens), 0)
+                           AS cached_input_tokens,
+                       COALESCE(SUM(j.uncached_input_tokens), 0)
+                           AS uncached_input_tokens,
+                       COALESCE(SUM(j.context_tokens), 0) AS context_tokens
+                FROM cluster_jobs j
+                JOIN cluster_goals g ON g.goal_id = j.goal_id
+                JOIN projects p ON p.project_id = g.project_id
+                WHERE {' AND '.join(goal_where)}
+                """,
+                tuple(goal_params),
+            ).fetchone(),
+            "task_events": connection.execute(
+                f"""
+                SELECT COALESCE(MAX(e.event_id), 0) AS latest
+                FROM task_events e
+                JOIN tasks t ON t.task_id = e.task_id
+                JOIN projects p ON p.project_id = t.project_id
+                LEFT JOIN cluster_goals g ON g.goal_id = t.goal_id
+                WHERE {' AND '.join(task_where)}
+                """,
+                tuple(task_params),
+            ).fetchone(),
+            "goal_events": connection.execute(
+                f"""
+                SELECT COALESCE(MAX(e.event_id), 0) AS latest
+                FROM cluster_events e
+                JOIN cluster_goals g ON g.goal_id = e.goal_id
+                JOIN projects p ON p.project_id = g.project_id
+                WHERE {' AND '.join(goal_where)}
+                """,
+                tuple(goal_params),
+            ).fetchone(),
+            "agent_events": connection.execute(
+                f"""
+                SELECT COALESCE(MAX(e.event_id), 0) AS latest
+                FROM cluster_agent_events e
+                JOIN cluster_agents a ON a.agent_id = e.agent_id
+                JOIN projects p ON p.project_id = a.project_id
+                WHERE {' AND '.join(agent_where)}
+                """,
+                tuple(agent_params),
+            ).fetchone(),
+            "messages": connection.execute(
+                f"""
+                SELECT COUNT(*) AS count,
+                       COALESCE(MAX(m.message_id), 0) AS latest
+                FROM messages m
+                JOIN projects p ON p.project_id = m.project_id
+                LEFT JOIN tasks t ON t.task_id = m.task_id
+                WHERE {' AND '.join(message_where)}
+                """,
+                tuple(message_params),
+            ).fetchone(),
+        }
+        canonical: dict[str, dict[str, Any]] = {}
+        for name, row in signature.items():
+            canonical[name] = dict(row) if row is not None else {}
+        digest = hashlib.sha256(
+            json.dumps(
+                canonical,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:24]
+        return f"v1:{digest}"
+
+    def dashboard_revision(
+        self,
+        project_id: str | None = None,
+        *,
+        include_archived: bool = False,
+    ) -> str:
+        with self.connection(write=False) as connection:
+            return self._dashboard_revision(
+                connection,
+                project_id,
+                include_archived,
+            )
+
+    def dashboard_summary(
+        self,
+        project_id: str | None = None,
+        *,
+        include_archived: bool = False,
+    ) -> dict[str, Any]:
+        system_capacity = env_int(
+            "CODEX_TEAM_CLUSTER_MAX_JOBS",
+            DEFAULT_GLOBAL_JOB_CAPACITY,
+            maximum=MAX_GLOBAL_JOB_CAPACITY,
+        )
+        goal_capacity = env_int(
+            "CODEX_TEAM_CLUSTER_MAX_WORKERS",
+            DEFAULT_GOAL_WORKER_CAPACITY,
+            maximum=MAX_GOAL_WORKER_CAPACITY,
+        )
+        heartbeat_warning_seconds = env_int(
+            "CODEX_TEAM_HEARTBEAT_WARNING_SECONDS",
+            DEFAULT_HEARTBEAT_WARNING_SECONDS,
+        )
+        with self.connection(write=False) as connection:
+            if project_id:
+                projects = [
+                    dict(row)
+                    for row in connection.execute(
+                        "SELECT * FROM projects WHERE project_id = ?",
+                        (project_id,),
+                    ).fetchall()
+                ]
+            else:
+                where = "" if include_archived else "WHERE archived_at IS NULL"
+                projects = [
+                    dict(row)
+                    for row in connection.execute(
+                        f"SELECT * FROM projects {where} ORDER BY updated_at DESC"
+                    ).fetchall()
+                ]
+            task_where = ["1 = 1"]
+            task_params: list[Any] = []
+            goal_where = ["1 = 1"]
+            goal_params: list[Any] = []
+            if project_id:
+                task_where.append("t.project_id = ?")
+                task_params.append(project_id)
+                goal_where.append("g.project_id = ?")
+                goal_params.append(project_id)
+            else:
+                task_where.append("p.archived_at IS NULL")
+                goal_where.append("p.archived_at IS NULL")
+            if not include_archived:
+                task_where.append("t.archived_at IS NULL")
+                task_where.append(
+                    "(g.goal_id IS NULL OR g.archived_at IS NULL)"
+                )
+                goal_where.append("g.archived_at IS NULL")
+            task_status_rows = connection.execute(
+                f"""
+                SELECT t.status, COUNT(*) AS count
+                FROM tasks t
+                JOIN projects p ON p.project_id = t.project_id
+                LEFT JOIN cluster_goals g ON g.goal_id = t.goal_id
+                WHERE {' AND '.join(task_where)}
+                GROUP BY t.status
+                """,
+                tuple(task_params),
+            ).fetchall()
+            counts = {
+                str(row["status"]): int(row["count"])
+                for row in task_status_rows
+            }
+            goal_status_rows = connection.execute(
+                f"""
+                SELECT g.status, COUNT(*) AS count
+                FROM cluster_goals g
+                JOIN projects p ON p.project_id = g.project_id
+                WHERE {' AND '.join(goal_where)}
+                GROUP BY g.status
+                """,
+                tuple(goal_params),
+            ).fetchall()
+            goal_counts = {
+                str(row["status"]): int(row["count"])
+                for row in goal_status_rows
+            }
+            job_row = connection.execute(
+                f"""
+                SELECT COUNT(*) AS active_jobs,
+                       SUM(CASE WHEN j.kind = 'worker' THEN 1 ELSE 0 END)
+                           AS active_workers,
+                       SUM(CASE WHEN j.kind = 'lead' THEN 1 ELSE 0 END)
+                           AS active_leads
+                FROM cluster_jobs j
+                JOIN cluster_goals g ON g.goal_id = j.goal_id
+                JOIN projects p ON p.project_id = g.project_id
+                WHERE j.status IN ('starting', 'running')
+                  AND {' AND '.join(goal_where)}
+                """,
+                tuple(goal_params),
+            ).fetchone()
+            active_job_rows = connection.execute(
+                f"""
+                SELECT j.job_id, j.kind, j.task_id, j.started_at
+                FROM cluster_jobs j
+                JOIN cluster_goals g ON g.goal_id = j.goal_id
+                JOIN projects p ON p.project_id = g.project_id
+                WHERE j.status IN ('starting', 'running')
+                  AND {' AND '.join(goal_where)}
+                """,
+                tuple(goal_params),
+            ).fetchall()
+            worker_task_ids = [
+                str(row["task_id"])
+                for row in active_job_rows
+                if row["kind"] == "worker" and row["task_id"]
+            ]
+            latest_activity: dict[str, str] = {}
+            if worker_task_ids:
+                placeholders = ",".join("?" for _ in worker_task_ids)
+                activity_rows = connection.execute(
+                    f"""
+                    SELECT task_id, MAX(created_at) AS latest_at
+                    FROM task_events
+                    WHERE task_id IN ({placeholders})
+                      AND event_type IN ('claimed', 'heartbeat', 'progress')
+                    GROUP BY task_id
+                    """,
+                    worker_task_ids,
+                ).fetchall()
+                latest_activity = {
+                    str(row["task_id"]): str(row["latest_at"])
+                    for row in activity_rows
+                }
+            now_utc = datetime.now(UTC)
+
+            def parse_time(value: str | None) -> datetime | None:
+                if not value:
+                    return None
+                try:
+                    parsed = datetime.fromisoformat(
+                        str(value).replace("Z", "+00:00")
+                    )
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=UTC)
+                except (TypeError, ValueError):
+                    return None
+                return parsed
+
+            worker_ages: list[int] = []
+            for row in active_job_rows:
+                if row["kind"] != "worker":
+                    continue
+                heartbeat_at = row["started_at"]
+                if row["task_id"]:
+                    activity_at = latest_activity.get(str(row["task_id"]))
+                    started = parse_time(heartbeat_at)
+                    activity = parse_time(activity_at)
+                    if activity and (
+                        started is None or activity >= started
+                    ):
+                        heartbeat_at = activity_at
+                heartbeat_time = parse_time(heartbeat_at)
+                if heartbeat_time is not None:
+                    worker_ages.append(
+                        max(
+                            0,
+                            int((now_utc - heartbeat_time).total_seconds()),
+                        )
+                    )
+            schedulable_goal_count = sum(
+                goal_counts.get(status, 0)
+                for status in ("planning", "active")
+            )
+            active_worker_rows = connection.execute(
+                f"""
+                SELECT j.goal_id, COUNT(*) AS worker_count
+                FROM cluster_jobs j
+                JOIN cluster_goals g ON g.goal_id = j.goal_id
+                JOIN projects p ON p.project_id = g.project_id
+                WHERE j.kind = 'worker'
+                  AND j.status IN ('starting', 'running')
+                  AND {' AND '.join(goal_where)}
+                GROUP BY j.goal_id
+                """,
+                tuple(goal_params),
+            ).fetchall()
+            fairness_wait_count = sum(
+                int(row["worker_count"]) >= goal_capacity
+                for row in active_worker_rows
+            )
+            heartbeat_overdue = sum(
+                age >= heartbeat_warning_seconds for age in worker_ages
+            )
+            revision = self._dashboard_revision(
+                connection,
+                project_id,
+                include_archived,
+            )
+            generated_at = utc_now()
+        cluster_summary = {
+            "goals_total": sum(goal_counts.values()),
+            "goals_active": goal_counts.get("active", 0),
+            "goals_paused": goal_counts.get("paused", 0),
+            "goals_failed": goal_counts.get("failed", 0),
+            "ready_tasks": counts.get("ready", 0),
+            "running_tasks": counts.get("running", 0),
+            "review_tasks": counts.get("review", 0),
+            "blocked_tasks": counts.get("blocked", 0),
+            "active_jobs": int(job_row["active_jobs"] or 0),
+            "active_workers": int(job_row["active_workers"] or 0),
+            "active_leads": int(job_row["active_leads"] or 0),
+            "global_jobs": int(job_row["active_workers"] or 0),
+            "global_capacity": schedulable_goal_count * goal_capacity,
+            "worker_capacity_per_goal": goal_capacity,
+            "system_jobs": int(job_row["active_jobs"] or 0),
+            "system_capacity": system_capacity,
+            "queued_goals": max(
+                0,
+                schedulable_goal_count
+                - int(job_row["active_leads"] or 0),
+            ),
+            "heartbeat_overdue": heartbeat_overdue,
+            "oldest_heartbeat_age_seconds": (
+                max(worker_ages) if worker_ages else None
+            ),
+            "fairness_wait_count": fairness_wait_count,
+            "attention_count": (
+                goal_counts.get("paused", 0)
+                + goal_counts.get("failed", 0)
+                + counts.get("blocked", 0)
+                + counts.get("review", 0)
+                + heartbeat_overdue
+            ),
+        }
+        return {
+            "projects": projects,
+            "selected_project_id": project_id,
+            "counts": counts,
+            "cluster_summary": cluster_summary,
+            "revision": revision,
+            "generated_at": generated_at,
+        }
+
+    def dashboard_events(
+        self,
+        project_id: str | None = None,
+        *,
+        include_archived: bool = False,
+        limit: int = 100,
+        before_event_id: int | None = None,
+    ) -> dict[str, Any]:
+        limit = max(1, min(int(limit), 500))
+        where = ["1 = 1"]
+        parameters: list[Any] = []
+        if project_id:
+            where.append("t.project_id = ?")
+            parameters.append(project_id)
+        else:
+            where.append("t.status != 'canceled'")
+        if not include_archived:
+            if not project_id:
+                where.append("p.archived_at IS NULL")
+            where.append("t.archived_at IS NULL")
+            where.append("(g.goal_id IS NULL OR g.archived_at IS NULL)")
+        if before_event_id is not None:
+            where.append("e.event_id < ?")
+            parameters.append(int(before_event_id))
+        with self.connection(write=False) as connection:
+            rows = connection.execute(
+                f"""
+                SELECT e.event_id, e.task_id, e.event_type, e.actor,
+                       e.thread_id, e.job_id, e.correlation_id,
+                       e.assignment_id, e.data_json, e.created_at
+                FROM task_events e
+                JOIN tasks t ON t.task_id = e.task_id
+                JOIN projects p ON p.project_id = t.project_id
+                LEFT JOIN cluster_goals g ON g.goal_id = t.goal_id
+                WHERE {' AND '.join(where)}
+                ORDER BY e.event_id DESC
+                LIMIT ?
+                """,
+                (*parameters, limit + 1),
+            ).fetchall()
+            revision = self._dashboard_revision(
+                connection,
+                project_id,
+                include_archived,
+            )
+            generated_at = utc_now()
+        has_more = len(rows) > limit
+        page = rows[:limit]
+        events = []
+        for row in reversed(page):
+            item = dict(row)
+            try:
+                item["data"] = json.loads(item.pop("data_json"))
+            except (TypeError, ValueError):
+                item["data"] = {}
+                item.pop("data_json", None)
+            events.append(item)
+        return {
+            "events": events,
+            "has_more": has_more,
+            "next_cursor": (
+                min(int(row["event_id"]) for row in page)
+                if has_more and page
+                else None
+            ),
+            "revision": revision,
+            "generated_at": generated_at,
+        }
+
+    def dashboard_partition(
+        self,
+        partition: str,
+        project_id: str | None = None,
+        *,
+        include_archived: bool = False,
+        limit: int = 100,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        partitions = {
+            "tasks": ("tasks", "task_id"),
+            "goals": ("cluster_goals", "goal_id"),
+            "agents": ("cluster_agents", "agent_id"),
+            "attempts": ("cluster_jobs", "job_id"),
+        }
+        if partition not in partitions:
+            raise ValueError(f"unknown dashboard partition: {partition}")
+        data_key, id_field = partitions[partition]
+        limit = max(1, min(int(limit), 500))
+        snapshot = self.dashboard_snapshot(
+            project_id,
+            include_archived=include_archived,
+        )
+        items = list(snapshot[data_key])
+        start = 0
+        if cursor:
+            positions = {
+                str(item.get(id_field)): index
+                for index, item in enumerate(items)
+                if item.get(id_field) is not None
+            }
+            if cursor not in positions:
+                raise TeamError(f"dashboard cursor not found: {cursor}")
+            start = positions[cursor] + 1
+        page = items[start : start + limit]
+        has_more = start + len(page) < len(items)
+        return {
+            "items": page,
+            "total": len(items),
+            "has_more": has_more,
+            "next_cursor": (
+                str(page[-1].get(id_field))
+                if has_more and page and page[-1].get(id_field) is not None
+                else None
+            ),
+            "selected_project_id": project_id,
+            "include_archived": include_archived,
+            "revision": snapshot["revision"],
+            "generated_at": snapshot["generated_at"],
         }
 
     def dashboard_snapshot(
@@ -1523,6 +2111,8 @@ class TeamService:
                     "thread_id": job.get("thread_id"),
                     "turn_id": job.get("turn_id"),
                     "runtime": job.get("runtime"),
+                    "thread_action": job.get("thread_action"),
+                    "outcome": job.get("outcome"),
                     "workflow_epoch": job.get("workflow_epoch"),
                     "input_tokens": job.get("input_tokens", 0),
                     "cached_input_tokens": job.get("cached_input_tokens", 0),
@@ -1959,6 +2549,12 @@ class TeamService:
                     default=0,
                 ),
             }
+            revision = self._dashboard_revision(
+                connection,
+                project_id,
+                include_archived,
+            )
+            generated_at = utc_now()
             return {
                 "projects": projects,
                 "selected_project_id": project_id,
@@ -1972,7 +2568,8 @@ class TeamService:
                 "cluster_agent_events": cluster_agent_events,
                 "cluster_summary": cluster_summary,
                 "include_archived": include_archived,
-                "generated_at": utc_now(),
+                "revision": revision,
+                "generated_at": generated_at,
             }
 
     def claim_task(
