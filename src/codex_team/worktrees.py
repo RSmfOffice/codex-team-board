@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import re
 import subprocess
+import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from .db import utc_now
 from .service import TeamError, TeamService
@@ -36,6 +38,8 @@ class WorktreeManager:
         task = self.team.get_task(task_id)
         if task["kind"] != "write":
             raise TeamError("only write tasks can own a worktree")
+        if task["status"] not in {"ready", "backlog"}:
+            raise TeamError("write task must be ready or backlog before creating a worktree")
         self.team._ensure_project_active(
             self.team.get_project(task["project_id"])
         )
@@ -73,44 +77,310 @@ class WorktreeManager:
         )
         if target.exists():
             raise TeamError(f"worktree target already exists: {target}")
+        operation_id = self._reserve_intent(
+            task_id=task_id,
+            goal_id=task.get("goal_id"),
+            repo_root=root,
+            worktree_path=target,
+            branch=branch,
+            target_branch=target_branch,
+            base_ref=base_ref,
+            base_commit=base_commit,
+            actor=actor,
+        )
         target.parent.mkdir(parents=True, exist_ok=True)
         add = self._git(root, "worktree", "add", "-b", branch, str(target), base_commit)
         if add.returncode != 0:
-            raise TeamError(add.stderr.strip() or add.stdout.strip() or "git worktree add failed")
+            error = add.stderr.strip() or add.stdout.strip() or "git worktree add failed"
+            self._fail_intent(operation_id, error)
+            raise TeamError(error)
+        try:
+            result = self._finalize_intent(operation_id)
+            result["worktree_operation_id"] = operation_id
+            return result
+        except Exception as exc:
+            raise TeamError(
+                "worktree was created but its database intent could not be finalized; "
+                f"recovery is required ({operation_id}): {exc}"
+            ) from exc
+
+    @staticmethod
+    def _operation_id() -> str:
+        return f"OP-{uuid.uuid4().hex[:16].upper()}"
+
+    @staticmethod
+    def _json(value: Mapping[str, Any]) -> str:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    def _reserve_intent(
+        self,
+        *,
+        task_id: str,
+        goal_id: str | None,
+        repo_root: Path,
+        worktree_path: Path,
+        branch: str,
+        target_branch: str,
+        base_ref: str,
+        base_commit: str,
+        actor: str,
+    ) -> str:
+        operation_id = self._operation_id()
+        now = utc_now()
+        payload = {
+            "repo_root": str(repo_root),
+            "worktree_path": str(worktree_path),
+            "branch": branch,
+            "target_branch": target_branch,
+            "base_ref": base_ref,
+            "base_commit": base_commit,
+        }
+        with self.team.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            task = connection.execute(
+                """
+                SELECT t.status, t.kind, t.worktree_path, t.archived_at,
+                       p.archived_at AS project_archived_at
+                FROM tasks t JOIN projects p ON p.project_id = t.project_id
+                WHERE t.task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if task is None:
+                raise TeamError(f"task not found: {task_id}")
+            if task["kind"] != "write":
+                raise TeamError("only write tasks can own a worktree")
+            if task["status"] not in {"ready", "backlog"}:
+                raise TeamError(
+                    "write task must be ready or backlog before creating a worktree"
+                )
+            if task["archived_at"] or task["project_archived_at"]:
+                raise TeamError("archived task or project cannot create a worktree")
+            if task["worktree_path"]:
+                raise TeamError(f"task already has worktree: {task['worktree_path']}")
+            active = connection.execute(
+                """
+                SELECT operation_id
+                FROM external_operations
+                WHERE operation_type = 'worktree_create'
+                  AND task_id = ?
+                  AND status IN ('pending', 'running')
+                LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+            if active is not None:
+                raise TeamError(
+                    f"worktree creation already in progress: {active['operation_id']}"
+                )
+            connection.execute(
+                """
+                INSERT INTO external_operations(
+                    operation_id, operation_type, status, goal_id, task_id,
+                    actor, payload_json, created_at, updated_at
+                ) VALUES (
+                    ?, 'worktree_create', 'running', ?, ?, ?, ?, ?, ?
+                )
+                """,
+                (
+                    operation_id,
+                    goal_id,
+                    task_id,
+                    actor,
+                    self._json(payload),
+                    now,
+                    now,
+                ),
+            )
+        return operation_id
+
+    def _finalize_intent(self, operation_id: str) -> dict[str, Any]:
+        now = utc_now()
+        with self.team.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            operation = connection.execute(
+                """
+                SELECT * FROM external_operations
+                WHERE operation_id = ? AND operation_type = 'worktree_create'
+                """,
+                (operation_id,),
+            ).fetchone()
+            if operation is None:
+                raise TeamError(f"worktree operation not found: {operation_id}")
+            if operation["status"] == "failed":
+                raise TeamError(
+                    f"worktree operation failed: {operation['error']}"
+                )
+            payload = json.loads(operation["payload_json"])
+            task_id = str(operation["task_id"])
+            task = connection.execute(
+                """
+                SELECT t.status, t.worktree_path, t.archived_at,
+                       p.archived_at AS project_archived_at
+                FROM tasks t JOIN projects p ON p.project_id = t.project_id
+                WHERE t.task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if task is None:
+                raise TeamError(f"task not found: {task_id}")
+            if task["archived_at"] or task["project_archived_at"]:
+                raise TeamError("archived task or project cannot finalize a worktree")
+            if task["status"] not in {"ready", "backlog"}:
+                raise TeamError(
+                    f"task status changed before worktree finalization: {task['status']}"
+                )
+            worktree_path = str(payload["worktree_path"])
+            if task["worktree_path"]:
+                if str(task["worktree_path"]) != worktree_path:
+                    raise TeamError("task already points to a different worktree")
+                if operation["status"] != "completed":
+                    connection.execute(
+                        """
+                        UPDATE external_operations
+                        SET status = 'completed', completed_at = ?, updated_at = ?,
+                            result_json = ?
+                        WHERE operation_id = ?
+                        """,
+                        (
+                            now,
+                            now,
+                            self._json({"worktree_path": worktree_path}),
+                            operation_id,
+                        ),
+                    )
+            else:
+                updated = connection.execute(
+                    """
+                    UPDATE tasks
+                    SET worktree_path = ?, branch = ?, target_branch = ?,
+                        base_ref = ?, base_commit = ?,
+                        updated_at = ?, version = version + 1
+                    WHERE task_id = ? AND worktree_path IS NULL
+                    """,
+                    (
+                        worktree_path,
+                        str(payload["branch"]),
+                        str(payload["target_branch"]),
+                        str(payload["base_ref"]),
+                        str(payload["base_commit"]),
+                        now,
+                        task_id,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise TeamError("task changed while finalizing worktree intent")
+                self.team._event(
+                    connection,
+                    task_id,
+                    "worktree_created",
+                    str(operation["actor"]),
+                    {
+                        **payload,
+                        "operation_id": operation_id,
+                    },
+                )
+                connection.execute(
+                    """
+                    UPDATE external_operations
+                    SET status = 'completed', completed_at = ?, updated_at = ?,
+                        result_json = ?
+                    WHERE operation_id = ?
+                    """,
+                    (
+                        now,
+                        now,
+                        self._json({"worktree_path": worktree_path}),
+                        operation_id,
+                    ),
+                )
+        return self.team.get_task(task_id)
+
+    def _fail_intent(self, operation_id: str, error: str) -> None:
+        now = utc_now()
         with self.team.connection() as connection:
             connection.execute(
                 """
-                UPDATE tasks
-                SET worktree_path = ?, branch = ?, target_branch = ?,
-                    base_ref = ?, base_commit = ?,
-                    updated_at = ?, version = version + 1
-                WHERE task_id = ?
+                UPDATE external_operations
+                SET status = 'failed', error = ?, completed_at = ?, updated_at = ?
+                WHERE operation_id = ? AND status IN ('pending', 'running')
                 """,
-                (
-                    str(target),
-                    branch,
-                    target_branch,
-                    base_ref,
-                    base_commit,
-                    utc_now(),
-                    task_id,
-                ),
+                (error, now, now, operation_id),
             )
-            self.team._event(
-                connection,
-                task_id,
-                "worktree_created",
-                actor,
-                {
-                    "worktree_path": str(target),
-                    "branch": branch,
-                    "target_branch": target_branch,
-                    "base_ref": base_ref,
-                    "base_commit": base_commit,
-                },
-            )
-        result = self.team.get_task(task_id)
-        return result
+
+    def recover_pending(self) -> list[dict[str, Any]]:
+        with self.team.connection(write=False) as connection:
+            rows = [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT * FROM external_operations
+                    WHERE operation_type = 'worktree_create'
+                      AND status IN ('pending', 'running')
+                    ORDER BY created_at, operation_id
+                    """
+                ).fetchall()
+            ]
+        recovered: list[dict[str, Any]] = []
+        for operation in rows:
+            operation_id = str(operation["operation_id"])
+            try:
+                payload = json.loads(operation["payload_json"])
+                root = Path(str(payload["repo_root"])).resolve()
+                target = Path(str(payload["worktree_path"])).resolve()
+                branch = str(payload["branch"])
+                if not root.is_dir():
+                    raise TeamError(f"repository root is missing: {root}")
+                if target.is_dir():
+                    top = self._git(target, "rev-parse", "--show-toplevel")
+                    current_branch = self._git(
+                        target,
+                        "symbolic-ref",
+                        "--short",
+                        "HEAD",
+                    )
+                    if (
+                        top.returncode != 0
+                        or Path(top.stdout.strip()).resolve() != target
+                        or current_branch.returncode != 0
+                        or current_branch.stdout.strip() != branch
+                    ):
+                        raise TeamError(
+                            "worktree target exists but branch/root do not match intent"
+                        )
+                    self._finalize_intent(operation_id)
+                else:
+                    branch_exists = self._git(
+                        root,
+                        "show-ref",
+                        "--verify",
+                        f"refs/heads/{branch}",
+                    )
+                    if branch_exists.returncode == 0:
+                        raise TeamError(
+                            "branch exists but worktree target is missing"
+                        )
+                    raise TeamError("worktree creation did not complete")
+                recovered.append({"operation_id": operation_id, "status": "completed"})
+            except Exception as exc:
+                error = str(exc)
+                try:
+                    self._fail_intent(operation_id, error)
+                except Exception as fail_error:
+                    error = f"{error}; failed to record operation failure: {fail_error}"
+                recovered.append(
+                    {
+                        "operation_id": operation_id,
+                        "status": "failed",
+                        "error": error,
+                    }
+                )
+        return recovered
 
     def list(self, repo: str | Path) -> list[dict[str, Any]]:
         root = self.team._root(repo)

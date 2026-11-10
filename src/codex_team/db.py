@@ -5,7 +5,7 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
@@ -142,7 +142,31 @@ CREATE TABLE IF NOT EXISTS cluster_jobs (
     reasoning_output_tokens INTEGER,
     usage_source TEXT,
     telemetry_complete INTEGER NOT NULL DEFAULT 0,
-    usage_missing_fields TEXT NOT NULL DEFAULT '[]'
+    usage_missing_fields TEXT NOT NULL DEFAULT '[]',
+    correlation_id TEXT,
+    prompt_hash TEXT NOT NULL DEFAULT '',
+    cache_profile TEXT NOT NULL DEFAULT '',
+    thread_action TEXT NOT NULL DEFAULT '',
+    outcome TEXT NOT NULL DEFAULT '',
+    settled_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS external_operations (
+    operation_id TEXT PRIMARY KEY,
+    operation_type TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN (
+        'pending', 'running', 'completed', 'failed', 'compensated'
+    )),
+    goal_id TEXT REFERENCES cluster_goals(goal_id) ON DELETE CASCADE,
+    task_id TEXT REFERENCES tasks(task_id) ON DELETE CASCADE,
+    job_id TEXT REFERENCES cluster_jobs(job_id) ON DELETE CASCADE,
+    actor TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    result_json TEXT NOT NULL DEFAULT '{}',
+    error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS cluster_agents (
@@ -237,8 +261,17 @@ CREATE INDEX IF NOT EXISTS idx_cluster_agents_pool
     ON cluster_agents(project_id, role, workstream_key, status, last_used_at);
 CREATE INDEX IF NOT EXISTS idx_cluster_jobs_turn
     ON cluster_jobs(thread_id, turn_id);
+CREATE INDEX IF NOT EXISTS idx_cluster_jobs_agent_started
+    ON cluster_jobs(agent_id, started_at DESC, job_id DESC);
+CREATE INDEX IF NOT EXISTS idx_cluster_jobs_correlation
+    ON cluster_jobs(correlation_id);
 CREATE INDEX IF NOT EXISTS idx_cluster_agent_events_agent
     ON cluster_agent_events(agent_id, event_id);
+CREATE INDEX IF NOT EXISTS idx_external_operations_status
+    ON external_operations(operation_type, status, updated_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_external_one_active_task_operation
+    ON external_operations(operation_type, task_id)
+    WHERE task_id IS NOT NULL AND status IN ('pending', 'running');
 CREATE UNIQUE INDEX IF NOT EXISTS idx_cluster_one_active_goal
     ON cluster_goals(project_id)
     WHERE status IN ('planning', 'active');
@@ -307,6 +340,12 @@ CLUSTER_JOB_MIGRATION_COLUMNS = {
     "usage_source": "TEXT",
     "telemetry_complete": "INTEGER NOT NULL DEFAULT 0",
     "usage_missing_fields": "TEXT NOT NULL DEFAULT '[]'",
+    "correlation_id": "TEXT",
+    "prompt_hash": "TEXT NOT NULL DEFAULT ''",
+    "cache_profile": "TEXT NOT NULL DEFAULT ''",
+    "thread_action": "TEXT NOT NULL DEFAULT ''",
+    "outcome": "TEXT NOT NULL DEFAULT ''",
+    "settled_at": "TEXT",
 }
 
 CLUSTER_AGENT_MIGRATION_COLUMNS = {
@@ -416,6 +455,24 @@ def _upgrade_schema(connection: sqlite3.Connection) -> None:
             connection.execute(
                 f"ALTER TABLE cluster_agents ADD COLUMN {name} {declaration}"
             )
+    connection.execute(
+        """
+        UPDATE cluster_jobs
+        SET correlation_id = COALESCE(correlation_id, job_id),
+            outcome = CASE
+                WHEN status IN ('completed', 'failed', 'interrupted', 'lost')
+                     AND TRIM(outcome) = ''
+                THEN status
+                ELSE outcome
+            END,
+            settled_at = CASE
+                WHEN status IN ('completed', 'failed', 'interrupted', 'lost')
+                     AND settled_at IS NULL
+                THEN started_at
+                ELSE settled_at
+            END
+        """
+    )
     connection.execute(
         """
         UPDATE cluster_agents

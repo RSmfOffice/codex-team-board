@@ -13,6 +13,10 @@
   instructions；任一版本变化都会禁止旧 thread 复用。
 - Core help 返回完整 operation `inputSchema`，保留类型、默认值、范围、枚举和
   字段说明。
+- `cluster_jobs` 扩展为统一 attempt ledger，记录 correlation、prompt hash、
+  cache profile、thread action、outcome 和 settled time。
+- 新增 `external_operations` durable intent 表；worktree 创建可跨数据库/Git
+  中断恢复，并发创建由唯一 active intent 约束。
 
 ### Changed
 
@@ -24,6 +28,8 @@
   bootstrap/policy 写入必须显式执行。
 - Worker、Explorer 和 Reviewer 的 Markdown/native TOML 模板全部改用
   `team_read`/`team_write` operation，避免默认 core 工具面与角色指令冲突。
+- App Server usage delta 的 baseline 改为读取已完成 attempt ledger，不再依赖
+  Agent 累计字段是否在成功 release 时更新。
 
 ### Fixed
 
@@ -43,11 +49,16 @@
 - CLI `task update` 补齐 `--commit`，与 MCP `team_update_task` 保持一致。
 - 全局和项目 AGENTS 全面使用 `team_read`/`team_write` operation 语法，避免默认
   Core 面要求不存在的细粒度工具。
+- completed/failed/interrupted/lost job 统一经过 settlement，写入 outcome、
+  settled_at 和可用 usage；Dashboard 对 failed Agent 优先投影 latest job。
+- 前端保留 unknown 语义，`null` token/cache 显示为 `—`，不再变成 0/0%。
 
 ### Database
 
-- schema 升级到 17，`cluster_goals` 新增 `stall_ticks`、`stall_signature` 和
-  `stalled_at`，用于跨 daemon 重启保留停滞检测状态。
+- schema 升级到 18；`cluster_jobs` 新增 correlation、prompt/profile、
+  thread action、outcome 和 settled 字段，并新增 `external_operations`。
+- schema 17 引入的 `cluster_goals.stall_ticks`、`stall_signature` 和
+  `stalled_at` 保持兼容并继续用于跨 daemon 停滞检测。
 
 ## [0.5.0] - 2026-11-08
 

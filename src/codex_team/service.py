@@ -855,12 +855,54 @@ class TeamService:
                 SELECT a.*, g.objective AS current_goal_objective,
                        t.title AS current_task_title,
                        j.kind AS current_job_kind,
-                       j.status AS current_job_status
+                       j.status AS current_job_status,
+                       latest_job.job_id AS latest_job_id,
+                       latest_job.status AS latest_job_status,
+                       latest_job.thread_action AS latest_job_thread_action,
+                       latest_job.outcome AS latest_job_outcome,
+                       latest_job.input_tokens AS latest_job_input_tokens,
+                       latest_job.cached_input_tokens AS latest_job_cached_input_tokens,
+                       latest_job.uncached_input_tokens AS latest_job_uncached_input_tokens,
+                       latest_job.output_tokens AS latest_job_output_tokens,
+                       latest_job.first_input_tokens AS latest_job_first_input_tokens,
+                       latest_job.first_cached_input_tokens AS latest_job_first_cached_input_tokens,
+                       latest_job.first_uncached_input_tokens AS latest_job_first_uncached_input_tokens,
+                       latest_job.context_tokens AS latest_job_context_tokens,
+                       latest_job.model_context_window AS latest_job_model_context_window,
+                       latest_job.cache_write_input_tokens AS latest_job_cache_write_input_tokens,
+                       latest_job.reasoning_output_tokens AS latest_job_reasoning_output_tokens,
+                       latest_job.usage_source AS latest_job_usage_source,
+                       latest_job.telemetry_complete AS latest_job_telemetry_complete,
+                       latest_job.usage_missing_fields AS latest_job_usage_missing_fields,
+                       latest_job.started_at AS latest_job_started_at,
+                       latest_job.finished_at AS latest_job_finished_at,
+                       ledger.ledger_total_input_tokens,
+                       ledger.ledger_total_cached_input_tokens,
+                       ledger.ledger_total_uncached_input_tokens,
+                       ledger.ledger_total_output_tokens
                 FROM cluster_agents a
                 JOIN projects p ON p.project_id = a.project_id
                 LEFT JOIN cluster_goals g ON g.goal_id = a.current_goal_id
                 LEFT JOIN tasks t ON t.task_id = a.current_task_id
                 LEFT JOIN cluster_jobs j ON j.job_id = a.current_job_id
+                LEFT JOIN cluster_jobs latest_job
+                  ON latest_job.job_id = (
+                    SELECT j2.job_id
+                    FROM cluster_jobs j2
+                    WHERE j2.agent_id = a.agent_id
+                    ORDER BY j2.started_at DESC, j2.job_id DESC
+                    LIMIT 1
+                  )
+                LEFT JOIN (
+                    SELECT agent_id,
+                           SUM(input_tokens) AS ledger_total_input_tokens,
+                           SUM(cached_input_tokens) AS ledger_total_cached_input_tokens,
+                           SUM(uncached_input_tokens) AS ledger_total_uncached_input_tokens,
+                           SUM(output_tokens) AS ledger_total_output_tokens
+                    FROM cluster_jobs
+                    WHERE agent_id IS NOT NULL
+                    GROUP BY agent_id
+                ) ledger ON ledger.agent_id = a.agent_id
                 WHERE {" AND ".join(agent_where)}
                 ORDER BY
                     CASE a.status
@@ -879,10 +921,41 @@ class TeamService:
             cluster_agents = []
             for row in agent_rows:
                 agent = dict(row)
-                agent["cache_hit_rate"] = self._cache_hit_rate(
+                total_rate = self._cache_hit_rate(
                     agent.get("total_input_tokens"),
                     agent.get("total_cached_input_tokens"),
                     agent.get("total_uncached_input_tokens"),
+                )
+                latest_usage = {
+                    field: agent.get(f"latest_job_{field}")
+                    for field in JOB_USAGE_FIELDS
+                }
+                latest_usage["usage_source"] = agent.get(
+                    "latest_job_usage_source"
+                )
+                latest_usage["usage_missing_fields"] = agent.get(
+                    "latest_job_usage_missing_fields"
+                )
+                self._project_unknown_usage(latest_usage)
+                for field, value in latest_usage.items():
+                    if field in JOB_USAGE_FIELDS:
+                        agent[f"latest_job_{field}"] = value
+                latest_rate = self._cache_hit_rate(
+                    latest_usage.get("input_tokens"),
+                    latest_usage.get("cached_input_tokens"),
+                    latest_usage.get("uncached_input_tokens"),
+                )
+                agent["cache_usage_source"] = (
+                    "agent_total"
+                    if total_rate is not None
+                    else "latest_job"
+                    if latest_rate is not None
+                    else None
+                )
+                agent["cache_hit_rate"] = (
+                    total_rate
+                    if total_rate is not None
+                    else latest_rate
                 )
                 cluster_agents.append(agent)
             cluster_agent_events: list[dict[str, Any]] = []

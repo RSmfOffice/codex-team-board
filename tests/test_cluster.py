@@ -3003,6 +3003,7 @@ class ClusterSchedulerTests(unittest.TestCase):
                 self.assertEqual(job["pid"], FakeProcess.pid)
                 self.assertIsNone(job["thread_id"])
                 self.assertIsNone(job["agent_id"])
+                self.assertEqual(job["thread_action"], "fallback_exec")
                 self.assertEqual(team.get_task(task["task_id"])["status"], "ready")
                 fallback_events = [
                     event["data"]
@@ -3756,9 +3757,17 @@ class ClusterSchedulerTests(unittest.TestCase):
                 workstream_key="feature-cache",
                 continuity_reason="same feature staged work",
             )
-            manager._dispatch_lead(second, [])
+            second_job = manager._dispatch_lead(second, [])
             self.assertEqual(len(runtime.start_threads), 1)
             self.assertEqual(runtime.resume_threads, [first_job["thread_id"]])
+            with team.connection(write=False) as connection:
+                resumed_action = connection.execute(
+                    """
+                    SELECT thread_action FROM cluster_jobs WHERE job_id = ?
+                    """,
+                    (second_job["job_id"],),
+                ).fetchone()
+            self.assertEqual(resumed_action["thread_action"], "resume")
             instructions = runtime.start_threads[0][1] or ""
             self.assertNotIn(first["goal_id"], instructions)
             self.assertNotIn(second["goal_id"], instructions)
@@ -4020,13 +4029,17 @@ class ClusterSchedulerTests(unittest.TestCase):
                            first_input_tokens, first_cached_input_tokens,
                            first_uncached_input_tokens, context_tokens,
                            model_context_window, usage_source,
-                           telemetry_complete
+                           telemetry_complete, outcome, settled_at,
+                           thread_action
                     FROM cluster_jobs
                     WHERE job_id = ?
                     """,
                     (usage_job["job_id"],),
                 ).fetchone()
             self.assertEqual(persisted["status"], "interrupted")
+            self.assertEqual(persisted["outcome"], "interrupted")
+            self.assertIsNotNone(persisted["settled_at"])
+            self.assertEqual(persisted["thread_action"], "fresh")
             self.assertEqual(persisted["input_tokens"], 150)
             self.assertEqual(persisted["cached_input_tokens"], 25)
             self.assertEqual(persisted["uncached_input_tokens"], 125)
@@ -4246,6 +4259,21 @@ class ClusterSchedulerTests(unittest.TestCase):
                 manager.get_goal(goal["goal_id"]),
                 team.get_task(task["task_id"]),
             )
+            _deliver_token_usage(
+                _ClusterAppServerEvents(manager),
+                dispatched["thread_id"],
+                dispatched["turn_id"],
+                {
+                    "total": {
+                        "inputTokens": 100,
+                        "cachedInputTokens": 80,
+                        "outputTokens": 20,
+                        "totalTokens": 120,
+                    },
+                    "last": {},
+                    "modelContextWindow": 1000,
+                },
+            )
             team.claim_task(
                 task["task_id"],
                 actor=manager._worker_actor(
@@ -4266,6 +4294,14 @@ class ClusterSchedulerTests(unittest.TestCase):
             jobs = restarted.get_goal(goal["goal_id"])["jobs"]
             lost = next(job for job in jobs if job["job_id"] == dispatched["job_id"])
             self.assertEqual(lost["status"], "lost")
+            self.assertEqual(lost["outcome"], "lost")
+            self.assertIsNotNone(lost["settled_at"])
+            self.assertEqual(lost["input_tokens"], 100)
+            self.assertEqual(lost["cached_input_tokens"], 80)
+            self.assertEqual(lost["uncached_input_tokens"], 20)
+            self.assertEqual(lost["output_tokens"], 20)
+            self.assertEqual(lost["context_tokens"], 120)
+            self.assertEqual(lost["model_context_window"], 1000)
             self.assertEqual(team.get_task(task["task_id"])["status"], "ready")
             self.assertIn(
                 "app_server_turn_lost",
@@ -4403,6 +4439,94 @@ class ClusterSchedulerTests(unittest.TestCase):
                     )["events"]
                 ],
             )
+
+    def test_attempt_ledger_records_prompt_profile_action_and_settlement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            repo = _repo(base, "attempt-ledger")
+            team.init_project(repo)
+            runtime = StubAppServerRuntime()
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime=runtime,
+                runtime_mode="app_server",
+            )
+            goal = manager.create_goal(repo, objective="Record attempt identity")
+            task = team.create_task(
+                repo,
+                title="Record attempt",
+                description="Persist identity for one App Server job.",
+                acceptance="Attempt ledger fields are complete.",
+                kind="read",
+                owner_role="team_explorer",
+                goal_id=goal["goal_id"],
+            )
+            dispatched = manager._dispatch_worker(
+                manager.get_goal(goal["goal_id"]),
+                team.get_task(task["task_id"]),
+            )
+            with team.connection(write=False) as connection:
+                started = connection.execute(
+                    """
+                    SELECT correlation_id, prompt_hash, cache_profile,
+                           thread_action, outcome, settled_at
+                    FROM cluster_jobs WHERE job_id = ?
+                    """,
+                    (dispatched["job_id"],),
+                ).fetchone()
+            self.assertEqual(started["correlation_id"], dispatched["job_id"])
+            self.assertEqual(len(started["prompt_hash"]), 64)
+            self.assertIn("cache-v1", started["cache_profile"])
+            self.assertEqual(started["thread_action"], "fresh")
+            self.assertEqual(started["outcome"], "")
+            self.assertIsNone(started["settled_at"])
+
+            _deliver_token_usage(
+                _ClusterAppServerEvents(manager),
+                dispatched["thread_id"],
+                dispatched["turn_id"],
+                {
+                    "total": {
+                        "inputTokens": 100,
+                        "cachedInputTokens": 80,
+                        "outputTokens": 20,
+                        "totalTokens": 120,
+                    },
+                    "last": {},
+                    "modelContextWindow": 1000,
+                },
+            )
+            actor = manager._worker_actor(
+                str(task["owner_role"]),
+                str(task["task_id"]),
+                str(dispatched["job_id"]),
+            )
+            claimed = team.claim_task(task["task_id"], actor=actor)
+            team.submit_task(
+                task["task_id"],
+                actor=actor,
+                claim_token=claimed["claim_token"],
+                result="attempt ledger fixture",
+                tests="fixture",
+            )
+            manager.app_turns[dispatched["job_id"]]["status"] = "completed"
+            manager._reconcile_jobs()
+
+            with team.connection(write=False) as connection:
+                settled = connection.execute(
+                    """
+                    SELECT status, outcome, settled_at, thread_action
+                    FROM cluster_jobs WHERE job_id = ?
+                    """,
+                    (dispatched["job_id"],),
+                ).fetchone()
+            self.assertEqual(settled["status"], "completed")
+            self.assertEqual(settled["outcome"], "completed")
+            self.assertIsNotNone(settled["settled_at"])
+            self.assertEqual(settled["thread_action"], "fresh")
 
     def test_default_runtime_is_app_server_and_workstream_contract_is_persisted(
         self,

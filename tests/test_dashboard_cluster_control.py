@@ -15,7 +15,7 @@ from unittest.mock import patch
 from codex_team.cluster import ClusterError, ClusterManager
 from codex_team.config import Settings
 from codex_team.dashboard import build_server
-from codex_team.db import utc_now
+from codex_team.db import SCHEMA_VERSION, utc_now
 from codex_team.service import TeamService
 
 
@@ -118,13 +118,13 @@ class DashboardClusterControlTests(unittest.TestCase):
         try:
             self.assertEqual(
                 connection.execute("PRAGMA user_version").fetchone()[0],
-                17,
+                SCHEMA_VERSION,
             )
             self.assertEqual(
                 connection.execute(
                     "SELECT MAX(version) FROM schema_migrations"
                 ).fetchone()[0],
-                17,
+                SCHEMA_VERSION,
             )
             connection.execute("PRAGMA user_version = 7")
             connection.execute(
@@ -137,7 +137,7 @@ class DashboardClusterControlTests(unittest.TestCase):
             health = self.get("/api/health")
             board = self.get("/api/board")
 
-        self.assertEqual(health["schema_version"], 17)
+        self.assertEqual(health["schema_version"], SCHEMA_VERSION)
         self.assertEqual(
             health["cluster_runtime"],
             {

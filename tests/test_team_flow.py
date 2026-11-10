@@ -658,6 +658,125 @@ class TeamFlowTests(unittest.TestCase):
                 worktree_path=self.base / "dirty-worktree",
             )
 
+    def test_worktree_intent_recovers_after_database_finalize_failure(self) -> None:
+        task = self.team.create_task(
+            self.repo,
+            title="Recover worktree intent",
+            description="The Git worktree exists before DB finalization.",
+            acceptance="Recovery attaches the existing worktree to the task.",
+            kind="write",
+            owner_role="team_worker",
+        )
+        with patch.object(
+            self.worktrees,
+            "_finalize_intent",
+            side_effect=RuntimeError("simulated database interruption"),
+        ):
+            with self.assertRaisesRegex(TeamError, "recovery is required"):
+                self.worktrees.create(task["task_id"], repo=self.repo)
+
+        self.assertIsNone(self.team.get_task(task["task_id"])["worktree_path"])
+        recovered = self.worktrees.recover_pending()
+        self.assertEqual(recovered[0]["status"], "completed")
+        current = self.team.get_task(task["task_id"])
+        self.assertTrue(Path(current["worktree_path"]).is_dir())
+        with self.team.connection(write=False) as connection:
+            operation = connection.execute(
+                """
+                SELECT status FROM external_operations
+                WHERE task_id = ? AND operation_type = 'worktree_create'
+                """,
+                (task["task_id"],),
+            ).fetchone()
+        self.assertEqual(operation["status"], "completed")
+
+    def test_concurrent_worktree_creation_has_one_intent_winner(self) -> None:
+        task = self.team.create_task(
+            self.repo,
+            title="Concurrent worktree intent",
+            description="Only one durable intent may own task provisioning.",
+            acceptance="One worktree and one completed operation exist.",
+            kind="write",
+            owner_role="team_worker",
+        )
+
+        def create() -> object:
+            try:
+                return self.worktrees.create(
+                    str(task["task_id"]),
+                    repo=self.repo,
+                )
+            except TeamError as exc:
+                return exc
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = list(executor.map(lambda _: create(), range(2)))
+        self.assertEqual(sum(isinstance(item, dict) for item in outcomes), 1)
+        self.assertEqual(sum(isinstance(item, TeamError) for item in outcomes), 1)
+        current = self.team.get_task(str(task["task_id"]))
+        self.assertTrue(Path(str(current["worktree_path"])).is_dir())
+        with self.team.connection(write=False) as connection:
+            operations = connection.execute(
+                """
+                SELECT status FROM external_operations
+                WHERE task_id = ? AND operation_type = 'worktree_create'
+                """,
+                (task["task_id"],),
+            ).fetchall()
+        statuses = [row["status"] for row in operations]
+        self.assertEqual(statuses.count("completed"), 1)
+        self.assertNotIn("pending", statuses)
+        self.assertNotIn("running", statuses)
+
+    def test_worktree_intent_without_git_result_is_marked_failed(self) -> None:
+        task = self.team.create_task(
+            self.repo,
+            title="Missing worktree result",
+            description="A durable intent exists without a Git worktree.",
+            acceptance="Recovery records a failed operation.",
+            kind="write",
+            owner_role="team_worker",
+        )
+        now = utc_now()
+        payload = {
+            "repo_root": str(self.repo.resolve()),
+            "worktree_path": str((self.base / "missing-worktree").resolve()),
+            "branch": "codex/team/missing-worktree",
+            "target_branch": "main",
+            "base_ref": "HEAD",
+            "base_commit": git(self.repo, "rev-parse", "HEAD"),
+        }
+        with self.team.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO external_operations(
+                    operation_id, operation_type, status, goal_id, task_id,
+                    actor, payload_json, created_at, updated_at
+                ) VALUES (
+                    'OP-MISSING-WORKTREE', 'worktree_create', 'running', ?, ?,
+                    'teamd', ?, ?, ?
+                )
+                """,
+                (
+                    task.get("goal_id"),
+                    task["task_id"],
+                    json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                    now,
+                    now,
+                ),
+            )
+        recovered = self.worktrees.recover_pending()
+        self.assertEqual(recovered[0]["status"], "failed")
+        with self.team.connection(write=False) as connection:
+            operation = connection.execute(
+                """
+                SELECT status, error FROM external_operations
+                WHERE operation_id = 'OP-MISSING-WORKTREE'
+                """
+            ).fetchone()
+        self.assertEqual(operation["status"], "failed")
+        self.assertIn("did not complete", operation["error"])
+
     def test_project_archive_hides_data_and_blocks_writes(self) -> None:
         project = self.team.register_project(self.repo)
         task = self.team.create_task(
@@ -1063,6 +1182,82 @@ class TeamFlowTests(unittest.TestCase):
         self.assertEqual(active_job["cached_input_tokens"], 600)
         self.assertEqual(active_job["uncached_input_tokens"], 200)
         self.assertEqual(active_job["cache_hit_rate"], 0.75)
+
+    def test_dashboard_projects_failed_agent_latest_job_usage(self) -> None:
+        manager = ClusterManager(
+            self.settings,
+            team=self.team,
+            worktrees=self.worktrees,
+        )
+        goal = manager.create_goal(
+            self.repo,
+            objective="Diagnose failed attempt usage",
+        )
+        now = utc_now()
+        with self.team.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO cluster_agents(
+                    agent_id, project_id, role, workstream_key, display_name,
+                    thread_id, status, model, model_provider,
+                    total_input_tokens, total_cached_input_tokens,
+                    total_uncached_input_tokens, context_tokens,
+                    turn_count, created_at, updated_at
+                ) VALUES (
+                    'A-FAILED-USAGE', ?, 'team_explorer', 'failed-usage',
+                    'Failed Usage Explorer', 'thread-failed-usage', 'failed',
+                    'test-model', 'test-provider', 0, 0, 0, 0, 1, ?, ?
+                )
+                """,
+                (goal["project_id"], now, now),
+            )
+            connection.execute(
+                """
+                INSERT INTO cluster_jobs(
+                    job_id, goal_id, kind, role, status, attempt,
+                    log_path, output_path, started_at, finished_at,
+                    error, agent_id, runtime, input_tokens,
+                    cached_input_tokens, uncached_input_tokens,
+                    output_tokens, context_tokens, model_context_window,
+                    usage_source, telemetry_complete,
+                    usage_missing_fields, correlation_id, prompt_hash,
+                    thread_action, outcome, settled_at
+                ) VALUES (
+                    'J-FAILED-USAGE', ?, 'worker', 'team_explorer', 'failed',
+                    1, ?, ?, ?, ?, 'provider failure', 'A-FAILED-USAGE',
+                    'app_server', 800, 600, 200, 120, 4096, 128000,
+                    'app_server.token_usage', 1, '[]', 'J-FAILED-USAGE',
+                    ?, 'fresh', 'failed', ?
+                )
+                """,
+                (
+                    goal["goal_id"],
+                    str(self.base / "failed-usage.log"),
+                    str(self.base / "failed-usage.out"),
+                    now,
+                    now,
+                    "a" * 64,
+                    now,
+                ),
+            )
+
+        dashboard = self.team.dashboard_snapshot(str(goal["project_id"]))
+        agent = next(
+            item
+            for item in dashboard["cluster_agents"]
+            if item["agent_id"] == "A-FAILED-USAGE"
+        )
+        self.assertEqual(agent["cache_usage_source"], "latest_job")
+        self.assertEqual(agent["latest_job_id"], "J-FAILED-USAGE")
+        self.assertEqual(agent["latest_job_status"], "failed")
+        self.assertEqual(agent["latest_job_outcome"], "failed")
+        self.assertEqual(agent["latest_job_thread_action"], "fresh")
+        self.assertEqual(agent["latest_job_cached_input_tokens"], 600)
+        self.assertEqual(agent["latest_job_uncached_input_tokens"], 200)
+        self.assertEqual(agent["ledger_total_input_tokens"], 800)
+        self.assertEqual(agent["ledger_total_cached_input_tokens"], 600)
+        self.assertEqual(agent["ledger_total_uncached_input_tokens"], 200)
+        self.assertEqual(agent["cache_hit_rate"], 0.75)
 
     def test_dashboard_projects_missing_usage_fields_to_null(self) -> None:
         manager = ClusterManager(
