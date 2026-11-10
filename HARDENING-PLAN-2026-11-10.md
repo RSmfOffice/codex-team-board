@@ -575,6 +575,7 @@ Merge commit:
 - [x] 软归档后默认诊断隐藏，include-archived 可查。
 - [x] Agent events、cluster jobs 和 Codex session 文件不删除。
 - [x] 重复执行幂等，并记录 `archived_stale` 审计事件。
+- [x] 项目 archive/restore 同步只恢复 `archived_project`，不误恢复单独归档。
 
 验收：
 

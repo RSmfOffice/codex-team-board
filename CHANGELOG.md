@@ -119,6 +119,8 @@
   token 列显示成真实 `0`；有 usage 后由下一次自动同步刷新。
 - 已登记的 native Thread 不再受自动发现 24 小时窗口限制，窗口外的 session
   在时间戳或 usage 状态变化时仍会幂等刷新。
+- 项目归档同步不再无条件恢复所有 archived Agent；项目 restore 只恢复
+  `archived_project` 来源，`archived_stale` 保持归档。
 - Dashboard revision 覆盖任务版本、Goal/Agent 更新时间、job 状态与 usage、
   Task/Goal/Agent 事件序列和消息序列；事件分页使用严格半开 cursor，避免重复或
   漏项。

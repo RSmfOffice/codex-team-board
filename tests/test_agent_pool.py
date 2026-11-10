@@ -759,6 +759,61 @@ class AgentPoolTests(unittest.TestCase):
         self.assertEqual(len(self.pool.list_agents("P2")), 1)
         self.assertEqual(second["archived_at"], None)
 
+    def test_project_sync_does_not_restore_individually_archived_agents(
+        self,
+    ) -> None:
+        current_profile = agent_cache_profile(
+            "current role instructions",
+            policy_path=None,
+            sandbox_mode="danger-full-access",
+            surface="core",
+            access_mode="full",
+            mcp_instructions="current instructions",
+        )
+        current = self.register(
+            thread_id="current-agent",
+            profile=current_profile,
+        )
+        stale = self.register(
+            thread_id="stale-agent",
+            profile="legacy",
+        )
+        applied = self.pool.archive_stale_managed_agents(apply=True)
+        self.assertEqual(applied["archived"], [stale["agent_id"]])
+
+        self.pool.archive_project("P1", False)
+        with closing(connect(self.db_path)) as connection:
+            stale_after_noop = connection.execute(
+                "SELECT archived_at FROM cluster_agents WHERE agent_id=?",
+                (stale["agent_id"],),
+            ).fetchone()[0]
+        self.assertIsNotNone(stale_after_noop)
+
+        self.pool.archive_project("P1", True)
+        self.pool.archive_project("P1", False)
+        with closing(connect(self.db_path)) as connection:
+            rows = {
+                row["agent_id"]: dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT agent_id, archived_at FROM cluster_agents
+                    WHERE agent_id IN (?, ?)
+                    """,
+                    (current["agent_id"], stale["agent_id"]),
+                ).fetchall()
+            }
+        self.assertIsNone(rows[current["agent_id"]]["archived_at"])
+        self.assertIsNotNone(rows[stale["agent_id"]]["archived_at"])
+        stale_events = self.agent_events(stale["agent_id"])
+        self.assertEqual(
+            stale_events[-1]["event_type"],
+            "archived_stale",
+        )
+        self.assertNotIn(
+            "restored",
+            [event["event_type"] for event in stale_events],
+        )
+
     def test_cannot_archive_project_with_busy_agent(self) -> None:
         self.register()
         self.pool.select_agent(

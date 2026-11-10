@@ -829,6 +829,8 @@ CLI、MCP、ClusterManager 和 WebUI 的 reset 都统一进入
 Thread。Native Thread、current reusable Thread、`busy/starting` 和仍绑定活动
 Goal/Task/Job 的记录不会归档。归档是可恢复软删除：默认诊断隐藏，include-archived
 仍可查询，Agent events、cluster jobs 和 Codex session 文件全部保留。
+项目归档同步通过 `archived_project` / `archived_stale` 事件来源区分归档原因；
+active 项目的 tick 或项目 restore 不会恢复单独归档的 stale Thread。
 
 ### Native 子 Agent 登记
 

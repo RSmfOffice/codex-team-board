@@ -1318,8 +1318,35 @@ class AgentPool:
                     (archived_at, now, project_id),
                 )
             for agent in agents:
-                if (agent["archived_at"] is not None) == archived:
-                    continue
+                if archived:
+                    if agent["archived_at"] is not None:
+                        continue
+                    event_type = "archived_project"
+                else:
+                    if agent["archived_at"] is None:
+                        continue
+                    latest_event = connection.execute(
+                        """
+                        SELECT event_type, actor
+                        FROM cluster_agent_events
+                        WHERE agent_id = ?
+                          AND event_type IN (
+                              'archived_project', 'archived',
+                              'archived_stale', 'restored'
+                          )
+                        ORDER BY event_id DESC
+                        LIMIT 1
+                        """,
+                        (agent["agent_id"],),
+                    ).fetchone()
+                    if (
+                        latest_event is None
+                        or latest_event["actor"] != "agent_pool"
+                        or latest_event["event_type"]
+                        not in {"archived_project", "archived"}
+                    ):
+                        continue
+                    event_type = "restored"
                 connection.execute(
                     """
                     UPDATE cluster_agents
@@ -1331,7 +1358,7 @@ class AgentPool:
                 self._event(
                     connection,
                     agent["agent_id"],
-                    "archived" if archived else "restored",
+                    event_type,
                     "agent_pool",
                     {"project_id": project_id},
                     created_at=now,
