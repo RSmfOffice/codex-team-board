@@ -56,6 +56,7 @@ expectText(app, "JSON.stringify(payload)", "app.js");
 expectText(app, "/api/clusters/control", "app.js");
 expectText(app, "/api/clusters/archive", "app.js");
 expectText(app, "/api/agents/reset", "app.js");
+expectText(app, "/api/agents/sync-native", "app.js");
 expectText(app, "/api/board", "app.js");
 expectText(app, "/api/summary", "app.js");
 expectText(app, "/api/projects", "app.js");
@@ -98,6 +99,8 @@ expectText(css, ".cluster-card.archived", "style.css");
 expectText(css, ".cluster-diagnostic.heartbeat-warning", "style.css");
 expectText(css, ".cluster-diagnostic.heartbeat-critical", "style.css");
 expectText(css, ".agent-thread-card.busy", "style.css");
+expectText(css, ".agent-thread-card.failed", "style.css");
+expectText(css, ".agent-status.failed", "style.css");
 expectText(css, ".agent-profile.historical", "style.css");
 expectText(css, ".chip.workflow.historical", "style.css");
 expectText(css, ".task-runtime", "style.css");
@@ -149,6 +152,13 @@ expectPattern(app, /function\s+buildBoardSignature\s*\(/, "app.js");
 expectPattern(app, /function\s+schedulePoll\s*\(/, "app.js");
 expectPattern(app, /async\s+function\s+pollBoard\s*\(/, "app.js");
 expectPattern(app, /function\s+handleVisibilityChange\s*\(/, "app.js");
+expectPattern(app, /async\s+function\s+syncNativeAgentThreads\s*\(/, "app.js");
+expectText(html, "自动同步", "index.html");
+expectText(
+  app,
+  'document.getElementById("agent-threads").addEventListener("toggle"',
+  "app.js native thread panel sync",
+);
 
 const pollBoardSource = between(
   app,
@@ -160,6 +170,11 @@ assert.ok(
   "pollBoard must not fetch projects after the one-time project load",
 );
 expectText(pollBoardSource, "/api/summary", "pollBoard summary probe");
+expectText(
+  pollBoardSource,
+  "syncNativeAgentThreads({ silent: true })",
+  "pollBoard native agent discovery",
+);
 expectText(pollBoardSource, "boardRequired", "pollBoard revision gate");
 expectText(pollBoardSource, "/api/board", "pollBoard conditional board fetch");
 

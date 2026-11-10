@@ -20,7 +20,7 @@ from .app_server import AppServerEvents, AppServerRuntime
 from .cache_contract import agent_cache_profile, configured_surface
 from .config import Settings
 from .db import connect, connect_readonly, utc_now
-from .native_threads import inspect_native_session
+from .native_threads import discover_native_sessions, inspect_native_session
 from .processes import pid_is_running
 from .prompt_contract import (
     configured_access_mode,
@@ -1324,6 +1324,143 @@ class ClusterManager:
             "agent": agent,
             "inspection": inspection,
             "same_task_only": True,
+        }
+
+    def sync_native_agents(
+        self,
+        *,
+        actor: str = "dashboard",
+        project_id: str | None = None,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        max_age_hours = env_int(
+            "CODEX_TEAM_NATIVE_DISCOVERY_MAX_AGE_HOURS",
+            24,
+            maximum=24 * 365,
+        )
+        discovered = discover_native_sessions(
+            limit=limit,
+            max_age_seconds=max_age_hours * 3600,
+        )
+        projects = self.team.list_projects(include_archived=False)
+        if project_id:
+            projects = [
+                project
+                for project in projects
+                if str(project["project_id"]) == project_id
+            ]
+        project_root_rows: list[tuple[Path, dict[str, Any]]] = []
+        for project in projects:
+            try:
+                root = Path(
+                    str(project["root_path"])
+                ).expanduser().resolve()
+            except (OSError, RuntimeError):
+                continue
+            project_root_rows.append((root, project))
+        project_roots = sorted(
+            project_root_rows,
+            key=lambda item: len(str(item[0])),
+            reverse=True,
+        )
+        with self.team.connection(write=False) as connection:
+            registered_threads = {
+                str(row["thread_id"])
+                for row in connection.execute(
+                    "SELECT thread_id FROM cluster_agents"
+                ).fetchall()
+            }
+            task_rows = connection.execute(
+                """
+                SELECT task_id, project_id, archived_at
+                FROM tasks
+                ORDER BY created_at DESC, task_id
+                """
+            ).fetchall()
+        tasks = {
+            str(row["task_id"]): {
+                "task_id": str(row["task_id"]),
+                "project_id": str(row["project_id"]),
+                "archived": bool(row["archived_at"]),
+            }
+            for row in task_rows
+        }
+
+        def matching_project(cwd: str | None) -> dict[str, Any] | None:
+            if not cwd:
+                return None
+            try:
+                path = Path(cwd).expanduser().resolve()
+            except (OSError, RuntimeError):
+                return None
+            for root, project in project_roots:
+                if path == root or root in path.parents:
+                    return project
+            return None
+
+        registered: list[dict[str, Any]] = []
+        skipped_existing: list[str] = []
+        skipped_unknown_project: list[str] = []
+        errors: list[dict[str, str]] = []
+        for item in discovered:
+            thread_id = str(item["thread_id"])
+            if thread_id in registered_threads:
+                skipped_existing.append(thread_id)
+                continue
+            project = matching_project(item.get("cwd"))
+            if project is None:
+                skipped_unknown_project.append(thread_id)
+                continue
+            task_id = next(
+                (
+                    task_id_value
+                    for task_id_value in item.get("task_ids", [])
+                    if task_id_value in tasks
+                    and tasks[task_id_value]["project_id"]
+                    == str(project["project_id"])
+                    and not tasks[task_id_value]["archived"]
+                ),
+                None,
+            )
+            parent_thread_id = item.get("parent_thread_id")
+            workstream_key = (
+                f"native:{parent_thread_id}"
+                if parent_thread_id
+                else f"native:{thread_id}"
+            )
+            try:
+                result = self.register_native_agent(
+                    project["root_path"],
+                    thread_id,
+                    str(item.get("agent_role") or "team_explorer"),
+                    workstream_key,
+                    actor=f"{actor}:{thread_id}",
+                    task_id=task_id,
+                    display_name=(
+                        item.get("agent_nickname")
+                        or item.get("agent_path")
+                        or thread_id
+                    ),
+                    model_provider=str(item.get("model_provider") or ""),
+                )
+            except (AgentPoolError, ClusterError, TeamError, OSError) as exc:
+                errors.append(
+                    {
+                        "thread_id": thread_id,
+                        "error": str(exc),
+                    }
+                )
+                continue
+            registered.append(result["agent"])
+            registered_threads.add(thread_id)
+        return {
+            "discovered": len(discovered),
+            "max_age_hours": max_age_hours,
+            "registered": registered,
+            "registered_count": len(registered),
+            "skipped_existing": skipped_existing,
+            "skipped_unknown_project": skipped_unknown_project,
+            "errors": errors,
         }
 
     def reset_agent(

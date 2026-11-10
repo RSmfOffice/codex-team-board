@@ -1,17 +1,106 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 from codex_team.native_threads import (
+    discover_native_sessions,
     find_native_session,
     inspect_native_session,
 )
 
 
 class NativeThreadTests(unittest.TestCase):
+    def test_discovery_finds_only_subagent_sessions_and_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "sessions"
+            root.mkdir()
+            thread_id = "01a1cafe-1111-7222-8333-944455556666"
+            subagent_path = root / f"rollout-{thread_id}.jsonl"
+            subagent_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "session_meta",
+                                "payload": {
+                                    "id": thread_id,
+                                    "cwd": "D:\\project",
+                                    "model_provider": "deepseek",
+                                    "source": {
+                                        "subagent": {
+                                            "thread_spawn": {
+                                                "parent_thread_id": "parent-123",
+                                                "agent_path": "/root/cache_prefix_review",
+                                                "agent_nickname": "Hume",
+                                                "agent_role": None,
+                                            }
+                                        }
+                                    },
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "input_text",
+                                            "text": "Review T-20261110-ABCDEF",
+                                        }
+                                    ],
+                                },
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (root / "rollout-main.jsonl").write_text(
+                json.dumps(
+                    {
+                        "type": "session_meta",
+                        "payload": {
+                            "id": "01a1cafe-9999-7222-8333-944455556666",
+                            "cwd": "D:\\project",
+                            "source": "vscode",
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            discovered = discover_native_sessions(root=root)
+            self.assertEqual(len(discovered), 1)
+            self.assertEqual(discovered[0]["thread_id"], thread_id)
+            self.assertEqual(discovered[0]["parent_thread_id"], "parent-123")
+            self.assertEqual(discovered[0]["agent_nickname"], "Hume")
+            self.assertEqual(discovered[0]["agent_role"], "team_reviewer")
+            self.assertEqual(
+                discovered[0]["task_ids"],
+                ["T-20261110-ABCDEF"],
+            )
+            self.assertEqual(discovered[0]["cwd"], "D:\\project")
+            self.assertEqual(discovered[0]["model_provider"], "deepseek")
+            old_timestamp = time.time() - 2 * 24 * 3600
+            os.utime(subagent_path, (old_timestamp, old_timestamp))
+            self.assertEqual(
+                discover_native_sessions(
+                    root=root,
+                    max_age_seconds=3600,
+                ),
+                [],
+            )
+
     def test_session_inspection_detects_parent_identity_and_task_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "sessions"

@@ -43,6 +43,10 @@
   revision、ETag 和 `If-None-Match` 304。
 - WebUI 常规轮询先读取 summary revision，未变化时不下载完整 board；任务详情
   改为按任务异步读取事件，不再依赖全局最新 500 条窗口。
+- Dashboard 新增 `POST /api/agents/sync-native`，从最近 Codex subagent
+  sessions 自动发现 native Thread，并按已登记活动项目的 cwd 归属幂等入库。
+- WebUI 在初始轮询、每 30 秒和展开 Agent Threads 时自动同步；历史 managed
+  failed Thread 继续保留，并增加明确的 failed 视觉状态。
 
 ### Changed
 
@@ -105,6 +109,8 @@
 - 数据库初始化对 locked/busy 做指数退避重试；只读连接使用编码 URI，兼容空格和
   `#` 路径。
 - 脱敏补充未加引号的冒号格式凭据。
+- Native 子 Agent 不再依赖 Lead 手工登记才能出现在 Dashboard；自动发现只读取
+  session metadata 和任务 ID，主 Thread、未知项目和非 subagent session 会被跳过。
 - Dashboard revision 覆盖任务版本、Goal/Agent 更新时间、job 状态与 usage、
   Task/Goal/Agent 事件序列和消息序列；事件分页使用严格半开 cursor，避免重复或
   漏项。

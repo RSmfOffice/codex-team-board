@@ -4,12 +4,20 @@ import hashlib
 import json
 import os
 import re
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping
 
 
 THREAD_ID_RE = re.compile(r"^[0-9a-fA-F-]{8,64}$")
+TASK_ID_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])(T-\d{8}-[A-Za-z0-9]{6})(?![A-Za-z0-9_-])",
+    re.IGNORECASE,
+)
+NATIVE_ROLES = frozenset(
+    {"lead", "team_explorer", "team_worker", "team_reviewer"}
+)
 
 
 def native_sessions_root() -> Path:
@@ -23,6 +31,52 @@ def native_sessions_root() -> Path:
         else Path.home() / ".codex"
     )
     return (base / "sessions").resolve()
+
+
+def discover_native_sessions(
+    *,
+    root: str | Path | None = None,
+    limit: int = 200,
+    max_age_seconds: int | None = None,
+) -> list[dict[str, Any]]:
+    """Discover Codex subagent sessions without storing message bodies."""
+
+    sessions_root = (
+        Path(root).expanduser().resolve()
+        if root is not None
+        else native_sessions_root()
+    )
+    if not sessions_root.is_dir():
+        return []
+    limit = max(1, min(int(limit), 1000))
+    cutoff = (
+        time.time() - max(1, int(max_age_seconds))
+        if max_age_seconds is not None
+        else None
+    )
+    candidates: list[tuple[float, Path]] = []
+    for path in sessions_root.rglob("*.jsonl"):
+        try:
+            modified = path.stat().st_mtime
+        except OSError:
+            continue
+        if cutoff is not None and modified < cutoff:
+            continue
+        candidates.append((modified, path))
+    candidates.sort(key=lambda item: (item[0], str(item[1])), reverse=True)
+
+    discovered: list[dict[str, Any]] = []
+    seen_thread_ids: set[str] = set()
+    for modified, path in candidates[:limit]:
+        item = _discover_session_file(path, modified)
+        if item is None:
+            continue
+        thread_id = str(item["thread_id"])
+        if thread_id in seen_thread_ids:
+            continue
+        seen_thread_ids.add(thread_id)
+        discovered.append(item)
+    return discovered
 
 
 def find_native_session(
@@ -181,6 +235,133 @@ def _optional_text(value: Any) -> str | None:
         return None
     normalized = str(value).strip()
     return normalized or None
+
+
+def _discover_session_file(
+    path: Path,
+    modified: float,
+) -> dict[str, Any] | None:
+    metadata: Mapping[str, Any] | None = None
+    task_ids: list[str] = []
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as stream:
+            for index, line in enumerate(stream):
+                if index >= 200:
+                    break
+                if not line.startswith("{"):
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(event, Mapping):
+                    continue
+                if metadata is None and event.get("type") == "session_meta":
+                    payload = event.get("payload")
+                    if not isinstance(payload, Mapping):
+                        return None
+                    source = payload.get("source")
+                    subagent = (
+                        source.get("subagent")
+                        if isinstance(source, Mapping)
+                        else None
+                    )
+                    spawn = (
+                        subagent.get("thread_spawn")
+                        if isinstance(subagent, Mapping)
+                        else None
+                    )
+                    if not isinstance(spawn, Mapping):
+                        return None
+                    metadata = payload
+                if metadata is not None and not task_ids:
+                    prompt = _user_prompt_text(event)
+                    if prompt:
+                        task_ids = list(
+                            dict.fromkeys(
+                                match.upper()
+                                for match in TASK_ID_RE.findall(prompt)
+                            )
+                        )
+                if metadata is not None and task_ids:
+                    break
+    except OSError:
+        return None
+    if metadata is None:
+        return None
+
+    source = metadata.get("source")
+    subagent = (
+        source.get("subagent")
+        if isinstance(source, Mapping)
+        else None
+    )
+    spawn = (
+        subagent.get("thread_spawn")
+        if isinstance(subagent, Mapping)
+        else None
+    )
+    if not isinstance(spawn, Mapping):
+        return None
+    thread_id = (
+        _optional_text(metadata.get("id"))
+        or _thread_id_from_filename(path)
+    )
+    if not thread_id or not THREAD_ID_RE.fullmatch(thread_id):
+        return None
+    parent_thread_id = _optional_text(spawn.get("parent_thread_id")) or (
+        _optional_text(metadata.get("parent_thread_id"))
+    )
+    agent_path = _optional_text(spawn.get("agent_path")) or _optional_text(
+        metadata.get("agent_path")
+    )
+    agent_nickname = _optional_text(
+        spawn.get("agent_nickname")
+    ) or _optional_text(metadata.get("agent_nickname"))
+    explicit_role = _optional_text(spawn.get("agent_role")) or _optional_text(
+        metadata.get("agent_role")
+    )
+    return {
+        "thread_id": thread_id,
+        "session_path": str(path),
+        "cwd": _optional_text(metadata.get("cwd")),
+        "parent_thread_id": parent_thread_id,
+        "agent_path": agent_path,
+        "agent_nickname": agent_nickname,
+        "agent_role": _infer_native_role(explicit_role, agent_path),
+        "task_ids": task_ids,
+        "model_provider": _optional_text(metadata.get("model_provider")) or "",
+        "last_seen_at": datetime.fromtimestamp(
+            modified,
+            tz=UTC,
+        ).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+    }
+
+
+def _thread_id_from_filename(path: Path) -> str | None:
+    match = re.search(
+        r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+        r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
+        path.stem,
+    )
+    return match.group(1) if match else None
+
+
+def _infer_native_role(
+    explicit_role: str | None,
+    agent_path: str | None,
+) -> str:
+    normalized_role = str(explicit_role or "").strip().lower()
+    if normalized_role in NATIVE_ROLES:
+        return normalized_role
+    hint = str(agent_path or "").strip().lower()
+    if "review" in hint or "verif" in hint:
+        return "team_reviewer"
+    if "worker" in hint or "implement" in hint or "fixer" in hint:
+        return "team_worker"
+    if "lead" in hint:
+        return "lead"
+    return "team_explorer"
 
 
 def _user_prompt_text(event: Mapping[str, Any]) -> str:
