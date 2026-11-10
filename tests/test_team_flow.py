@@ -321,6 +321,7 @@ class TeamFlowTests(unittest.TestCase):
             runtime_mode="exec",
             agent_command=["codex"],
         )
+        self.addCleanup(manager.close)
         goal = manager.create_goal(
             self.repo,
             objective="Reject an old workflow cohort",
@@ -353,8 +354,7 @@ class TeamFlowTests(unittest.TestCase):
         manager.tick()
         current_task = self.team.get_task(task["task_id"])
         current_goal = manager.get_goal(goal["goal_id"])
-        self.assertEqual(current_task["status"], "blocked")
-        self.assertIn("workflow epoch", current_task["blocker"])
+        self.assertEqual(current_task["status"], "ready")
         self.assertEqual(current_goal["status"], "paused")
         self.assertIn(
             "workflow_epoch_mismatch",
@@ -376,6 +376,26 @@ class TeamFlowTests(unittest.TestCase):
                 owner_role="team_explorer",
                 goal_id=goal["goal_id"],
             )
+        with self.team.connection() as connection:
+            connection.execute(
+                "UPDATE cluster_goals SET workflow_epoch = ? WHERE goal_id = ?",
+                (
+                    self.team.current_workflow_epoch(self.repo),
+                    goal["goal_id"],
+                ),
+            )
+        manager.set_goal_status(
+            goal["goal_id"],
+            "active",
+            reason="exercise task-level epoch gate",
+        )
+        manager._dispatch_next_job(
+            manager.get_goal(goal["goal_id"]),
+            [self.team.get_task(task["task_id"])],
+        )
+        blocked_task = self.team.get_task(task["task_id"])
+        self.assertEqual(blocked_task["status"], "blocked")
+        self.assertIn("workflow epoch", blocked_task["blocker"])
 
     def test_explicit_goal_workflow_epoch_migration(self) -> None:
         manager = ClusterManager(

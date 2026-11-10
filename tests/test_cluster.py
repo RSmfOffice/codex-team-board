@@ -12,6 +12,7 @@ import threading
 import time
 import unittest
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -21,6 +22,7 @@ from codex_team.cluster import (
     _ClusterAppServerEvents,
     ClusterManager,
     LEAD_DEVELOPER_INSTRUCTIONS,
+    TICK_PHASE_ORDER,
     _agent_cache_profile,
     _redact_sensitive_file,
     _redact_sensitive_log,
@@ -468,6 +470,257 @@ class ClusterSchedulerTests(unittest.TestCase):
             self.assertTrue(_redact_sensitive_file(path))
             self.assertNotIn(secret, path.read_text(encoding="utf-8"))
             self.assertFalse(_redact_sensitive_file(path))
+
+    def test_tick_phases_have_fixed_order_and_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = _settings(Path(temporary))
+            manager = ClusterManager(
+                settings,
+                team=TeamService(settings),
+                runtime_mode="exec",
+                agent_command=["codex"],
+            )
+            with (
+                patch.object(
+                    manager,
+                    "_reconcile_jobs",
+                    return_value={"count": 1},
+                ) as settle,
+                patch.object(
+                    manager.worktrees,
+                    "recover_pending",
+                    return_value=[],
+                ) as recover,
+                patch.object(
+                    manager,
+                    "_apply_agent_reset_requests",
+                    return_value={"count": 0},
+                ) as reset,
+                patch.object(
+                    manager,
+                    "_sync_project_agent_archive",
+                    return_value={"count": 0},
+                ) as archive,
+                patch.object(
+                    manager,
+                    "list_goals",
+                    return_value=[],
+                ) as prepare,
+                patch.object(
+                    manager,
+                    "_schedule_goals",
+                    return_value=[],
+                ) as dispatch,
+                patch.object(
+                    manager,
+                    "_check_worker_health",
+                    return_value={"count": 0},
+                ) as worker_health,
+                patch.object(
+                    manager,
+                    "_check_goal_stalls",
+                    return_value={"count": 0},
+                ) as goal_health,
+            ):
+                result = manager.tick()
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["phase_order"], list(TICK_PHASE_ORDER))
+            self.assertEqual(
+                [phase["name"] for phase in result["phases"]],
+                list(TICK_PHASE_ORDER),
+            )
+            self.assertEqual(result["failed_phase"], None)
+            self.assertEqual(result["skipped_phases"], [])
+            self.assertTrue(
+                all(
+                    phase["ok"]
+                    and isinstance(phase["duration_ms"], float)
+                    and isinstance(phase["counts"], dict)
+                    for phase in result["phases"]
+                )
+            )
+            for mocked in (
+                settle,
+                recover,
+                reset,
+                archive,
+                prepare,
+                dispatch,
+                worker_health,
+                goal_health,
+            ):
+                self.assertTrue(mocked.called)
+
+    def test_tick_phase_failure_stops_and_publishes_redacted_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = _settings(Path(temporary))
+            manager = ClusterManager(
+                settings,
+                team=TeamService(settings),
+                runtime_mode="exec",
+                agent_command=["codex"],
+            )
+            with (
+                patch.object(
+                    manager,
+                    "_reconcile_jobs",
+                    side_effect=RuntimeError(
+                        "claim_token=top-secret-value"
+                    ),
+                ),
+                patch.object(
+                    manager.worktrees,
+                    "recover_pending",
+                    side_effect=AssertionError("recover should be skipped"),
+                ),
+                patch.object(
+                    manager,
+                    "_schedule_goals",
+                    side_effect=AssertionError("dispatch should be skipped"),
+                ),
+            ):
+                result = manager.tick()
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["failed_phase"], "settle")
+        self.assertEqual(
+            [phase["name"] for phase in result["phases"]],
+            ["settle", "publish"],
+        )
+        self.assertEqual(
+            result["skipped_phases"],
+            [
+                "recover",
+                "control",
+                "prepare",
+                "dispatch",
+                "health",
+            ],
+        )
+        self.assertNotIn("top-secret-value", result["error"])
+        self.assertIn("[REDACTED]", result["error"])
+
+    def test_concurrent_tick_calls_are_serialized(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = _settings(Path(temporary))
+            manager = ClusterManager(
+                settings,
+                team=TeamService(settings),
+                runtime_mode="exec",
+                agent_command=["codex"],
+            )
+            state_lock = threading.Lock()
+            active = 0
+            max_active = 0
+
+            def reconcile() -> dict[str, int]:
+                nonlocal active, max_active
+                with state_lock:
+                    active += 1
+                    max_active = max(max_active, active)
+                time.sleep(0.15)
+                with state_lock:
+                    active -= 1
+                return {"count": 0}
+
+            with (
+                patch.object(
+                    manager,
+                    "_reconcile_jobs",
+                    side_effect=reconcile,
+                ),
+                patch.object(manager, "list_goals", return_value=[]),
+            ):
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    results = list(
+                        executor.map(lambda _: manager.tick(), range(2))
+                    )
+
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(result["ok"] for result in results))
+        self.assertEqual(max_active, 1)
+
+    def test_tick_reconciles_planning_goal_through_active_to_completed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            repo = _repo(base, "terminal-reconciliation")
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime_mode="exec",
+                agent_command=["codex"],
+            )
+            goal = manager.create_goal(
+                repo,
+                objective="Complete a terminal task",
+            )
+            task = team.create_task(
+                repo,
+                title="Already complete",
+                description="Exercise terminal reconciliation.",
+                acceptance="Goal activates then completes.",
+                kind="read",
+                owner_role="team_explorer",
+                goal_id=goal["goal_id"],
+            )
+            with team.connection() as connection:
+                connection.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'done', completed_at = ?, updated_at = ?
+                    WHERE task_id = ?
+                    """,
+                    (utc_now(), utc_now(), task["task_id"]),
+                )
+
+            result = manager.tick()
+            current = manager.get_goal(goal["goal_id"])
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(current["status"], "completed")
+        status_events = [
+            event["data"]["status"]
+            for event in current["events"]
+            if event["event_type"] == "goal_status"
+        ]
+        self.assertEqual(status_events[-2:], ["active", "completed"])
+
+    def test_empty_goal_waits_for_lead_instead_of_completing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            repo = _repo(base, "empty-goal")
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime_mode="exec",
+                agent_command=["codex"],
+            )
+            goal = manager.create_goal(
+                repo,
+                objective="Plan an empty goal",
+            )
+            with patch.object(
+                manager,
+                "_dispatch_lead",
+                return_value={
+                    "job_id": "J-EMPTY-GOAL",
+                    "goal_id": goal["goal_id"],
+                    "status": "running",
+                },
+            ):
+                result = manager.tick()
+            current = manager.get_goal(goal["goal_id"])
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(current["status"], "planning")
+        self.assertGreaterEqual(len(result["scheduled"]), 1)
 
     def test_write_and_auto_lead_jobs_use_git_writable_sandbox(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -5029,7 +5282,7 @@ class ClusterSchedulerTests(unittest.TestCase):
                 },
             )
             self.assertTrue(
-                migrated["workflow_epoch"].startswith("workflow-v1:")
+                migrated["workflow_epoch"].startswith("workflow-v2:")
             )
             listed = server.call_tool(
                 "team_agent_list",

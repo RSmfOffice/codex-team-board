@@ -688,6 +688,20 @@ settlement helper；completed、failed、interrupted、lost 都会写入 outcome
 settled_at。Dashboard 的 Agent 卡片通过 latest-job 和 attempt ledger 投影失败或
 中断任务的真实 usage，不再依赖成功 release 后的累计字段。
 
+`teamd` 的每次 tick 固定按以下阶段执行：
+
+```text
+settle → recover → control → prepare → dispatch → health → publish
+```
+
+`clusterd.json` 的 tick 结果包含 `phase_order`、`phases`、`failed_phase`、
+`skipped_phases` 和总 `ok`。每个阶段带 `duration_ms` 与 `counts`；业务阶段失败
+会停止后续阶段，但仍执行 publish，让看板和 daemon 状态能定位失败位置。同一
+`ClusterManager` 内的并发 tick 使用锁串行化。
+
+当 Goal 的所有任务都已 done/canceled 且没有活动 job 时，`planning` Goal 会先
+进入 `active`，再进入 `completed`，用两个明确事件完成 terminal reconciliation。
+
 `workstream_key` 是项目内连续性作用域；省略时默认使用当前 `goal_id`。默认复用
 策略为：
 

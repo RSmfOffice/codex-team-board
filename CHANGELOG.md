@@ -31,6 +31,9 @@
 - 新增显式 `cluster migrate-workflow` 和
   `team_goal_migrate_workflow`；有活动 job/running task 时禁止迁移，
   存在未完成任务时要求 durable checkpoint。
+- `teamd` tick 改为固定
+  `settle/recover/control/prepare/dispatch/health/publish` 流水线，输出阶段
+  `duration_ms`、`counts`、失败阶段和跳过阶段。
 
 ### Changed
 
@@ -82,11 +85,17 @@
 - 旧 `workflow_epoch` 的 ready Task 在 claim 前被阻断，旧 Goal 不自动 resume；
   Lead/Task dispatch 会记录 `workflow_epoch_mismatch` 并保持等待迁移。
 - Dashboard 的 Goal、Task、Agent latest job 显示当前或未绑定 workflow epoch。
+- `planning` Goal 在全部任务终态时显式经过 `active → completed`，不再尝试非法
+  的 `planning → completed` 直接转换。
+- 同一 `ClusterManager` 的并发 tick 串行化；业务阶段失败后停止后续阶段，但
+  publish 仍会产出可诊断状态并脱敏错误。
 
 ### Database
 
 - schema 升级到 20；`cluster_goals`、`tasks` 和 `cluster_jobs` 新增
   `workflow_epoch`；旧记录一次性回填为 `legacy-unbound`。
+- `workflow_epoch` 语义版本升级到 `workflow-v2`，覆盖新的 tick 状态机与阶段
+  流水线。
 - schema 19 的 `cluster_agents` runtime、parent/path/nickname、
   actor、prompt hash/status、native session path 和 last-seen；
   `task_events` 新增 thread/job/correlation/assignment 关联字段。
