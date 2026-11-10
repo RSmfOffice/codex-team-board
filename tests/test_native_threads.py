@@ -15,6 +15,137 @@ from codex_team.native_threads import (
 
 
 class NativeThreadTests(unittest.TestCase):
+    def test_usage_parser_ignores_parent_history_and_reads_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            thread_id = "01a1cafe-4444-7222-8333-944455556666"
+            path = root / f"rollout-{thread_id}.jsonl"
+            target_task = "T-20261110-ABCDEF"
+            path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "session_meta",
+                                "ordinal": 0,
+                                "payload": {
+                                    "id": thread_id,
+                                    "context_window": 996147,
+                                    "subagent_history_start_ordinal": 10,
+                                    "source": {
+                                        "subagent": {
+                                            "thread_spawn": {
+                                                "parent_thread_id": "parent-123",
+                                                "agent_path": "/root/reviewer",
+                                            }
+                                        }
+                                    },
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "response_item",
+                                "ordinal": 1,
+                                "payload": {
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "input_text",
+                                            "text": "Parent task T-20261109-999999",
+                                        }
+                                    ],
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "response_item",
+                                "ordinal": 10,
+                                "payload": {
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "input_text",
+                                            "text": f"Review {target_task}",
+                                        }
+                                    ],
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "token_usage_record",
+                                "ordinal": 11,
+                                "payload": {
+                                    "thread_id": thread_id,
+                                    "turn_id": "turn-1",
+                                    "usage": {
+                                        "input_tokens": 1000,
+                                        "cached_input_tokens": 800,
+                                        "output_tokens": 50,
+                                    },
+                                    "turn_token_usage": {
+                                        "input_tokens": 1000,
+                                        "cached_input_tokens": 800,
+                                        "output_tokens": 50,
+                                    },
+                                    "thread_token_usage": {
+                                        "input_tokens": 2000,
+                                        "cached_input_tokens": 1600,
+                                        "output_tokens": 100,
+                                    },
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "event_msg",
+                                "ordinal": 12,
+                                "payload": {
+                                    "type": "token_count",
+                                    "info": {
+                                        "total_token_usage": {
+                                            "input_tokens": 2000,
+                                            "cached_input_tokens": 1600,
+                                            "output_tokens": 100,
+                                        },
+                                        "last_token_usage": {
+                                            "input_tokens": 1000,
+                                            "cached_input_tokens": 800,
+                                            "output_tokens": 50,
+                                        },
+                                        "model_context_window": 996147,
+                                    },
+                                },
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            inspected = inspect_native_session(
+                thread_id,
+                task_id=target_task,
+                root=root,
+            )
+            self.assertEqual(inspected["prompt_status"], "delivered")
+            self.assertEqual(inspected["task_ids"], [target_task])
+            usage = inspected["usage"]
+            self.assertTrue(usage["available"])
+            self.assertEqual(usage["last_input_tokens"], 1000)
+            self.assertEqual(usage["last_cached_input_tokens"], 800)
+            self.assertEqual(usage["last_uncached_input_tokens"], 200)
+            self.assertEqual(usage["total_input_tokens"], 2000)
+            self.assertEqual(usage["context_tokens"], 1000)
+            self.assertEqual(usage["model_context_window"], 996147)
+            self.assertEqual(usage["turn_count"], 1)
+            self.assertEqual(usage["last_turn_id"], "turn-1")
+
     def test_discovery_finds_only_subagent_sessions_and_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "sessions"

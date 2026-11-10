@@ -661,8 +661,12 @@ nativeBoard.cluster_agents = [{
   prompt_status: "missing",
   current_task_id: "T-NATIVE",
   current_task_title: "验证任务送达",
-  context_tokens: 0,
-  turn_count: 0,
+  last_cached_input_tokens: 800,
+  last_uncached_input_tokens: 200,
+  context_tokens: 1000,
+  model_context_window: 996147,
+  cache_hit_rate: 0.8,
+  turn_count: 1,
 }];
 assert.equal(
   hooks.renderBoard(nativeBoard),
@@ -675,6 +679,9 @@ assert.match(nativeAgentHtml, /prompt missing/);
 assert.match(nativeAgentHtml, /agent Erdos/);
 assert.match(nativeAgentHtml, /父 Thread：thread-parent-1/);
 assert.match(nativeAgentHtml, /Native thread 仅支持 same-task/);
+assert.match(nativeAgentHtml, /1,000 \/ 996,147/);
+assert.match(nativeAgentHtml, /80%/);
+assert.match(nativeAgentHtml, /200/);
 assert.equal(
   hooks.renderBoard(secondBoard),
   true,

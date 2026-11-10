@@ -867,6 +867,11 @@ POST /api/agents/sync-native
 `same_task_only` 认领门禁时，仍应执行显式 `team_agent_register_native`。
 历史 managed `failed` Thread 不会被自动隐藏或删除，诊断面板继续完整保留。
 
+Native session 的 token 数据来自 `subagent_history_start_ordinal` 之后的
+`token_usage_record` 和 `token_count`。Dashboard 显示最近一次 input/cached/
+uncached/context 和累计 cache rate；session 尚无 usage 事件时显示 `—`，不会把
+数据库默认 `0` 误报成真实用量。显式记录的零值仍保持为 `0`。
+
 ### Workstream checkpoint
 
 阶段边界使用 compact checkpoint 代替复制完整历史：

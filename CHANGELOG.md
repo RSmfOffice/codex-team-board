@@ -47,6 +47,8 @@
   sessions 自动发现 native Thread，并按已登记活动项目的 cwd 归属幂等入库。
 - WebUI 在初始轮询、每 30 秒和展开 Agent Threads 时自动同步；历史 managed
   failed Thread 继续保留，并增加明确的 failed 视觉状态。
+- Native Agent 同步会读取 session 的 `token_usage_record` 与 `token_count`，
+  持久化最近/累计 input、cached、uncached、context、model window 和 turn 数。
 
 ### Changed
 
@@ -111,6 +113,8 @@
 - 脱敏补充未加引号的冒号格式凭据。
 - Native 子 Agent 不再依赖 Lead 手工登记才能出现在 Dashboard；自动发现只读取
   session metadata 和任务 ID，主 Thread、未知项目和非 subagent session 会被跳过。
+- Native Agent 尚无 usage 证据时，Dashboard 保持 unknown/`—`，不再把数据库默认
+  token 列显示成真实 `0`；有 usage 后由下一次自动同步刷新。
 - Dashboard revision 覆盖任务版本、Goal/Agent 更新时间、job 状态与 usage、
   Task/Goal/Agent 事件序列和消息序列；事件分页使用严格半开 cursor，避免重复或
   漏项。

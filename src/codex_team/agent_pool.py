@@ -178,6 +178,78 @@ class AgentPool:
             "model_context_window": model_context_window,
         }
 
+    @staticmethod
+    def _optional_non_negative_int(value: Any) -> int | None:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed >= 0 else None
+
+    @classmethod
+    def _update_native_usage(
+        cls,
+        connection: sqlite3.Connection,
+        agent_id: str,
+        usage: Mapping[str, Any] | None,
+    ) -> None:
+        values = usage or {}
+        model_context_window = cls._optional_non_negative_int(
+            values.get("model_context_window")
+        )
+        if not values.get("available"):
+            if model_context_window is not None:
+                connection.execute(
+                    """
+                    UPDATE cluster_agents
+                    SET model_context_window = ?
+                    WHERE agent_id = ?
+                    """,
+                    (model_context_window, agent_id),
+                )
+            return
+
+        def count(name: str) -> int:
+            return cls._optional_non_negative_int(values.get(name)) or 0
+
+        raw_turn_id = values.get("last_turn_id")
+        last_turn_id = (
+            str(raw_turn_id).strip()
+            if raw_turn_id is not None and str(raw_turn_id).strip()
+            else None
+        )
+        connection.execute(
+            """
+            UPDATE cluster_agents
+            SET last_input_tokens = ?,
+                last_cached_input_tokens = ?,
+                last_uncached_input_tokens = ?,
+                total_input_tokens = ?,
+                total_cached_input_tokens = ?,
+                total_uncached_input_tokens = ?,
+                context_tokens = ?,
+                model_context_window = COALESCE(?, model_context_window),
+                turn_count = ?,
+                last_turn_id = COALESCE(?, last_turn_id)
+            WHERE agent_id = ?
+            """,
+            (
+                count("last_input_tokens"),
+                count("last_cached_input_tokens"),
+                count("last_uncached_input_tokens"),
+                count("total_input_tokens"),
+                count("total_cached_input_tokens"),
+                count("total_uncached_input_tokens"),
+                count("context_tokens"),
+                model_context_window,
+                count("turn_count"),
+                last_turn_id,
+                agent_id,
+            ),
+        )
+
     def register_thread(
         self,
         project_id: str,
@@ -306,6 +378,7 @@ class AgentPool:
         prompt_status: str = "unknown",
         native_session_path: str | None = None,
         last_seen_at: str | None = None,
+        usage: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         project_id = self._require_text(project_id, "project_id")
         role = self._require_text(role, "role").lower()
@@ -431,6 +504,11 @@ class AgentPool:
                         existing["agent_id"],
                     ),
                 )
+                self._update_native_usage(
+                    connection,
+                    str(existing["agent_id"]),
+                    usage,
+                )
                 self._event(
                     connection,
                     existing["agent_id"],
@@ -441,6 +519,9 @@ class AgentPool:
                         "task_id": task_id,
                         "prompt_status": prompt_status,
                         "session_path": native_session_path,
+                        "usage_available": bool(
+                            (usage or {}).get("available")
+                        ),
                     },
                     created_at=now,
                 )
@@ -490,6 +571,11 @@ class AgentPool:
                     now,
                 ),
             )
+            self._update_native_usage(
+                connection,
+                agent_id,
+                usage,
+            )
             self._event(
                 connection,
                 agent_id,
@@ -506,6 +592,9 @@ class AgentPool:
                     "agent_nickname": agent_nickname,
                     "prompt_status": prompt_status,
                     "session_path": native_session_path,
+                    "usage_available": bool(
+                        (usage or {}).get("available")
+                    ),
                 },
                 created_at=now,
             )

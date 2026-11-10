@@ -535,6 +535,26 @@ Merge commit:
 
 ---
 
+### Phase 4D-2：Native Session Token Usage
+
+状态：实现完成，待 Lead Review、合并和正式库 usage 刷新
+
+- [x] 以 `subagent_history_start_ordinal` 隔离父 Thread 历史。
+- [x] 解析 `token_usage_record` 与 `token_count` 的 last/total usage。
+- [x] 记录 last/total input、cached、uncached、context、model window、turn。
+- [x] 已登记 native Thread 在 session 更新后幂等刷新 usage。
+- [x] 无 usage 证据时 API 投影为 `null`，UI 显示 `—`。
+- [x] 显式 usage 零值仍按真实零值保留。
+
+验收：
+
+- usage parser 过滤父历史，并正确解析 cached/uncached/context/window。
+- 首次无 usage 的 native Agent 在追加 token 事件后可自动刷新。
+- UI smoke 验证 native context/cache/uncached 与 unknown 语义。
+- 不改数据库 schema，不引入第二 usage 状态源。
+
+---
+
 ### Phase 5：安装、进程与历史清理
 
 状态：未开始

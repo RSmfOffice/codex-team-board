@@ -1872,6 +1872,21 @@ class TeamService:
                 agent["profile_contract_status"] = (
                     cache_profile_contract_status(agent.get("profile"))
                 )
+                if agent.get("runtime") == "native":
+                    agent["usage_available"] = bool(
+                        int(agent.get("turn_count") or 0)
+                    )
+                    if not agent["usage_available"]:
+                        for field in (
+                            "last_input_tokens",
+                            "last_cached_input_tokens",
+                            "last_uncached_input_tokens",
+                            "total_input_tokens",
+                            "total_cached_input_tokens",
+                            "total_uncached_input_tokens",
+                            "context_tokens",
+                        ):
+                            agent[field] = None
                 total_rate = self._cache_hit_rate(
                     agent.get("total_input_tokens"),
                     agent.get("total_cached_input_tokens"),
@@ -1897,7 +1912,10 @@ class TeamService:
                     latest_usage.get("uncached_input_tokens"),
                 )
                 agent["cache_usage_source"] = (
-                    "agent_total"
+                    "native_session"
+                    if agent.get("runtime") == "native"
+                    and agent.get("usage_available")
+                    else "agent_total"
                     if total_rate is not None
                     else "latest_job"
                     if latest_rate is not None
