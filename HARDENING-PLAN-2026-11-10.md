@@ -424,7 +424,7 @@ Merge commit:
 
 ### Phase 4C：安全与状态完整性
 
-状态：代码与自动化验收完成，等待 Lead diff Review 和合并
+状态：已完成并通过 Lead Review、主分支集成和正式库迁移验证
 
 - [x] Dashboard 写接口校验 loopback Host、same-origin Origin 和
   `application/json`，无 Origin 的 CLI 客户端保持兼容。
@@ -452,6 +452,12 @@ Core schema hash:
 86e78eef5f5f631094f5218d763c83997f5ab52d1ba22877f93092720f93fca6
 workflow_epoch:
 workflow-v3
+Live workflow epoch:
+workflow-v3:35d6cf536183084845e2237f20bcaa94
+Worker commit:
+65ab74805bb8f96fde0c18d759a997821af7ebd5
+Merge commit:
+990e6d283bc7668c6fc52564abae2530fe0dc290
 ```
 
 ---
