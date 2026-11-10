@@ -386,7 +386,7 @@ Merge commit:
 
 ### Phase 4B：调度状态机与 Tick 流水线
 
-状态：代码与自动化验收完成，等待 Lead diff Review 和合并
+状态：已完成并通过 Lead Review、主分支集成和正式 daemon 验证
 
 - [x] 将 tick 拆成 settle/recover/control/prepare/dispatch/health/publish 阶段。
 - [x] 每个阶段输出耗时、计数、成功状态和失败错误。
@@ -410,6 +410,14 @@ compileall ok
 Core tools: team_read, team_write
 Core schema hash:
 86e78eef5f5f631094f5218d763c83997f5ab52d1ba22877f93092720f93fca6
+Live daemon phases:
+settle,recover,control,prepare,dispatch,health,publish
+Live terminal reconciliation:
+planning -> active -> completed
+Worker commit:
+884eea110c7d66d67fdbecb410da6956120cf7ad
+Merge commit:
+2c9a6ddd31bea443a2f970e6e3e08d95674ba8a5
 ```
 
 ---
