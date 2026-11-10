@@ -1,11 +1,11 @@
 # Codex Team Board v0.5.0 项目流程拆分与交接 Bug 风险登记册
 
 > 文档基线：2026-11-10
-> Git 提交：`3830f4b5ef2ee7989fcf61ee7632a49473553d5c`
+> Git 提交：`2a24e69242273f2ee5d78e1e10e0bcffca6f04ac`
 > Release：`v0.5.0`
-> schema：`20`
-> workflow epoch：`workflow-v4`
-> 测试基线：`187 tests OK, 1 skipped`
+> schema：`21`
+> workflow epoch：`workflow-v4:64c5c32c2244734d37b8828e3afe8008`
+> 测试基线：`205 tests OK, 1 skipped`
 
 本文档是当前 `v0.5.0` 的流程地图和交接风险登记册。
 [AUDIT-FLOW-2026-11-10.md](AUDIT-FLOW-2026-11-10.md) 保留为加固前历史审计；
@@ -57,17 +57,20 @@
 
 当前最高优先级残余风险：
 
-1. `H28/P0` daemon、job 和 stop 仍主要依赖 PID，PID 复用可能误判或误杀。
-2. `H01/P1` 安装器先删除 MCP 再重装，后续步骤失败时没有完整回滚。
-3. `H10/P1` Review 的 Git 检查与任务落板之间仍隔着外部 Git 可变窗口。
-4. `H09/P1` submit/block/update 的部分 read-check-write 仍不是统一
+1. `H01/P1` 安装器先删除 MCP 再重装，后续步骤失败时没有完整回滚。
+2. `H10/P1` Review 的 Git 检查与任务落板之间仍隔着外部 Git 可变窗口。
+3. `H09/H08/H21/P1` submit/block/update/recovery 的部分 read-check-write 仍不是统一
    `BEGIN IMMEDIATE + version CAS`。
-5. `H23/P1` Native 角色依赖 `agent_path` 启发式，Thread 生命周期状态不完整。
-6. `H25/P1` revision 依赖秒级时间和聚合值，极端同秒变化可能漏刷新。
+4. `H23/P1` Native 角色依赖 `agent_path` 启发式，Thread 生命周期状态不完整。
+5. `H25/P1` revision 依赖秒级时间和聚合值，极端同秒变化可能漏刷新。
+6. `H13/P2` 任一业务 tick phase 失败会跳过后续 phase，可能暂时停止调度。
 7. `H26/P2` tasks/goals/agents/attempts 分区 API 仍先组装完整 snapshot 再切片。
 8. `H29/P2` 版本升级后旧进程可能继续加载旧 Python，出现前后端契约错位。
 9. `H30/P2` 历史 worktree、branch 和日志没有完整自动清理/保留策略。
-10. `H13/P2` 任一业务 tick phase 失败会跳过后续 phase，可能暂时停止调度。
+
+第一批 process ownership 已完成：daemon、exec、App Server 与 ownerless Job
+现在使用强进程身份和 Windows Job Object；旧的无 identity 活动进程采用
+fail-closed 运维门禁，不再按裸 PID 自动终止。
 
 ---
 
@@ -349,18 +352,20 @@ Codex native sessions
   重复累计 usage；Worker 只有 runtime 成功且 Task 已到
   `review/done/blocked` 才算 Job `completed`。
 - 潜在 Bug：
-  - daemon 重启后内存中的 `Popen` 对象丢失，只能凭持久化 PID 判断进程是否
-    仍存活；PID 复用会延长假 running，见 H19/H28。
+  - daemon 重启后内存中的 `Popen` 对象仍会丢失；当前通过持久化 PID +
+    creation-time + executable + instance ID 验证 ownerless 进程，并在确认
+    终止后结算 `lost`。无 identity 的旧 Job 只能 fail closed。
   - App Server state 缺失时 Job 会转 `lost`，但若 DB settlement 已提交、后续
     AgentPool 收敛抛错，当前实现会吞掉异常，可能留下终态 Job 与 busy Agent
     暂时不一致。
   - 数据库把缺失 usage 写为结构字段 0，必须依赖 `usage_source`、
     `telemetry_complete` 和 `usage_missing_fields` 还原 unknown；直接查数值列
     会误判真实命中率 0%。
-- 当前状态：`受保护/残余 P2`。terminal CAS 保证结算幂等，unknown usage
-  投影受保护；Agent release 异常后的补偿仍是残余问题。
+- 当前状态：`受保护/残余 P2`。terminal CAS 保证结算幂等；ownerless exec
+  Job 的终止、复核和 `lost` 恢复已关闭；Agent release 异常补偿仍是残余问题。
 - 验证：`test_cluster` settlement、lost turn、cancel usage、daemon restart；
-  `test_usage_repair` missing-vs-zero。
+  `test_process_ownership` ownerless/restart/finalize；`test_usage_repair`
+  missing-vs-zero。
 
 ### H13 Tick recover / control
 
@@ -504,22 +509,23 @@ Codex native sessions
 
 - 生产者：`_start_exec_job`、`subprocess.Popen`、`_pump_log`。
 - 消费者：`_reconcile_jobs`、timeout/cancel/daemon stop、step log parser。
-- 交接物：PID、process object、exit code、stdout/stderr JSONL、thread_id、
-  output 文件。
+- 交接物：PID、process object、process creation-time/executable/instance ID、
+  Job Object handle、exit code、stdout/stderr JSONL、thread_id、output 文件。
 - 必须保持：只终止本项目创建的进程；stdout 必须持续抽取以防管道阻塞；敏感
   信息写入日志前必须脱敏；进程退出后 Job 必须结算。
 - 潜在 Bug：
-  - Windows 上只保存 PID，没有 Job Object、进程启动时间、command line 或
-    instance token；PID 复用会误判存活并可能误杀无关进程。
-  - daemon 重启后 process object 丢失，仅靠 `pid_is_running` 维持 Job；无法
-    reattach stdout/exit code，只能等 PID 消失或 timeout。
-  - `taskkill /T /F` 没有二次核验目标身份，属于 H28 的 P0 问题。
-  - prompt 从 stdin 写入，若 Popen 成功后写 stdin/启动 pump 失败，必须依赖
-    exception settlement；该路径已有失败结算，但要检查子进程是否被回收。
-- 当前状态：`残余风险 P1`。log pump、进程组、timeout 和启动异常结算已实现；
-  进程身份不可验证是高风险根因。
-- 验证：`test_cluster` exec startup/timeout/log parsing；
-  `test_usage_repair` exec JSONL usage；daemon/restart tests。
+  - Job Object 在 `Popen` 后立即 attach；若子进程在 attach 完成前已经创建
+    grandchild，启动瞬间仍存在极窄的竞争窗口，当前没有 CREATE_SUSPENDED
+    级别的对抗性测试。
+  - Popen、Job、map 注册和 SQLite running 收尾现已处于同一失败清理路径；
+    DB 不可用时只能关闭进程树并记录尽可能完整的失败信息。
+  - daemon 崩溃时 KILL_ON_JOB_CLOSE 会清理进程树；若检测到强身份仍匹配的
+    ownerless 历史进程，reconcile 先验证并终止，身份未消失则保持 active 等
+    下一 tick，不提前恢复第二个 Worker。
+- 当前状态：`P1 已关闭 / 残余 P2`。裸 PID 判活和未验证 taskkill 根因已关闭；
+  启动瞬间的 attach 竞争仍属于低概率加固项。
+- 验证：`test_process_ownership` timeout/cancel/restart/ownerless/DB finalize；
+  `test_cluster` exec startup/log parsing；`test_usage_repair` exec JSONL usage。
 
 ### H20 Job settlement → usage / outcome
 
@@ -541,10 +547,14 @@ Codex native sessions
     一致性。
   - interrupted/cancel 时会尽力从 JSONL 恢复 usage；完全没有事件时保持
     unknown。
-- 当前状态：`受保护/残余 P2`。terminal CAS、usage evidence、first/final
-  快照和 unknown 投影已覆盖；ledger backfill 后仍需核对 baseline。
+- 强制 `lost` 结算不等同于进程已死：ownerless exec 只有在身份复核、终止成功
+  且 identity 消失后才进入 Task recovery。
+- 当前状态：`受保护/残余 P2`。terminal CAS、ownerless 终止门禁、usage
+  evidence、first/final 快照和 unknown 投影已覆盖；ledger backfill 后仍需核对
+  baseline。
 - 验证：`test_cluster` app/exec settlement、cancel usage、lost usage；
-  `test_usage_repair` normalize/backfill。
+  `test_process_ownership` ownerless/finalize；`test_usage_repair`
+  normalize/backfill。
 
 ### H21 Worker failure / retry / recovery
 
@@ -565,9 +575,10 @@ Codex native sessions
     上限并自动 blocked。
   - Agent 被标 failed 后后续 attempt 一定 fresh，成本会上升但隔离更安全。
 - 当前状态：`受保护/残余 P1`。attempt 上限、scope 重试和 actor 检查已实现；
-  事务一致性与人工 owner 冲突 UX 需继续收紧。
+  ownerless 进程必须先安全终止再恢复；事务一致性与人工 owner 冲突 UX 需继续
+  收紧。
 - 验证：`test_cluster` retry/recovery/context overflow/claim conflict；
-  `test_team_flow` lease expiration。
+  `test_process_ownership` ownerless recovery；`test_team_flow` lease expiration。
 
 ### H22 Task/Goal/Agent events → correlation
 
@@ -718,29 +729,29 @@ Codex native sessions
 - 生产者：`ensure_daemon`、`clusterd.acquire_lock`、Windows Scheduled Task、
   user startup watchdog、Dashboard 启动脚本。
 - 消费者：Tick、App Server runtime、exec child、Dashboard、stop/restart/cancel。
-- 交接物：`clusterd.lock` PID、`clusterd.json` state/identity、daemon log、
-  watchdog registration、process PIDs。
+- 交接物：`clusterd.lock` 强进程身份、`clusterd.json` state/identity、daemon
+  log、watchdog registration、Windows Job Object ownership。
 - 必须保持：全机器同一 Team Home 只运行一个 daemon；stop/kill 只能作用于本
   项目目标进程；daemon identity/config mismatch 可见；watchdog 不创建重复实例。
 - 潜在 Bug：
-  - `P0`：daemon lock、Job reconcile、goal cancel 和 stop 都以裸 PID 判断
-    身份。Windows 快速复用 PID 时可能把无关进程当作 daemon/child，进而
-    `taskkill /T /F` 错杀。
-  - daemon 重启后旧 Job 没有 process object，也没有 Windows Job Object handle；
-    无法可靠证明持久化 PID 仍是同一进程。
-  - `ensure_daemon` 发现任意 running PID 即返回，不自动处理 state identity
-    mismatch；升级后可能继续运行旧 Python/旧配置。
+  - `P0 已关闭`：daemon lock、pid、state 和 Job 现在要求 PID +
+    creation-time + executable + instance ID 同时匹配；stop 后必须确认 PID
+    消失才删除 lock。
+  - legacy live PID、伪造身份、缺 identity 或损坏 lock 会 fail closed：
+    不杀进程、不删锁、不自动启动替代 daemon，需要人工确认旧进程后升级。
+  - 无 identity 的历史 active Job 不能被安全认领或终止，只能转 `lost` 并保留
+    运维处置边界；这是兼容性残余风险，不再是裸 PID 自动误杀。
   - watchdog 通过“最新 pythoncore”查找解释器；安装多版本 Python 后，下一次
     restart 可能切到不同解释器。
   - Scheduled Task 失败时退回 HKCU Run watchdog；注册状态分散在两处，排障需
     同时检查 task、Run key、named mutex 和 watchdog log。
   - Dashboard 没有独立 ownership lock；端口冲突/多实例时只能从日志和 health
     推断。
-- 当前状态：`残余风险 P0`。这是当前最高优先级；在引入进程启动时间、命令行/
-  instance token、Windows Job Object 或可验证 control channel 前，不能把裸 PID
-  当作强身份。
-- 验证：`test_cluster` daemon identity/restart/if-idle；
-  `scripts/ensure-cluster-daemon.ps1`；Windows 实机需要 PID reuse 注入测试。
+- 当前状态：`P0 已关闭 / 残余 P2`。强身份、Job Object、fail-closed 和 stop
+  后复核已落地；多版本解释器、watchdog 注册和 legacy 运维仍是残余问题。
+- 验证：`test_process_ownership` 17 项 Windows/daemon/Job tests；
+  `test_cluster` daemon identity/restart/if-idle；
+  `scripts/ensure-cluster-daemon.ps1`。
 
 ### H29 Upgrade / release / workflow epoch
 
@@ -800,14 +811,14 @@ Codex native sessions
 
 | ID | 严重度 | 当前状态 | 触发条件 | 主要影响 | 建议下一步 |
 | --- | --- | --- | --- | --- | --- |
-| H28 | P0 | 残余风险 | Windows 重启/崩溃后 PID 被复用 | 误判 daemon/Job 存活，可能误杀 | 引入 Job Object + 进程启动时间/instance token，stop 前强校验 |
-| H19 | P1 | 残余风险 | daemon 重启后继续依赖持久化 PID | 无法 reattach，假 running 到 timeout | 与 H28 同批实现 process identity/control channel |
 | H01 | P1 | 残余风险 | MCP remove 后后续安装在失败 | MCP 消失，需人工修复 | staging + 回滚，或原子切换 MCP 注册 |
 | H10 | P1 | 受保护/残余 | Review ancestry 后 Git 被外部移动 | 可能批准不再对应 target 的 merge | repo lock 或 merge commit/target ref CAS |
 | H09/H08 | P1 | 受保护/残余 | submit/block/update 与其他写并发 | read-check-write 竞争，状态覆盖 | 统一 `BEGIN IMMEDIATE` + version CAS |
 | H21 | P1 | 受保护/残余 | retry/recover 与外部 claim 并发 | Task 暂时卡住或错误恢复 | 事务化 recovery，明确 foreign owner 处理 |
 | H23 | P1 | 受保护/残余 | metadata 缺 role/multiple task IDs | Native Thread 角色/Task 误绑 | 显式 metadata 优先，存 parent+assignment identity |
 | H25 | P1 | 残余风险 | 同秒更新且聚合签名不变 | Dashboard 不刷新 | 表级 monotonic revision 或 change counter |
+| H19 | P2 | P1 已关闭/残余 | Popen 后、Job attach 前极短启动窗口 | 理论上的 grandchild 逃逸 | CREATE_SUSPENDED 级启动测试 |
+| H28 | P2 | P0 已关闭/残余 | legacy live identity 或损坏 lock | daemon fail closed、需人工升级 | Round 4 统一升级/watchdog 编排 |
 | H13 | P2 | 残余风险 | 任一 business phase 异常 | 当轮后续调度停摆 | phase 独立错误隔离 + retry budget |
 | H14/H15 | P2 | 受保护/残余 | runtime 瞬时失败/预占中断 | Task 被过粗 blocked 或短期 running | 区分 transient/permanent，事务化 reservation release |
 | H16 | P2 | 受保护/残余 | release/usage 对账异常 | busy Agent 或累计成本偏差 | 后台 reconcile Agent vs Job ledger |
@@ -851,8 +862,9 @@ Codex native sessions
 ### 6.3 Runtime / Thread / process 真相
 
 1. `team_cluster_status` 看 Goal、Lead/Worker Job、daemon、retry、generation。
-2. `clusterd.lock`/`clusterd.json` 的 PID 只能作为线索；在 H28 修复前，不把
-   `pid_is_running=true` 当作同一进程证明。
+2. `clusterd.lock`/`clusterd.json` 不只看 PID；核对
+   `process_identity_verified`、creation-time、executable 和 instance ID。
+   legacy live PID 或损坏 lock 必须 fail closed，人工确认后再升级。
 3. App Server Job 同时看 `thread_id/turn_id/runtime_generation`、
    `app_turns` 日志事件、当前 runtime health generation。
 4. generation 不一致必须归为 `lost` 并走 Task recovery，不得继续等旧 Turn。
@@ -893,13 +905,15 @@ Codex native sessions
 | `test_dashboard_read_model.py` | H25-H27 | revision、ETag、snapshot、partition、filter |
 | `test_dashboard_cluster_control.py` | H11/H26-H28 | Dashboard Goal/daemon control |
 | `test_migrations.py` | H25/H29/H30 | schema migration/backfill 幂等 |
+| `test_process_ownership.py` | H12/H19/H20/H21/H28 | 强身份、Windows Job Object、ownerless recovery、legacy lock |
 | `test_usage_repair.py` | H19/H20/H24/H28 | exec usage、unknown、backfill、MCP 边界 |
 | `scripts/dashboard-ui-smoke.mjs` | H25-H27 | render signature、polling、archive UI |
 | `scripts/dashboard-edge-smoke.mjs` | H26/H27 | 真实浏览器看板、归档和恢复路径 |
 | `scripts/agent-cache-benchmark.py` | H16/H20/H24 | fresh/reuse usage 与 gate 判定 |
 
-测试覆盖不代表交接点已无风险。尤其 H19/H21/H23/H25/H28 包含时间、PID、并发、
-长期数据和 Windows 实机语义，单元测试只能覆盖可注入部分。
+测试覆盖不代表交接点已无风险。尤其 H21/H23/H25 包含时间、并发和长期数据；
+H19/H28 的 Windows 实机语义已有专项测试，但启动瞬间和 legacy 运维仍需按
+残余风险处理。
 
 ---
 
@@ -942,8 +956,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/team.ps1 cluster dae
 
 ## 9. Phase 5 建议顺序
 
-1. `P0` 进程身份：Windows Job Object、进程启动时间、instance token、可验证
-   stop/control，关闭 H19/H28 误杀根因。
+1. `已完成` 进程身份：Windows Job Object、进程 creation-time/executable/
+   instance ID、可验证 stop/control，关闭 H19/H28 裸 PID 误杀根因。
 2. `P1` 写事务：submit/block/heartbeat/update/recovery/review 的外部检查与 DB
    CAS 统一成明确事务边界。
 3. `P1` Review Git 窗口：repo-level lock 或 target ref/merge commit CAS。
