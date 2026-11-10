@@ -169,6 +169,117 @@ class CacheContractTests(unittest.TestCase):
             {"task_id": "T-1"},
         )
 
+    def test_core_dispatcher_rejects_schema_invalid_arguments(self) -> None:
+        server = Mock()
+        with patch.dict(
+            os.environ,
+            {
+                "CODEX_TEAM_MCP_ACCESS": "full",
+                "CODEX_TEAM_MCP_SURFACE": "core",
+            },
+            clear=False,
+        ):
+            invalid_requests = (
+                {
+                    "task_id": "T-1",
+                    "actor": "lead",
+                    "approve": "false",
+                    "notes": "must not become true",
+                },
+                {
+                    "goal_id": "G-1",
+                    "action": "invalid-action",
+                },
+                {
+                    "task_id": "T-1",
+                    "actor": "worker",
+                    "reason": "",
+                },
+            )
+            for index, arguments in enumerate(invalid_requests):
+                with self.subTest(arguments=arguments):
+                    operation = (
+                        "team_review_task"
+                        if "approve" in arguments
+                        else "team_cluster_control"
+                        if "action" in arguments
+                        else "team_block_task"
+                    )
+                    result = _process(
+                        server,
+                        {
+                            "id": f"invalid-{index}",
+                            "method": "tools/call",
+                            "params": {
+                                "name": "team_write",
+                                "arguments": {
+                                    "operation": operation,
+                                    "arguments": arguments,
+                                },
+                            },
+                        },
+                    )
+                    self.assertTrue(result["result"]["isError"])
+        server.call_tool.assert_not_called()
+
+    def test_cluster_control_schema_rejects_unknown_action(self) -> None:
+        server = Mock()
+        with patch.dict(
+            os.environ,
+            {
+                "CODEX_TEAM_MCP_ACCESS": "full",
+                "CODEX_TEAM_MCP_SURFACE": "core",
+            },
+            clear=False,
+        ):
+            result = _process(
+                server,
+                {
+                    "id": "invalid-action",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "team_write",
+                        "arguments": {
+                            "operation": "team_cluster_control",
+                            "arguments": {
+                                "goal_id": "G-1",
+                                "action": "invalid-action",
+                            },
+                        },
+                    },
+                },
+            )
+        self.assertTrue(result["result"]["isError"])
+        server.call_tool.assert_not_called()
+
+    def test_legacy_surface_uses_the_same_runtime_validation(self) -> None:
+        server = Mock()
+        with patch.dict(
+            os.environ,
+            {
+                "CODEX_TEAM_MCP_ACCESS": "full",
+                "CODEX_TEAM_MCP_SURFACE": "legacy",
+            },
+            clear=False,
+        ):
+            result = _process(
+                server,
+                {
+                    "id": "invalid-legacy",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "team_claim_task",
+                        "arguments": {
+                            "task_id": "T-1",
+                            "actor": "worker",
+                            "lease_minutes": "30",
+                        },
+                    },
+                },
+            )
+        self.assertTrue(result["result"]["isError"])
+        server.call_tool.assert_not_called()
+
     def test_core_read_only_cannot_dispatch_write_operation(self) -> None:
         server = Mock()
         with patch.dict(

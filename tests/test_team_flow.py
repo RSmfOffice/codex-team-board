@@ -4,8 +4,10 @@ import json
 import subprocess
 import tempfile
 import threading
+import types
 import unittest
 import urllib.request
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -69,6 +71,45 @@ class TeamFlowTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def _create_write_task_in_review(
+        self,
+        *,
+        name: str,
+        worktree_name: str,
+    ) -> tuple[dict[str, object], dict[str, object], Path, str]:
+        task = self.team.create_task(
+            self.repo,
+            title=name,
+            description="Exercise review integrity.",
+            acceptance="Only the submitted commit can be merged.",
+            kind="write",
+            owner_role="team_worker",
+        )
+        worktree = self.worktrees.create(
+            str(task["task_id"]),
+            repo=self.repo,
+            worktree_path=self.base / worktree_name,
+        )
+        claimed = self.team.claim_task(
+            str(task["task_id"]),
+            actor=f"worker-{name}",
+        )
+        isolated = Path(str(worktree["worktree_path"]))
+        filename = f"{worktree_name}.txt"
+        (isolated / filename).write_text(name + "\n", encoding="utf-8")
+        git(isolated, "add", filename)
+        git(isolated, "commit", "-m", f"work {name}")
+        worker_commit = git(isolated, "rev-parse", "HEAD")
+        self.team.submit_task(
+            str(task["task_id"]),
+            actor=f"worker-{name}",
+            claim_token=str(claimed["claim_token"]),
+            result=f"{filename} created",
+            tests="review integrity fixture",
+            commit_sha=worker_commit,
+        )
+        return task, worktree, isolated, worker_commit
+
     def test_cli_submit_accepts_commit_sha(self) -> None:
         args = build_parser().parse_args(
             [
@@ -88,6 +129,22 @@ class TeamFlowTests(unittest.TestCase):
             ]
         )
         self.assertEqual(args.commit, "abc1234")
+        update_args = build_parser().parse_args(
+            [
+                "task",
+                "update",
+                "T-TEST",
+                "--actor",
+                "worker",
+                "--token",
+                "private-token",
+                "--note",
+                "progress",
+                "--commit",
+                "def5678",
+            ]
+        )
+        self.assertEqual(update_args.commit, "def5678")
         ensure_args = build_parser().parse_args(
             [
                 "cluster",
@@ -177,6 +234,48 @@ class TeamFlowTests(unittest.TestCase):
             },
         )
 
+    def test_create_task_rejects_terminal_and_archived_goals(self) -> None:
+        cluster = ClusterManager(
+            self.settings,
+            team=self.team,
+            runtime_mode="exec",
+            agent_command=["codex"],
+        )
+        completed = cluster.create_goal(
+            self.repo,
+            objective="Completed goal",
+        )
+        cluster.set_goal_status(completed["goal_id"], "active")
+        cluster.set_goal_status(completed["goal_id"], "completed")
+        with self.assertRaisesRegex(TeamError, "terminal"):
+            self.team.create_task(
+                self.repo,
+                title="Must not be orphaned",
+                description="Terminal goals cannot accept tasks.",
+                acceptance="Creation is rejected.",
+                kind="read",
+                owner_role="team_explorer",
+                goal_id=completed["goal_id"],
+            )
+
+        archived = cluster.create_goal(
+            self.repo,
+            objective="Archived goal",
+        )
+        cluster.set_goal_status(archived["goal_id"], "active")
+        cluster.set_goal_status(archived["goal_id"], "completed")
+        cluster.set_goal_archived(archived["goal_id"], True)
+        with self.assertRaisesRegex(TeamError, "archived"):
+            self.team.create_task(
+                self.repo,
+                title="Must not target archive",
+                description="Archived goals cannot accept tasks.",
+                acceptance="Creation is rejected.",
+                kind="read",
+                owner_role="team_explorer",
+                goal_id=archived["goal_id"],
+            )
+
     def test_write_task_requires_worktree_and_full_review_flow(self) -> None:
         task = self.team.create_task(
             self.repo,
@@ -258,7 +357,6 @@ class TeamFlowTests(unittest.TestCase):
             any(item["task_id"] == done["task_id"] for item in dashboard["tasks"])
         )
         self.assertGreaterEqual(dashboard["counts"].get("done", 0), 1)
-
         with self.team.connection(write=False) as connection:
             events = connection.execute(
                 "SELECT event_type FROM task_events WHERE task_id = ? ORDER BY event_id",
@@ -272,7 +370,153 @@ class TeamFlowTests(unittest.TestCase):
         self.assertIn("reviewed", event_types)
         self.assertEqual(schema_version, SCHEMA_VERSION)
         history = self.team.get_task_events(done["task_id"])
-        self.assertIn("worktree_created", [item["event_type"] for item in history["events"]])
+        self.assertIn(
+            "worktree_created",
+            [item["event_type"] for item in history["events"]],
+        )
+
+    def test_review_rejects_merge_without_submitted_commit(self) -> None:
+        task, worktree, _, worker_commit = self._create_write_task_in_review(
+            name="unrelated merge",
+            worktree_name="unrelated-merge-worktree",
+        )
+        with self.assertRaisesRegex(TeamError, "not contained"):
+            self.team.review_task(
+                str(task["task_id"]),
+                actor="lead",
+                approve=True,
+                notes="must reject unrelated target history",
+                merge_commit=str(worktree["base_commit"]),
+            )
+        current = self.team.get_task(str(task["task_id"]))
+        self.assertEqual(current["status"], "review")
+        self.assertEqual(current["commit_sha"], worker_commit)
+
+    def test_review_rejects_archived_task_and_project(self) -> None:
+        task = self.team.create_task(
+            self.repo,
+            title="Archived review",
+            description="Archived records are immutable.",
+            acceptance="Review is rejected.",
+            kind="read",
+            owner_role="team_explorer",
+        )
+        claimed = self.team.claim_task(
+            str(task["task_id"]),
+            actor="archive-worker",
+        )
+        self.team.submit_task(
+            str(task["task_id"]),
+            actor="archive-worker",
+            claim_token=str(claimed["claim_token"]),
+            result="ready for review",
+            tests="fixture",
+        )
+        self.team.set_task_archived(str(task["task_id"]), True)
+        with self.assertRaisesRegex(TeamError, "archived"):
+            self.team.review_task(
+                str(task["task_id"]),
+                actor="lead",
+                approve=True,
+                notes="must reject archived task",
+            )
+
+        second = self.team.create_task(
+            self.repo,
+            title="Archived project review",
+            description="Project archive blocks review.",
+            acceptance="Review is rejected.",
+            kind="read",
+            owner_role="team_explorer",
+        )
+        claimed = self.team.claim_task(
+            str(second["task_id"]),
+            actor="archive-project-worker",
+        )
+        self.team.submit_task(
+            str(second["task_id"]),
+            actor="archive-project-worker",
+            claim_token=str(claimed["claim_token"]),
+            result="ready for project archive",
+            tests="fixture",
+        )
+        project = self.team.get_project(str(second["project_id"]))
+        self.team.set_project_archived(str(project["project_id"]), True)
+        with self.assertRaisesRegex(TeamError, "project is archived"):
+            self.team.review_task(
+                str(second["task_id"]),
+                actor="lead",
+                approve=True,
+                notes="must reject archived project",
+            )
+
+    def test_concurrent_review_has_one_terminal_winner(self) -> None:
+        task = self.team.create_task(
+            self.repo,
+            title="Concurrent review",
+            description="Only one reviewer may transition the task.",
+            acceptance="Exactly one review succeeds.",
+            kind="read",
+            owner_role="team_explorer",
+        )
+        claimed = self.team.claim_task(
+            str(task["task_id"]),
+            actor="review-race-worker",
+        )
+        self.team.submit_task(
+            str(task["task_id"]),
+            actor="review-race-worker",
+            claim_token=str(claimed["claim_token"]),
+            result="ready for concurrent review",
+            tests="fixture",
+        )
+
+        barrier = threading.Barrier(2)
+        state_lock = threading.Lock()
+        state = {"active": True, "reads": 0}
+        original_connection = TeamService.connection
+
+        @contextmanager
+        def synchronized_connection(
+            service: TeamService,
+            *,
+            write: bool = True,
+        ):
+            with original_connection(service, write=write) as connection:
+                yield connection
+                if not write and state["active"]:
+                    with state_lock:
+                        state["reads"] += 1
+                        read_number = state["reads"]
+                    if read_number <= 2:
+                        barrier.wait(timeout=5)
+                        if read_number == 2:
+                            state["active"] = False
+
+        self.team.connection = types.MethodType(
+            synchronized_connection,
+            self.team,
+        )
+
+        def review() -> object:
+            try:
+                return self.team.review_task(
+                    str(task["task_id"]),
+                    actor="lead",
+                    approve=True,
+                    notes="concurrent review",
+                )
+            except TeamError as exc:
+                return exc
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = list(executor.map(lambda _: review(), range(2)))
+
+        successes = [item for item in outcomes if isinstance(item, dict)]
+        failures = [item for item in outcomes if isinstance(item, TeamError)]
+        self.assertEqual(len(successes), 1)
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(self.team.get_task(str(task["task_id"]))["status"], "done")
 
     def test_dependencies_block_claim(self) -> None:
         first = self.team.create_task(
@@ -336,8 +580,22 @@ class TeamFlowTests(unittest.TestCase):
         self.assertIn("team_goal_set_checkpoint", after)
         self.assertIn("Explorer 的 read 任务和 Reviewer", after)
         self.assertIn("Worker 的 write 任务默认 fresh", after)
-        self.assertIn('team_read(operation="team_list_tasks")', after)
-        self.assertIn("team_get_task_events", after)
+        self.assertIn(
+            'team_read(operation="team_list_tasks", arguments={...})',
+            after,
+        )
+        self.assertIn(
+            'team_read(operation="team_get_task_events"',
+            after,
+        )
+        self.assertIn(
+            'team_write(operation="team_goal_set_checkpoint"',
+            after,
+        )
+        self.assertIn(
+            'team_write(operation="team_review_task"',
+            after,
+        )
         self.assertIn("主 checkout 必须干净", after)
         self.assertNotEqual(before, "")
         self.assertIn("Review 重点", worker_prompt.read_text(encoding="utf-8"))
@@ -961,7 +1219,6 @@ class TeamFlowTests(unittest.TestCase):
         manager.set_goal_status(goal["goal_id"], "active")
         with self.assertRaisesRegex(TeamError, "only completed or failed"):
             manager.set_goal_archived(goal["goal_id"], True)
-        manager.set_goal_status(goal["goal_id"], "completed")
 
         cascaded = self.team.create_task(
             self.repo,
@@ -1028,6 +1285,7 @@ class TeamFlowTests(unittest.TestCase):
                 """,
                 (now, blocked["task_id"]),
             )
+        manager.set_goal_status(goal["goal_id"], "completed")
         self.team.set_task_archived(manually_archived["task_id"], True)
         persistent_agent = manager.agent_pool.register_thread(
             goal["project_id"],
@@ -1396,7 +1654,6 @@ class TeamFlowTests(unittest.TestCase):
             objective="Keep an archived failure for audit only",
             autonomy="auto",
         )
-        manager.set_goal_status(goal["goal_id"], "failed", reason="historical failure")
         task = self.team.create_task(
             self.repo,
             title="Blocked historical task",
@@ -1410,6 +1667,11 @@ class TeamFlowTests(unittest.TestCase):
             task["task_id"],
             actor="worker",
             reason="preserved for audit",
+        )
+        manager.set_goal_status(
+            goal["goal_id"],
+            "failed",
+            reason="historical failure",
         )
 
         manager.set_goal_archived(goal["goal_id"], True)
@@ -1445,7 +1707,6 @@ class TeamFlowTests(unittest.TestCase):
             objective="Archive a failed project as history",
             autonomy="auto",
         )
-        manager.set_goal_status(goal["goal_id"], "failed", reason="historical failure")
         task = self.team.create_task(
             self.repo,
             title="Legacy blocked task",
@@ -1459,6 +1720,11 @@ class TeamFlowTests(unittest.TestCase):
             task["task_id"],
             actor="worker",
             reason="preserved for audit",
+        )
+        manager.set_goal_status(
+            goal["goal_id"],
+            "failed",
+            reason="historical failure",
         )
 
         self.team.set_project_archived(project["project_id"], True)

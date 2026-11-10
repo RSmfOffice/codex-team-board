@@ -117,6 +117,13 @@ class AgentPool:
                 return usage[name]
         return 0
 
+    @staticmethod
+    def _usage_field_is_present(usage: Mapping[str, Any], *names: str) -> bool:
+        return any(
+            name in usage and usage[name] is not None
+            for name in names
+        )
+
     @classmethod
     def _normalize_usage(cls, usage: Mapping[str, Any] | None) -> dict[str, int | None]:
         values = usage or {}
@@ -395,9 +402,12 @@ class AgentPool:
                   AND archived_at IS NULL
                   AND reset_requested_at IS NULL
                   AND (
-                    model_context_window IS NULL
-                    OR model_context_window <= 0
-                    OR context_tokens <= model_context_window * ?
+                    turn_count = 0
+                    OR (
+                        model_context_window IS NOT NULL
+                        AND model_context_window > 0
+                        AND context_tokens <= model_context_window * ?
+                    )
                   )
                 ORDER BY
                     CASE WHEN last_used_at IS NULL THEN 1 ELSE 0 END,
@@ -522,6 +532,20 @@ class AgentPool:
     ) -> dict[str, Any]:
         agent_id = self._require_text(agent_id, "agent_id")
         normalized = self._normalize_usage(usage)
+        values = usage or {}
+        context_known = self._usage_field_is_present(
+            values,
+            "context",
+            "context_tokens",
+            "contextTokens",
+        )
+        window_known = self._usage_field_is_present(
+            values,
+            "model_context_window",
+            "modelContextWindow",
+        )
+        if not (context_known and window_known):
+            normalized["model_context_window"] = None
         now = utc_now()
         status = "stored" if cache_epoch_changed else "idle"
         with self._connection() as connection:
@@ -543,7 +567,7 @@ class AgentPool:
                     total_cached_input_tokens = total_cached_input_tokens + ?,
                     total_uncached_input_tokens = total_uncached_input_tokens + ?,
                     context_tokens = ?,
-                    model_context_window = COALESCE(?, model_context_window),
+                    model_context_window = ?,
                     turn_count = turn_count + 1, last_used_at = ?, updated_at = ?,
                     last_unloaded_at = CASE WHEN ? THEN ? ELSE last_unloaded_at END
                 WHERE agent_id = ?

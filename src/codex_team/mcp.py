@@ -19,6 +19,7 @@ from .cache_contract import (
 from .config import Settings
 from .cluster import ClusterManager, daemon_status as cluster_daemon_status, ensure_daemon
 from .service import TeamError, TeamService
+from .validation import SchemaValidationError, validate_input_schema
 from .worktrees import WorktreeManager
 
 LOGGER = logging.getLogger("codex_team.mcp")
@@ -135,7 +136,7 @@ def _guard_tool_call(name: str, arguments: Mapping[str, Any]) -> None:
         for value in raw_roots.split(os.pathsep)
         if value.strip()
     ]
-    for key in ("repo_root", "repo"):
+    for key in ("repo_root", "repo", "worktree_path"):
         value = arguments.get(key)
         if not isinstance(value, str) or not value.strip():
             continue
@@ -147,6 +148,47 @@ def _guard_tool_call(name: str, arguments: Mapping[str, Any]) -> None:
             raise TeamError(
                 f"{key} is outside CODEX_TEAM_ALLOWED_ROOTS: {candidate}"
             )
+
+
+def _validate_tool_arguments(
+    name: str,
+    arguments: Mapping[str, Any],
+) -> None:
+    if name == "help":
+        return
+    definition = next(
+        (
+            tool
+            for tool in _tool_definitions()
+            if tool.get("name") == name
+        ),
+        None,
+    )
+    if definition is None:
+        raise TeamError(f"unknown tool: {name}")
+    schema = definition.get("inputSchema")
+    if not isinstance(schema, Mapping):
+        raise TeamError(f"tool schema is unavailable: {name}")
+    validate_input_schema(arguments, schema)
+
+
+def _optional_boolean(
+    arguments: Mapping[str, Any],
+    name: str,
+    *,
+    default: bool,
+) -> bool:
+    value = arguments.get(name, default)
+    if not isinstance(value, bool):
+        raise TeamError(f"{name} must be a boolean")
+    return value
+
+
+def _required_boolean(arguments: Mapping[str, Any], name: str) -> bool:
+    value = arguments.get(name)
+    if not isinstance(value, bool):
+        raise TeamError(f"{name} must be a boolean")
+    return value
 
 
 def _tool_definitions() -> list[dict[str, Any]]:
@@ -785,8 +827,16 @@ class TeamMcpServer:
                     statuses=arguments.get("statuses"),
                     owner_role=arguments.get("owner_role"),
                     goal_id=arguments.get("goal_id"),
-                    include_done=bool(arguments.get("include_done", True)),
-                    include_archived=bool(arguments.get("include_archived", False)),
+                    include_done=_optional_boolean(
+                        arguments,
+                        "include_done",
+                        default=True,
+                    ),
+                    include_archived=_optional_boolean(
+                        arguments,
+                        "include_archived",
+                        default=False,
+                    ),
                 )
             }
         if name == "team_get_task":
@@ -860,7 +910,7 @@ class TeamMcpServer:
             return self.team.review_task(
                 arguments["task_id"],
                 actor=arguments["actor"],
-                approve=bool(arguments["approve"]),
+                approve=_required_boolean(arguments, "approve"),
                 notes=arguments["notes"],
                 merge_commit=arguments.get("merge_commit", ""),
             )
@@ -920,6 +970,10 @@ class TeamMcpServer:
             }
         if name == "team_cluster_control":
             action = arguments["action"]
+            if action not in {"pause", "resume", "cancel", "archive", "restore"}:
+                raise TeamError(
+                    "action must be pause, resume, cancel, archive, or restore"
+                )
             reason = f"{action} requested through MCP"
             if action in {"archive", "restore"}:
                 goal = self.cluster.set_goal_archived(
@@ -964,8 +1018,10 @@ class TeamMcpServer:
             return {
                 "agents": self.cluster.list_agents(
                     arguments.get("project_id"),
-                    include_archived=bool(
-                        arguments.get("include_archived", False)
+                    include_archived=_optional_boolean(
+                        arguments,
+                        "include_archived",
+                        default=False,
                     ),
                 )
             }
@@ -1040,6 +1096,7 @@ def _process(server: TeamMcpServer, message: dict[str, Any]) -> dict[str, Any] |
                 name,
                 arguments,
             )
+            _validate_tool_arguments(normalized_name, normalized_arguments)
             _guard_tool_call(normalized_name, normalized_arguments)
             result = _tool_result(
                 server.call_tool(normalized_name, normalized_arguments)
@@ -1051,6 +1108,19 @@ def _process(server: TeamMcpServer, message: dict[str, Any]) -> dict[str, Any] |
         else:
             raise TeamError(f"method not found: {method}")
         return {"jsonrpc": "2.0", "id": message_id, "result": result}
+    except (TeamError, SchemaValidationError) as exc:
+        LOGGER.warning("MCP request rejected: %s", exc)
+        if method == "tools/call":
+            return {
+                "jsonrpc": "2.0",
+                "id": message_id,
+                "result": _tool_result(f"Tool error: {exc}", is_error=True),
+            }
+        return {
+            "jsonrpc": "2.0",
+            "id": message_id,
+            "error": {"code": -32602, "message": str(exc)},
+        }
     except Exception as exc:
         LOGGER.exception("MCP request failed: %s", method)
         if method == "tools/call":

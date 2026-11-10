@@ -329,6 +329,21 @@ class UsageRepairTests(unittest.TestCase):
                         "team_create_task",
                         {"repo_root": str(outside)},
                     )
+                with self.assertRaisesRegex(Exception, "outside"):
+                    _guard_tool_call(
+                        "team_create_worktree",
+                        {
+                            "repo_root": str(inside),
+                            "worktree_path": str(outside),
+                        },
+                    )
+                _guard_tool_call(
+                    "team_create_worktree",
+                    {
+                        "repo_root": str(inside),
+                        "worktree_path": str(root / "allowed-worktree"),
+                    },
+                )
 
 
 if __name__ == "__main__":

@@ -31,6 +31,18 @@
   blocked，并通过 `dependency_invalidated` 自动交给 Lead 处理。
 - planning/active goal 在无活动 job 且行为签名长期不变时，由停滞看门狗自动暂停，
   避免依赖环或调度异常造成无声挂起。
+- Core 和 legacy MCP surface 都在执行业务前校验 operation `inputSchema`；布尔、
+  整数、枚举、required 和 additionalProperties 不再依赖下游隐式转换。
+- Review 现在要求 submitted Worker commit 已包含在 merge_commit 中，并使用
+  task version CAS，避免无关 merge 或多个并发 Review 把任务误置为 done。
+- completed/failed/archived goal 不能继续创建可调度任务；归档 task/project
+  不能继续 Review。
+- context/model window 缺失的 managed Thread 不再自动复用；只有完整且低于
+  `CODEX_TEAM_AGENT_REUSE_CONTEXT_RATIO` 的上下文允许复用。
+- `CODEX_TEAM_ALLOWED_ROOTS` 同时约束显式 `worktree_path`。
+- CLI `task update` 补齐 `--commit`，与 MCP `team_update_task` 保持一致。
+- 全局和项目 AGENTS 全面使用 `team_read`/`team_write` operation 语法，避免默认
+  Core 面要求不存在的细粒度工具。
 
 ### Database
 

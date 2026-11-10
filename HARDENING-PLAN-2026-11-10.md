@@ -28,14 +28,14 @@
 
 ### Phase 0：规划与文档
 
-状态：进行中
+状态：已完成
 
 - [x] 完成完整流程拆解。
 - [x] 建立 H1-H14 交接点。
 - [x] 建立 P1/P2 问题清单。
 - [x] 创建本施工清单。
-- [ ] 将审计与计划文档提交到主分支。
-- [ ] 创建实施 task 和隔离 worktree。
+- [x] 将审计与计划文档提交到主分支。
+- [x] 创建实施 task 和隔离 worktree。
 
 验收：
 
@@ -47,18 +47,18 @@
 
 ### Phase 1：入口契约、状态真实性和基础安全
 
-状态：待开始
+状态：代码与自动化验收完成，等待 Lead diff Review 和合并
 
 这是当前第一批实施内容。
 
 #### F1-01 MCP 严格 schema 校验
 
-- [ ] 实现 operation/tool inputSchema 运行时验证。
-- [ ] 支持对象、字符串、整数、布尔、数组、required、enum、minLength、minimum、maximum、additionalProperties 和 items。
-- [ ] Core dispatcher 和 legacy surface 都执行相同校验。
-- [ ] 禁止字符串 `"false"` 被 `bool()` 转为批准。
-- [ ] 禁止未知 `team_cluster_control.action` 进入 resume fallback。
-- [ ] 错误以 MCP tool error 返回，不抛非结构化 traceback。
+- [x] 实现 operation/tool inputSchema 运行时验证。
+- [x] 支持对象、字符串、整数、布尔、数组、required、enum、minLength、minimum、maximum、additionalProperties 和 items。
+- [x] Core dispatcher 和 legacy surface 都执行相同校验。
+- [x] 禁止字符串 `"false"` 被 `bool()` 转为批准。
+- [x] 禁止未知 `team_cluster_control.action` 进入 resume fallback。
+- [x] 错误以 MCP tool error 返回，不抛非结构化 traceback。
 
 不变量：
 
@@ -77,9 +77,9 @@ invalid input => no domain mutation
 
 #### F1-02 CLI 与 MCP 命令契约一致
 
-- [ ] 为 CLI `task update` 增加 `--commit`。
-- [ ] 所有 CLI/MCP 同名字段使用相同语义。
-- [ ] 回归 CLI submit/update commit_sha。
+- [x] 为 CLI `task update` 增加 `--commit`。
+- [x] 所有 CLI/MCP 同名字段使用相同语义。
+- [x] 回归 CLI submit/update commit_sha。
 
 测试：
 
@@ -88,9 +88,9 @@ invalid input => no domain mutation
 
 #### F1-03 禁止在 terminal/archived goal 下创建可调度任务
 
-- [ ] `create_task(goal_id=...)` 检查 goal 状态和 archived_at。
-- [ ] completed/failed/archived goal 返回明确 TeamError。
-- [ ] 仍允许 planning/active/paused goal 下预先规划任务。
+- [x] `create_task(goal_id=...)` 检查 goal 状态和 archived_at。
+- [x] completed/failed/archived goal 返回明确 TeamError。
+- [x] 仍允许 planning/active/paused goal 下预先规划任务。
 
 测试：
 
@@ -101,12 +101,12 @@ invalid input => no domain mutation
 
 #### F1-04 Review 合并证据闭环
 
-- [ ] write task 的 `commit_sha` 必须存在。
-- [ ] Worker commit 必须是 merge commit 的祖先。
-- [ ] merge commit 必须仍可解析在目标分支上。
-- [ ] task/project archived 时禁止 Review。
-- [ ] Review 使用 task.version 做 compare-and-swap。
-- [ ] 并发 Review 只有一个终态赢家。
+- [x] write task 的 `commit_sha` 必须存在。
+- [x] Worker commit 必须是 merge commit 的祖先。
+- [x] merge commit 必须仍可解析在目标分支上。
+- [x] task/project archived 时禁止 Review。
+- [x] Review 使用 task.version 做 compare-and-swap。
+- [x] 并发 Review 只有一个终态赢家。
 
 测试：
 
@@ -117,10 +117,10 @@ invalid input => no domain mutation
 
 #### F1-05 unknown context 禁止自动复用
 
-- [ ] Agent release 时区分 context unknown 与真实 context 0。
-- [ ] context/window 不完整时清空可复用窗口信息。
-- [ ] 自动 reuse 只允许 context/window 已知且低于 ratio 的 Agent。
-- [ ] `turn_count=0` 的新 Agent 按空上下文处理。
+- [x] Agent release 时区分 context unknown 与真实 context 0。
+- [x] context/window 不完整时清空可复用窗口信息。
+- [x] 自动 reuse 只允许 context/window 已知且低于 ratio 的 Agent。
+- [x] `turn_count=0` 的新 Agent 按空上下文处理。
 
 测试：
 
@@ -131,8 +131,8 @@ invalid input => no domain mutation
 
 #### F1-06 Worktree 路径边界
 
-- [ ] `CODEX_TEAM_ALLOWED_ROOTS` 同时检查 `repo_root/repo/worktree_path`。
-- [ ] 确认路径 resolve 后不能逃逸 allowed root。
+- [x] `CODEX_TEAM_ALLOWED_ROOTS` 同时检查 `repo_root/repo/worktree_path`。
+- [x] 确认路径 resolve 后不能逃逸 allowed root。
 
 测试：
 
@@ -141,9 +141,9 @@ invalid input => no domain mutation
 
 #### F1-07 Prompt/tool 名称一致
 
-- [ ] bootstrap 全局 AGENTS 改用 `team_read`/`team_write` operation 语法。
-- [ ] 项目 AGENTS 中残留的直接 operation 名改成明确调用形式。
-- [ ] 不改变 Core 两工具 schema。
+- [x] bootstrap 全局 AGENTS 改用 `team_read`/`team_write` operation 语法。
+- [x] 项目 AGENTS 中残留的直接 operation 名改成明确调用形式。
+- [x] 不改变 Core 两工具 schema。
 
 测试：
 
@@ -152,12 +152,22 @@ invalid input => no domain mutation
 
 #### F1-08 回归与运行态验证
 
-- [ ] 完整 unittest。
-- [ ] UI smoke。
-- [ ] compileall。
-- [ ] diff check。
-- [ ] Core tools/list 仍只有 `team_read/team_write`。
+- [x] 完整 unittest。
+- [x] UI smoke。
+- [x] compileall。
+- [x] diff check。
+- [x] Core tools/list 仍只有 `team_read/team_write`。
 - [ ] 工作区干净。
+
+本轮验证：
+
+```text
+146 tests OK, 1 skipped
+dashboard-ui-smoke: ok
+compileall ok
+Core schema hash:
+86e78eef5f5f631094f5218d763c83997f5ab52d1ba22877f93092720f93fca6
+```
 
 ---
 

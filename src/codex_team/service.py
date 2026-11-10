@@ -496,7 +496,7 @@ class TeamService:
             raise TeamError("title must not be empty")
         if not owner_role.strip():
             raise TeamError("owner_role must not be empty")
-        if priority not in {0, 1, 2, 3}:
+        if isinstance(priority, bool) or priority not in {0, 1, 2, 3}:
             raise TeamError("priority must be between 0 and 3")
         if not isinstance(continuity_mode, str):
             raise TeamError("continuity_mode must be auto, reuse, or fresh")
@@ -512,11 +512,21 @@ class TeamService:
             connection.execute("BEGIN IMMEDIATE")
             if goal_id:
                 goal = connection.execute(
-                    "SELECT project_id FROM cluster_goals WHERE goal_id = ?",
+                    """
+                    SELECT project_id, status, archived_at
+                    FROM cluster_goals
+                    WHERE goal_id = ?
+                    """,
                     (goal_id,),
                 ).fetchone()
                 if goal is None or goal["project_id"] != project["project_id"]:
                     raise TeamError("goal does not belong to this project")
+                if goal["archived_at"]:
+                    raise TeamError("goal is archived; restore it before creating tasks")
+                if goal["status"] in {"completed", "failed"}:
+                    raise TeamError(
+                        f"goal is terminal ({goal['status']}); create or resume an active goal"
+                    )
             for dependency in dependencies:
                 row = connection.execute(
                     "SELECT project_id FROM tasks WHERE task_id = ?",
@@ -1864,119 +1874,211 @@ class TeamService:
         notes: str,
         merge_commit: str = "",
     ) -> dict[str, Any]:
+        if not isinstance(actor, str):
+            raise TeamError("actor must be a string")
+        if not isinstance(approve, bool):
+            raise TeamError("approve must be a boolean")
+        if not isinstance(notes, str):
+            raise TeamError("notes must be a string")
+        if not isinstance(merge_commit, str):
+            raise TeamError("merge_commit must be a string")
+        actor = actor.strip()
         if actor.lower() not in {"lead", "main", "human"}:
             raise TeamError("only the lead or human reviewer can review tasks")
-        with self.connection() as connection:
+        with self.connection(write=False) as connection:
             task = connection.execute(
                 """
-                SELECT t.*, p.root_path
+                SELECT t.*, p.root_path, p.archived_at AS project_archived_at
                 FROM tasks t JOIN projects p ON p.project_id = t.project_id
                 WHERE t.task_id = ?
                 """,
                 (task_id,),
             ).fetchone()
-            if task is None:
+        if task is None:
+            raise TeamError(f"task not found: {task_id}")
+        if task["status"] != "review":
+            raise TeamError("task is not in review")
+        if task["archived_at"]:
+            raise TeamError("task is archived; restore it before review")
+        if task["project_archived_at"]:
+            raise TeamError("project is archived; restore it before review")
+
+        resolved_merge = merge_commit.strip()
+        worker_commit = ""
+        if approve and task["kind"] == "write":
+            worktree = task["worktree_path"]
+            if not worktree or not Path(worktree).is_dir():
+                raise TeamError("write task worktree is missing")
+            status = subprocess.run(
+                ["git", "-C", str(worktree), "status", "--porcelain"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            if status.returncode != 0:
+                raise TeamError(status.stderr.strip() or "could not inspect worktree")
+            if status.stdout.strip():
+                raise TeamError(
+                    "worktree is dirty; commit all accepted changes before approval"
+                )
+            if not resolved_merge:
+                raise TeamError("write task approval requires merge_commit")
+            submitted_commit = str(task["commit_sha"] or "").strip()
+            if not submitted_commit:
+                raise TeamError("write task approval requires submitted commit_sha")
+            worker_result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(task["root_path"]),
+                    "rev-parse",
+                    "--verify",
+                    f"{submitted_commit}^{{commit}}",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            if worker_result.returncode != 0:
+                raise TeamError("submitted commit_sha does not resolve")
+            worker_commit = worker_result.stdout.strip()
+            merge_result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(task["root_path"]),
+                    "rev-parse",
+                    "--verify",
+                    f"{resolved_merge}^{{commit}}",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            if merge_result.returncode != 0:
+                raise TeamError("merge_commit does not resolve in the main repository")
+            resolved_merge = merge_result.stdout.strip()
+            target_branch = str(task["target_branch"] or "")
+            if not target_branch:
+                raise TeamError("write task has no target branch")
+            target_result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(task["root_path"]),
+                    "rev-parse",
+                    "--verify",
+                    f"refs/heads/{target_branch}^{{commit}}",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            if target_result.returncode != 0:
+                raise TeamError(f"target branch not found: {target_branch}")
+            target_commit = target_result.stdout.strip()
+            merge_on_target = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(task["root_path"]),
+                    "merge-base",
+                    "--is-ancestor",
+                    resolved_merge,
+                    target_commit,
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if merge_on_target.returncode != 0:
+                raise TeamError(
+                    f"merge_commit is not reachable from target branch {target_branch}"
+                )
+            worker_in_merge = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(task["root_path"]),
+                    "merge-base",
+                    "--is-ancestor",
+                    worker_commit,
+                    resolved_merge,
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if worker_in_merge.returncode != 0:
+                raise TeamError(
+                    "submitted commit_sha is not contained in merge_commit"
+                )
+
+        expected_version = int(task["version"])
+        new_status = "done" if approve else "ready"
+        now = utc_now()
+        completed_at = now if approve else None
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                """
+                SELECT t.status, t.version, t.archived_at,
+                       p.archived_at AS project_archived_at
+                FROM tasks t JOIN projects p ON p.project_id = t.project_id
+                WHERE t.task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if current is None:
                 raise TeamError(f"task not found: {task_id}")
-            if task["status"] != "review":
-                raise TeamError("task is not in review")
-            if approve and task["kind"] == "write":
-                worktree = task["worktree_path"]
-                if not worktree or not Path(worktree).is_dir():
-                    raise TeamError("write task worktree is missing")
-                status = subprocess.run(
-                    ["git", "-C", str(worktree), "status", "--porcelain"],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    check=False,
-                )
-                if status.returncode != 0:
-                    raise TeamError(status.stderr.strip() or "could not inspect worktree")
-                if status.stdout.strip():
-                    raise TeamError("worktree is dirty; commit all accepted changes before approval")
-                if not merge_commit.strip():
-                    raise TeamError("write task approval requires merge_commit")
-                verify_commit = subprocess.run(
-                    [
-                        "git",
-                        "-C",
-                        str(task["root_path"]),
-                        "rev-parse",
-                        "--verify",
-                        f"{merge_commit.strip()}^{{commit}}",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    check=False,
-                )
-                if verify_commit.returncode != 0:
-                    raise TeamError("merge_commit does not resolve in the main repository")
-                resolved_merge = verify_commit.stdout.strip()
-                target_branch = str(task["target_branch"] or "")
-                if not target_branch:
-                    raise TeamError("write task has no target branch")
-                target_commit_result = subprocess.run(
-                    [
-                        "git",
-                        "-C",
-                        str(task["root_path"]),
-                        "rev-parse",
-                        "--verify",
-                        f"refs/heads/{target_branch}^{{commit}}",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    check=False,
-                )
-                if target_commit_result.returncode != 0:
-                    raise TeamError(f"target branch not found: {target_branch}")
-                target_commit = target_commit_result.stdout.strip()
-                ancestor = subprocess.run(
-                    [
-                        "git",
-                        "-C",
-                        str(task["root_path"]),
-                        "merge-base",
-                        "--is-ancestor",
-                        resolved_merge,
-                        target_commit,
-                    ],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                if ancestor.returncode != 0:
-                    raise TeamError(
-                        f"merge_commit is not reachable from target branch {target_branch}"
-                    )
-            else:
-                resolved_merge = merge_commit.strip()
-            new_status = "done" if approve else "ready"
-            completed_at = utc_now() if approve else None
-            connection.execute(
+            if current["status"] != "review":
+                raise TeamError("task is no longer in review")
+            if current["archived_at"] or current["project_archived_at"]:
+                raise TeamError("task or project was archived during review")
+            if int(current["version"]) != expected_version:
+                raise TeamError("task changed during review; reload and retry")
+            updated = connection.execute(
                 """
                 UPDATE tasks
                 SET status = ?, review_notes = ?, merge_commit = ?, claimed_by = NULL,
                     claim_token = NULL, lease_until = NULL, completed_at = ?,
                     updated_at = ?, version = version + 1
-                WHERE task_id = ?
+                WHERE task_id = ? AND status = 'review' AND version = ?
+                  AND archived_at IS NULL
                 """,
-                (new_status, notes, resolved_merge, completed_at, utc_now(), task_id),
+                (
+                    new_status,
+                    notes,
+                    resolved_merge,
+                    completed_at,
+                    now,
+                    task_id,
+                    expected_version,
+                ),
             )
+            if updated.rowcount != 1:
+                raise TeamError("task review conflicted with another update")
             self._event(
                 connection,
                 task_id,
                 "reviewed",
                 actor,
-                {"approve": approve, "notes": notes, "merge_commit": resolved_merge},
+                {
+                    "approve": approve,
+                    "notes": notes,
+                    "merge_commit": resolved_merge,
+                    "worker_commit": worker_commit,
+                },
             )
-        result = self.get_task(task_id)
-        return result
+        return self.get_task(task_id)
 
     def add_message(
         self,
