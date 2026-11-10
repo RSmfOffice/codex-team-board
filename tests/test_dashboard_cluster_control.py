@@ -207,6 +207,173 @@ class DashboardClusterControlTests(unittest.TestCase):
         )
         self.assertEqual(board["cluster_runtime"], health["cluster_runtime"])
 
+    def test_sync_native_agents_is_idempotent_and_preserves_failed(self) -> None:
+        task = self.team.create_task(
+            self.repo,
+            title="Native sync task",
+            description="Bind a discovered native session.",
+            acceptance="Native session is visible.",
+            kind="read",
+            owner_role="team_explorer",
+        )
+        with self.team.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO cluster_agents(
+                    agent_id, project_id, role, workstream_key, display_name,
+                    thread_id, runtime, status, created_at, updated_at
+                ) VALUES (?, ?, 'team_worker', 'legacy-failed',
+                          'Legacy Failed Worker',
+                          '01a1cafe-9999-7222-8333-944455556666',
+                          'managed', 'failed', ?, ?)
+                """,
+                (
+                    "A-LEGACY-FAILED",
+                    self.project["project_id"],
+                    utc_now(),
+                    utc_now(),
+                ),
+            )
+
+        sessions_root = self.base / "codex-sessions"
+        sessions_root.mkdir()
+        thread_id = "01a1cafe-1111-7222-8333-944455556666"
+        session_path = sessions_root / f"rollout-{thread_id}.jsonl"
+        session_path.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "session_meta",
+                            "payload": {
+                                "id": thread_id,
+                                "cwd": str(self.repo),
+                                "model_provider": "deepseek",
+                                "source": {
+                                    "subagent": {
+                                        "thread_spawn": {
+                                            "parent_thread_id": "parent-123",
+                                            "agent_path": "/root/cache_prefix_review",
+                                            "agent_nickname": "Hume",
+                                            "agent_role": None,
+                                        }
+                                    }
+                                },
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "response_item",
+                            "payload": {
+                                "type": "message",
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "input_text",
+                                        "text": f"Review {task['task_id']}",
+                                    }
+                                ],
+                            },
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        unknown_thread_id = "01a1cafe-2222-7222-8333-944455556666"
+        (sessions_root / f"rollout-{unknown_thread_id}.jsonl").write_text(
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "id": unknown_thread_id,
+                        "cwd": str(self.base / "unknown-project"),
+                        "source": {
+                            "subagent": {
+                                "thread_spawn": {
+                                    "parent_thread_id": "parent-456",
+                                    "agent_path": "/root/unknown",
+                                    "agent_role": "team_explorer",
+                                }
+                            }
+                        },
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (sessions_root / "rollout-main-thread.jsonl").write_text(
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "01a1cafe-3333-7222-8333-944455556666",
+                        "cwd": str(self.repo),
+                        "source": "vscode",
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        with patch.dict(
+            os.environ,
+            {"CODEX_NATIVE_SESSIONS_ROOT": str(sessions_root)},
+        ):
+            status, first = self.post(
+                "/api/agents/sync-native",
+                {"limit": 100},
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(first["registered_count"], 1)
+            self.assertEqual(first["registered"][0]["thread_id"], thread_id)
+            self.assertIn(
+                unknown_thread_id,
+                first["skipped_unknown_project"],
+            )
+            self.assertEqual(
+                first["registered"][0]["current_task_id"],
+                task["task_id"],
+            )
+
+            board = self.get("/api/board")
+            agent_ids = {
+                agent["agent_id"] for agent in board["cluster_agents"]
+            }
+            self.assertIn("A-LEGACY-FAILED", agent_ids)
+            native = next(
+                agent
+                for agent in board["cluster_agents"]
+                if agent["thread_id"] == thread_id
+            )
+            self.assertEqual(native["runtime"], "native")
+            self.assertEqual(native["prompt_status"], "delivered")
+            self.assertEqual(native["current_task_id"], task["task_id"])
+
+            status, second = self.post(
+                "/api/agents/sync-native",
+                {"limit": 100},
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(second["registered_count"], 0)
+            self.assertIn(thread_id, second["skipped_existing"])
+            after = self.get("/api/board")
+            self.assertEqual(
+                len(after["cluster_agents"]),
+                len(board["cluster_agents"]),
+            )
+            self.assertIn(
+                "A-LEGACY-FAILED",
+                {
+                    agent["agent_id"]
+                    for agent in after["cluster_agents"]
+                },
+            )
+
     def test_control_cluster_goal_pause_resume_and_cancel(self) -> None:
         cluster = ClusterManager(self.settings, team=self.team)
         goal = cluster.create_goal(

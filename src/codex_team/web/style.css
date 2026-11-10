@@ -429,6 +429,10 @@ input[type="text"]:focus {
 .agent-thread-card.busy {
   border-color: rgba(244, 191, 101, 0.42);
 }
+.agent-thread-card.failed {
+  border-color: rgba(255, 107, 125, 0.46);
+  background: linear-gradient(155deg, #2a1a22, #15151d);
+}
 .agent-thread-head {
   display: flex;
   align-items: flex-start;
@@ -457,6 +461,10 @@ input[type="text"]:focus {
 .agent-status.loaded {
   color: var(--green);
   border-color: rgba(83, 214, 155, 0.34);
+}
+.agent-status.failed {
+  color: #ff8997;
+  border-color: rgba(255, 107, 125, 0.5);
 }
 .agent-thread-meta {
   display: flex;

@@ -338,6 +338,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/agents/reset":
             self._reset_agent()
             return
+        if parsed.path == "/api/agents/sync-native":
+            self._sync_native_agents()
+            return
         if parsed.path not in {"/api/projects/archive", "/api/tasks/archive"}:
             self._send_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
             return
@@ -426,6 +429,40 @@ class DashboardHandler(BaseHTTPRequestHandler):
             )
             self._send_json({"agent": agent})
         except TeamError as exc:
+            self._send_json(
+                {"error": str(exc)},
+                status=HTTPStatus.CONFLICT,
+            )
+        except (OSError, ValueError) as exc:
+            self._send_json(
+                {"error": str(exc)},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+
+    def _sync_native_agents(self) -> None:
+        try:
+            payload = self._read_json()
+            project_id = payload.get("project_id")
+            if project_id is not None and not isinstance(project_id, str):
+                raise ValueError("project_id must be a string")
+            limit = self._optional_integer(
+                payload,
+                "limit",
+                default=200,
+                minimum=1,
+                maximum=1000,
+            )
+            cluster = ClusterManager(
+                self.team_service.settings,
+                team=self.team_service,
+            )
+            result = cluster.sync_native_agents(
+                actor="dashboard",
+                project_id=str(project_id).strip() if project_id else None,
+                limit=limit,
+            )
+            self._send_json(result)
+        except (ClusterError, TeamError) as exc:
             self._send_json(
                 {"error": str(exc)},
                 status=HTTPStatus.CONFLICT,

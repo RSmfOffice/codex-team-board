@@ -507,6 +507,26 @@ Merge commit:
 
 ---
 
+### Phase 4D-1：Native Agent Threads 自动发现补强
+
+状态：实现完成，待 Lead Review、合并和正式库回填验证
+
+- [x] 扫描近期 Codex `session_meta`，只接受 `source.subagent.thread_spawn`。
+- [x] 按 session `cwd` 匹配已登记活动项目，未知或归档项目跳过。
+- [x] 从首个用户任务正文提取可选 task ID，并校验项目归属和归档状态。
+- [x] 按 thread ID 幂等登记，重复同步不新增重复 Agent。
+- [x] Dashboard 初始轮询、30 秒周期和展开诊断时自动同步。
+- [x] 历史 managed failed Thread 保持完整，并增加 failed 视觉状态。
+- [x] 默认只发现最近 24 小时 session；已登记 Thread 不因窗口过期被删除。
+
+验收：
+
+- 主 Thread、非 subagent session、未知项目不会进入 `cluster_agents`。
+- native discovery、API 幂等、failed 保留和 UI 自动触发有回归测试。
+- 不改数据库 schema，不引入第二状态源。
+
+---
+
 ### Phase 5：安装、进程与历史清理
 
 状态：未开始

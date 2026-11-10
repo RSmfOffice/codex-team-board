@@ -850,6 +850,23 @@ managed runtime reset，也不会被 `continuity_mode=auto|reuse` 选中。每�
 session 根目录不是默认 `~/.codex/sessions` 时，通过
 `CODEX_NATIVE_SESSIONS_ROOT` 指定。
 
+Dashboard 还会低频自动发现最近 24 小时的 Codex subagent session。只处理
+`source.subagent.thread_spawn`、且 `cwd` 位于已登记活动项目内的 session；
+主 Thread、未知项目、归档项目和非 subagent 文件不会入库。发现过程只读取
+`session_meta` 和任务 ID，不读取或展示对话正文。首次登记仍会写入
+`cluster_agents`，之后按 thread ID 幂等跳过，不会重复生成 Agent。
+
+WebUI 在首次轮询、每 30 秒和展开“Agent Threads 诊断”时调用：
+
+```text
+POST /api/agents/sync-native
+{"limit": 500}
+```
+
+自动发现适合展示和监控；需要精确绑定角色、task prompt 送达状态或
+`same_task_only` 认领门禁时，仍应执行显式 `team_agent_register_native`。
+历史 managed `failed` Thread 不会被自动隐藏或删除，诊断面板继续完整保留。
+
 ### Workstream checkpoint
 
 阶段边界使用 compact checkpoint 代替复制完整历史：
@@ -975,6 +992,7 @@ Agent runtime 与模型配置：
 | `CODEX_TEAM_AGENT_REUSE_CONTEXT_RATIO` | `0.85` | 复用 thread 的 context/window 上限比例，范围 `0.1..1.0` |
 | `CODEX_TEAM_AGENT_CODEX_HOME` | `<CODEX_TEAM_HOME>\agent-codex-home` | 托管 Agent 专用 Codex Home；同步 `config.toml`、`auth.json`、`models.json`，不复制用户 sessions |
 | `CODEX_NATIVE_SESSIONS_ROOT` | `%USERPROFILE%\.codex\sessions` | Native Thread 登记的 Codex session JSONL 根目录 |
+| `CODEX_TEAM_NATIVE_DISCOVERY_MAX_AGE_HOURS` | `24` | Dashboard 自动发现的 session 回溯窗口；已登记 Thread 不因超出窗口而删除 |
 | `CODEX_TEAM_MODEL` | 空 | 可选模型覆盖；空值使用 Codex 默认模型 |
 | `CODEX_TEAM_MODEL_PROVIDER` | 空 | 可选 provider 覆盖；必须与 AgentPool 身份匹配 |
 

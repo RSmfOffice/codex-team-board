@@ -1,5 +1,6 @@
 const POLL_INTERVAL_MS = 2000;
 const MAX_POLL_BACKOFF_MS = 30000;
+const NATIVE_AGENT_SYNC_INTERVAL_MS = 30000;
 const lanes = ["ready", "running", "review", "blocked", "done"];
 const terminalGoalStatuses = new Set(["completed", "failed", "canceled"]);
 const attentionHealthStates = new Set([
@@ -56,6 +57,8 @@ let queuedForceRender = false;
 let lastBoardSignature = "";
 let lastBoardRevision = "";
 let detailRequestVersion = 0;
+let lastNativeAgentSyncAt = 0;
+let nativeAgentSyncInFlight = false;
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -325,6 +328,58 @@ async function loadProjects(signal) {
   );
   projectsLoaded = true;
   updateArchiveButton();
+}
+
+async function syncNativeAgentThreads({
+  force = false,
+  silent = false,
+  refresh = false,
+} = {}) {
+  const now = Date.now();
+  if (
+    nativeAgentSyncInFlight
+    || (!force && now - lastNativeAgentSyncAt < NATIVE_AGENT_SYNC_INTERVAL_MS)
+  ) {
+    return false;
+  }
+  nativeAgentSyncInFlight = true;
+  lastNativeAgentSyncAt = now;
+  if (!silent) {
+    setActionStatus("agent-reset-status", "正在扫描 Codex Native Threads…", "pending");
+  }
+  try {
+    const result = await requestJson(
+      "/api/agents/sync-native",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ limit: 500 }),
+      },
+      "sync native agents",
+    );
+    const registered = nonNegativeNumber(result.registered_count);
+    const errors = Array.isArray(result.errors) ? result.errors.length : 0;
+    setActionStatus(
+      "agent-reset-status",
+      registered
+        ? `已发现并登记 ${registered} 个 Native Thread${errors ? ` · ${errors} 个失败` : ""}`
+        : `Native Thread 已同步${errors ? ` · ${errors} 个失败` : " · 无新增"}`,
+      errors ? "error" : "success",
+    );
+    if (refresh && registered > 0) {
+      await requestImmediateRefresh({ forceRender: true });
+    }
+    return registered > 0;
+  } catch (error) {
+    setActionStatus(
+      "agent-reset-status",
+      `Native Thread 同步失败：${error.message}`,
+      "error",
+    );
+    return false;
+  } finally {
+    nativeAgentSyncInFlight = false;
+  }
 }
 
 function updateArchiveButton() {
@@ -1125,6 +1180,7 @@ async function pollBoard({ forceRender = false } = {}) {
     if (!projectsLoaded) {
       await loadProjects(activeRequest.signal);
     }
+    await syncNativeAgentThreads({ silent: true });
     const params = new URLSearchParams();
     if (selectedProject) params.set("project_id", selectedProject);
     if (includeArchived) params.set("include_archived", "1");
@@ -1421,6 +1477,14 @@ function initializeDashboard() {
   document.getElementById("agent-threads").addEventListener("click", (event) => {
     const button = event.target.closest('[data-control-action="reset-agent"]');
     if (button) void handleAgentReset(button);
+  });
+  document.getElementById("agent-threads").addEventListener("toggle", (event) => {
+    if (event.target.open) {
+      void syncNativeAgentThreads({
+        force: true,
+        refresh: true,
+      });
+    }
   });
   document.getElementById("cluster-create-form").addEventListener(
     "submit",
