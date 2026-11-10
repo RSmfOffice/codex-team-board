@@ -20,6 +20,10 @@ _AUTHORIZATION_RE = re.compile(
     r"(?i)(?P<prefix>\bauthorization\s*[:=]\s*(?:bearer\s+)?)"
     r"(?P<value>[^\s,;&]+)"
 )
+_COLON_VALUE_RE = re.compile(
+    rf"(?i)(?P<prefix>\b{_SENSITIVE_KEY}\s*:\s*)"
+    r"(?P<value>[^\s,;&]+)"
+)
 _COMMAND_VALUE_RE = re.compile(
     rf"(?i)(?P<prefix>--{_SENSITIVE_KEY}(?:\s+|=))"
     r"(?P<value>[^\s,;&]+)"
@@ -34,6 +38,10 @@ def redact_sensitive_text(text: str) -> str:
         str(text),
     )
     redacted = _AUTHORIZATION_RE.sub(
+        lambda match: match.group("prefix") + "[REDACTED]",
+        redacted,
+    )
+    redacted = _COLON_VALUE_RE.sub(
         lambda match: match.group("prefix") + "[REDACTED]",
         redacted,
     )

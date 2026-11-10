@@ -1129,6 +1129,89 @@ class TeamFlowTests(unittest.TestCase):
         with self.assertRaisesRegex(TeamError, "running task"):
             self.team.set_project_archived(project["project_id"], True)
 
+    def test_archive_claim_races_preserve_terminal_invariants(self) -> None:
+        project = self.team.register_project(self.repo)
+        project_task = self.team.create_task(
+            self.repo,
+            title="Project archive race",
+            description="Claim and project archive are serialized.",
+            acceptance="No archived project contains a running task.",
+            kind="read",
+            owner_role="team_explorer",
+        )
+        barrier = threading.Barrier(2)
+
+        def outcome(action: object) -> tuple[str, object]:
+            barrier.wait(timeout=5)
+            try:
+                return "ok", action()
+            except TeamError as exc:
+                return "error", str(exc)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            project_outcomes = list(
+                executor.map(
+                    outcome,
+                    [
+                        lambda: self.team.claim_task(
+                            project_task["task_id"],
+                            actor="project-racer",
+                        ),
+                        lambda: self.team.set_project_archived(
+                            project["project_id"],
+                            True,
+                        ),
+                    ],
+                )
+            )
+        current_project = self.team.get_project(project["project_id"])
+        current_task = self.team.get_task(project_task["task_id"])
+        self.assertFalse(
+            bool(current_project["archived_at"])
+            and current_task["status"] == "running"
+        )
+        self.assertEqual(
+            sum(item[0] == "ok" for item in project_outcomes),
+            1,
+        )
+        if current_project["archived_at"]:
+            self.team.set_project_archived(project["project_id"], False)
+
+        task = self.team.create_task(
+            self.repo,
+            title="Task archive race",
+            description="Claim and task archive are serialized.",
+            acceptance="A task cannot be archived and running together.",
+            kind="read",
+            owner_role="team_explorer",
+        )
+        barrier = threading.Barrier(2)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            task_outcomes = list(
+                executor.map(
+                    outcome,
+                    [
+                        lambda: self.team.claim_task(
+                            task["task_id"],
+                            actor="task-racer",
+                        ),
+                        lambda: self.team.set_task_archived(
+                            task["task_id"],
+                            True,
+                        ),
+                    ],
+                )
+            )
+        current_task = self.team.get_task(task["task_id"])
+        self.assertFalse(
+            bool(current_task["archived_at"])
+            and current_task["status"] == "running"
+        )
+        self.assertEqual(
+            sum(item[0] == "ok" for item in task_outcomes),
+            1,
+        )
+
     def test_cancel_stale_task_preserves_audit_and_rejects_running(self) -> None:
         stale = self.team.create_task(
             self.repo,

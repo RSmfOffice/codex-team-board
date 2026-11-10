@@ -1039,17 +1039,28 @@ class TeamMcpServer:
                     arguments["goal_id"],
                     reason=reason,
                 )
-            else:
-                status = "paused" if action == "pause" else "active"
+            elif action == "resume":
+                try:
+                    daemon = ensure_daemon(self.settings)
+                except Exception as exc:
+                    raise TeamError(
+                        f"cluster daemon failed to start: {exc}"
+                    ) from exc
                 goal = self.cluster.set_goal_status(
                     arguments["goal_id"],
-                    status,
+                    "active",
+                    reason=reason,
+                )
+            else:
+                goal = self.cluster.set_goal_status(
+                    arguments["goal_id"],
+                    "paused",
                     reason=reason,
                 )
             return {
                 "goal": goal,
                 "daemon": (
-                    ensure_daemon(self.settings)
+                    daemon
                     if action == "resume"
                     else cluster_daemon_status(self.settings)
                 ),

@@ -457,10 +457,16 @@ class TeamService:
         project_id: str,
         archived: bool,
     ) -> dict[str, Any]:
-        project = self.get_project(project_id)
         now = utc_now()
-        if archived:
-            with self.connection(write=False) as connection:
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            project = connection.execute(
+                "SELECT * FROM projects WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            if project is None:
+                raise TeamError(f"project not found: {project_id}")
+            if archived:
                 active_goal = connection.execute(
                     """
                     SELECT goal_id FROM cluster_goals
@@ -487,19 +493,21 @@ class TeamService:
                     """,
                     (project_id,),
                 ).fetchone()
-            if active_goal:
-                raise TeamError(
-                    f"cannot archive project with unfinished goal: {active_goal['goal_id']}"
-                )
-            if running_task:
-                raise TeamError(
-                    f"cannot archive project with running task: {running_task['task_id']}"
-                )
-            if active_job:
-                raise TeamError(
-                    f"cannot archive project with active job: {active_job['job_id']}"
-                )
-        with self.connection() as connection:
+                if active_goal:
+                    raise TeamError(
+                        "cannot archive project with unfinished goal: "
+                        f"{active_goal['goal_id']}"
+                    )
+                if running_task:
+                    raise TeamError(
+                        "cannot archive project with running task: "
+                        f"{running_task['task_id']}"
+                    )
+                if active_job:
+                    raise TeamError(
+                        "cannot archive project with active job: "
+                        f"{active_job['job_id']}"
+                    )
             connection.execute(
                 """
                 UPDATE projects
@@ -508,18 +516,29 @@ class TeamService:
                 """,
                 (now if archived else None, now, project_id),
             )
-        return self.get_project(project["project_id"])
+        return self.get_project(str(project["project_id"]))
 
     def set_task_archived(
         self,
         task_id: str,
         archived: bool,
     ) -> dict[str, Any]:
-        task = self.get_task(task_id)
-        if archived:
-            if task["status"] == "running":
-                raise TeamError(f"cannot archive running task: {task_id}")
-            with self.connection(write=False) as connection:
+        now = utc_now()
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            task = connection.execute(
+                """
+                SELECT t.*, p.archived_at AS project_archived_at
+                FROM tasks t JOIN projects p ON p.project_id = t.project_id
+                WHERE t.task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if task is None:
+                raise TeamError(f"task not found: {task_id}")
+            if archived:
+                if task["status"] == "running":
+                    raise TeamError(f"cannot archive running task: {task_id}")
                 active_job = connection.execute(
                     """
                     SELECT job_id FROM cluster_jobs
@@ -529,7 +548,7 @@ class TeamService:
                     (task_id,),
                 ).fetchone()
                 active_goal = None
-                if task.get("goal_id"):
+                if task["goal_id"]:
                     active_goal = connection.execute(
                         """
                         SELECT goal_id FROM cluster_goals
@@ -537,16 +556,16 @@ class TeamService:
                         """,
                         (task["goal_id"],),
                     ).fetchone()
-            if active_job:
-                raise TeamError(
-                    f"cannot archive task with active job: {active_job['job_id']}"
-                )
-            if active_goal:
-                raise TeamError(
-                    f"cannot archive task in unfinished goal: {active_goal['goal_id']}"
-                )
-        now = utc_now()
-        with self.connection() as connection:
+                if active_job:
+                    raise TeamError(
+                        "cannot archive task with active job: "
+                        f"{active_job['job_id']}"
+                    )
+                if active_goal:
+                    raise TeamError(
+                        "cannot archive task in unfinished goal: "
+                        f"{active_goal['goal_id']}"
+                    )
             connection.execute(
                 """
                 UPDATE tasks

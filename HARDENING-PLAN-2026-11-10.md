@@ -424,21 +424,35 @@ Merge commit:
 
 ### Phase 4C：安全与状态完整性
 
-状态：未开始
+状态：代码与自动化验收完成，等待 Lead diff Review 和合并
 
-- [ ] Dashboard 写接口校验 loopback Host、same-origin Origin 和
+- [x] Dashboard 写接口校验 loopback Host、same-origin Origin 和
   `application/json`，无 Origin 的 CLI 客户端保持兼容。
-- [ ] Goal resume 与 daemon 启动使用可回滚顺序，daemon 启动失败不留下
+- [x] Goal resume 与 daemon 启动使用可回滚顺序，daemon 启动失败不留下
   active 假状态。
-- [ ] 项目/任务归档与 claim 使用单一 `BEGIN IMMEDIATE` 事务。
-- [ ] 数据库 URI 转义、并发迁移重试和只读连接回归。
-- [ ] 脱敏覆盖未加引号的冒号格式，并增加凭据泄漏反向测试。
+- [x] 项目/任务归档与 claim 使用单一 `BEGIN IMMEDIATE` 事务。
+- [x] 数据库 URI 转义、并发迁移重试和只读连接回归。
+- [x] 脱敏覆盖未加引号的冒号格式，并增加凭据泄漏反向测试。
+- [x] `workflow_epoch` 升级到 `workflow-v3`。
 
 验收：
 
 - 非法来源和错误 Content-Type 在业务写入前被拒绝。
 - archive/claim 竞争不会产生 archived project + running task。
 - 数据库路径包含 `#`、空格或 Windows 特殊字符时迁移和只读连接正常。
+
+本轮验证：
+
+```text
+179 tests OK, 1 skipped
+dashboard-ui-smoke: ok
+compileall ok
+Core tools: team_read, team_write
+Core schema hash:
+86e78eef5f5f631094f5218d763c83997f5ab52d1ba22877f93092720f93fca6
+workflow_epoch:
+workflow-v3
+```
 
 ---
 

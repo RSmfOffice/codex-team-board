@@ -34,6 +34,8 @@
 - `teamd` tick 改为固定
   `settle/recover/control/prepare/dispatch/health/publish` 流水线，输出阶段
   `duration_ms`、`counts`、失败阶段和跳过阶段。
+- Dashboard 写接口新增 loopback Host、same-origin Origin 和
+  `application/json` 校验；无 Origin 的 CLI 客户端保持兼容。
 
 ### Changed
 
@@ -51,6 +53,7 @@
   `team_read`/`team_write` operation，避免默认 core 工具面与角色指令冲突。
 - App Server usage delta 的 baseline 改为读取已完成 attempt ledger，不再依赖
   Agent 累计字段是否在成功 release 时更新。
+- Goal resume 先确保 daemon 启动成功，再迁移到 active；daemon 失败保持 paused。
 
 ### Fixed
 
@@ -89,6 +92,10 @@
   的 `planning → completed` 直接转换。
 - 同一 `ClusterManager` 的并发 tick 串行化；业务阶段失败后停止后续阶段，但
   publish 仍会产出可诊断状态并脱敏错误。
+- 项目/任务归档与 claim 使用同一 `BEGIN IMMEDIATE` 事务，消除归档竞争窗口。
+- 数据库初始化对 locked/busy 做指数退避重试；只读连接使用编码 URI，兼容空格和
+  `#` 路径。
+- 脱敏补充未加引号的冒号格式凭据。
 
 ### Database
 
@@ -96,6 +103,8 @@
   `workflow_epoch`；旧记录一次性回填为 `legacy-unbound`。
 - `workflow_epoch` 语义版本升级到 `workflow-v2`，覆盖新的 tick 状态机与阶段
   流水线。
+- `workflow_epoch` 当前升级到 `workflow-v3`，覆盖安全、归档事务和 resume
+  顺序变化。
 - schema 19 的 `cluster_agents` runtime、parent/path/nickname、
   actor、prompt hash/status、native session path 和 last-seen；
   `task_events` 新增 thread/job/correlation/assignment 关联字段。

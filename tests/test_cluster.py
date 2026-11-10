@@ -5282,7 +5282,7 @@ class ClusterSchedulerTests(unittest.TestCase):
                 },
             )
             self.assertTrue(
-                migrated["workflow_epoch"].startswith("workflow-v2:")
+                migrated["workflow_epoch"].startswith("workflow-v3:")
             )
             listed = server.call_tool(
                 "team_agent_list",
@@ -5352,6 +5352,46 @@ class ClusterSchedulerTests(unittest.TestCase):
                 "delivered",
             )
             self.assertTrue(native["same_task_only"])
+
+    def test_mcp_resume_daemon_failure_keeps_goal_paused(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = _settings(Path(temporary))
+            team = TeamService(settings)
+            repo = _repo(Path(temporary), "mcp-resume-failure")
+            manager = ClusterManager(settings, team=team)
+            goal = manager.create_goal(
+                repo,
+                objective="Keep paused when daemon resume fails",
+            )
+            manager.set_goal_status(
+                goal["goal_id"],
+                "paused",
+                reason="fixture pause",
+            )
+            server = TeamMcpServer(settings)
+            try:
+                with patch(
+                    "codex_team.mcp.ensure_daemon",
+                    side_effect=RuntimeError("daemon failed"),
+                ):
+                    with self.assertRaisesRegex(
+                        TeamError,
+                        "failed to start",
+                    ):
+                        server.call_tool(
+                            "team_cluster_control",
+                            {
+                                "goal_id": goal["goal_id"],
+                                "action": "resume",
+                            },
+                        )
+                self.assertEqual(
+                    manager.get_goal(goal["goal_id"])["status"],
+                    "paused",
+                )
+            finally:
+                server.cluster.close()
+                manager.close()
 
     def test_agent_cache_benchmark_emits_json_markdown_and_gate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

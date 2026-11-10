@@ -333,6 +333,10 @@ Blocked、Done 泳道，以及依赖、租约、分支、worktree、审计结果
 团队消息和自动集群目标。任务状态仍通过 MCP 或 CLI 写入；集群目标和归档操作
 可以直接在 WebUI 完成。
 
+Dashboard 的写接口只接受 loopback `Host`、same-origin `Origin`（无 Origin 的
+CLI 客户端保持兼容）和 `application/json`。非法来源或媒体类型在业务状态写入前
+返回 403/415，防止跨站请求与 DNS rebinding 操作本地任务库。
+
 也可以双击根目录的 `启动Codex团队看板.cmd`。
 
 看板只显示已经通过 `codexTeamBoard` MCP 或 `team.ps1 task create`/
@@ -346,6 +350,10 @@ Blocked、Done 泳道，以及依赖、租约、分支、worktree、审计结果
 看板顶部可以直接选择项目、填写目标并创建集群。`auto` 模式会持续调度到目标和
 任务完成；`supervised` 模式在执行到 Review 时暂停，等待人工决定。创建请求会
 同时确保 `teamd` 已启动。
+
+Goal resume 先确保 daemon 启动成功，再把状态改为 active；daemon 启动失败时
+Goal 保持 paused。项目或任务归档与 claim 在同一个 `BEGIN IMMEDIATE` 事务内
+竞争，不会产生“归档项目下仍有 running task”的组合。
 
 集群卡提供以下操作：
 
@@ -687,6 +695,10 @@ cache profile、`thread_action`、outcome 和 settled time。所有 job 终态�
 settlement helper；completed、failed、interrupted、lost 都会写入 outcome 和
 settled_at。Dashboard 的 Agent 卡片通过 latest-job 和 attempt ledger 投影失败或
 中断任务的真实 usage，不再依赖成功 release 后的累计字段。
+
+数据库初始化遇到 `database is locked/busy` 时进行指数退避重试；只读连接使用
+编码后的 `file:` URI，路径中的空格、`#` 等字符不会被误解析。日志脱敏同时覆盖
+JSON、`=` 赋值、命令行和未加引号的冒号格式凭据。
 
 `teamd` 的每次 tick 固定按以下阶段执行：
 
