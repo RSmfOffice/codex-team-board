@@ -589,6 +589,10 @@ Merge commit:
 - 默认 Agent Threads 从 29 降为 6 个 Native；第二次 apply 新增 0。
 - 归档前备份：`team.sqlite.pre-agent-cleanup-20261110T140308Z.bak`，
   `PRAGMA integrity_check=ok`。
+- 项目归档来源隔离 Worker：`c4485ab7ad36b34a58e090fb1668672f48daffb2`；
+  Merge：`224a4641c1c49a6b50f831c3bce3bed0ce9db429`；187 tests OK。
+- Active 项目 daemon tick 后仍保持 23 个 archived managed、0 个 visible
+  managed；项目 restore 只恢复 `archived_project`，不会恢复 `archived_stale`。
 
 ---
 
