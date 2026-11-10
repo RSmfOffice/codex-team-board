@@ -268,7 +268,49 @@ Terminal jobs missing settlement/correlation:
 
 ---
 
-### Phase 4：调度流水线与 Read Model
+### 后续施工顺序
+
+1. Phase 4A 先封死旧 Agent、旧 worktree/branch 和 native Thread 的错误分配面。
+2. Phase 4B 修状态机和 tick 阶段边界，保证调度结果可解释、可恢复。
+3. Phase 4C 处理来源校验、归档事务、数据库初始化和脱敏等 P1 安全缺口。
+4. Phase 4D 再拆分 Read Model，避免在状态机未稳定时过早扩大 Dashboard 读取面。
+5. Phase 5 最后做 daemon 身份、安装回滚、日志和历史 worktree 清理。
+
+Phase 4A 是低风险、高收益的分配安全门禁，应作为下一批唯一首选写任务。
+Phase 4B 可以在全量基线通过后开始；Phase 4C 以后按共享文件范围串行执行，
+不要让多个 Writer 同时修改 `service.py`、`cluster.py` 或 `dashboard.py`。
+
+---
+
+### Phase 4A：Assignment Boundary Hardening
+
+状态：下一批首选
+
+目标：不拆新版架构、不删除历史数据，只保证旧 Thread、旧 worktree/branch
+和历史任务对象不会进入新任务的分配链。
+
+- [ ] 固化 Agent 分配边界：只允许 `runtime=managed`、状态可复用且 cache
+  profile 与当前 Prompt Contract 完全一致的历史 Thread。
+- [ ] 增加旧 `legacy`、`v0.5` 和“只匹配部分 profile”的反向回归，确认
+  `continuity_mode=reuse` 也不会退化为模糊匹配。
+- [ ] 固化 worktree/branch 分配边界：新任务只能使用自己的 task worktree；
+  已被其他 task 使用的路径或 branch 必须拒绝。
+- [ ] 固化 native Thread 边界：同一 native thread/actor 只能绑定同一 task；
+  prompt 未 delivered 时不能 claim。
+- [ ] Dashboard 默认明确标识旧 profile Thread 为不可复用历史；是否提供
+  “显示历史 Thread”由展示筛选实现，不新增第二套 Thread 状态。
+- [ ] 用当前正式库上 8 个 `legacy`、13 个 `v0.5` Thread 做只读兼容性验证。
+
+验收：
+
+- 新任务无论使用 `auto` 还是 `reuse`，都不会选中旧 profile Thread。
+- 旧 task/worktree/branch 不会被新 task 隐式接管。
+- native Thread 不能跨 task 复用。
+- 所有旧 Agent、job、usage 和事件继续保留，可查询但不参与新分配。
+
+---
+
+### Phase 4B：调度状态机与 Tick 流水线
 
 状态：未开始
 
@@ -276,30 +318,72 @@ Terminal jobs missing settlement/correlation:
 - [ ] 每个阶段输出耗时与计数。
 - [ ] 修复 `planning` goal 在全部任务终态时直接尝试 `completed` 的非法转换；
   应由 prepare 阶段显式执行可审计的 `planning -> active -> completed` 收敛。
+- [ ] 覆盖并发 tick、daemon 重启、空任务 Goal 和 terminal reconciliation。
+
+验收：
+
+- 每次 tick 的阶段顺序固定，任一阶段失败能定位到具体阶段。
+- Goal 状态转换全部符合显式状态机，不再依赖调用方绕过非法转换。
+
+---
+
+### Phase 4C：安全与状态完整性
+
+状态：未开始
+
+- [ ] Dashboard 写接口校验 loopback Host、same-origin Origin 和
+  `application/json`，无 Origin 的 CLI 客户端保持兼容。
+- [ ] Goal resume 与 daemon 启动使用可回滚顺序，daemon 启动失败不留下
+  active 假状态。
+- [ ] 项目/任务归档与 claim 使用单一 `BEGIN IMMEDIATE` 事务。
+- [ ] 数据库 URI 转义、并发迁移重试和只读连接回归。
+- [ ] 脱敏覆盖未加引号的冒号格式，并增加凭据泄漏反向测试。
+
+验收：
+
+- 非法来源和错误 Content-Type 在业务写入前被拒绝。
+- archive/claim 竞争不会产生 archived project + running task。
+- 数据库路径包含 `#`、空格或 Windows 特殊字符时迁移和只读连接正常。
+
+---
+
+### Phase 4D：Read Model 与 Dashboard 扩容
+
+状态：未开始
+
 - [ ] split dashboard API：summary、tasks、goal、events、agents、attempts。
 - [ ] 使用 version/ETag/cursor，避免每 2 秒读取全量 board。
+- [ ] task detail 按 task 读取事件，不再依赖全局最新 500 条。
 - [ ] unknown、真实 0、unavailable 分离。
 - [ ] fresh/resume/fallback_exec 分离展示。
+- [ ] 为大任务库和事件历史建立轮询大小、延迟和结果正确性门禁。
 
 验收：
 
 - 大任务库下 board 轮询大小和延迟有明确上限。
-- task detail 不再依赖全局最新 500 条事件。
+- task detail 不再依赖全局事件窗口。
 
 ---
 
-### Phase 5：安装、进程与运维恢复
+### Phase 5：安装、进程与历史清理
 
 状态：未开始
 
-- [ ] 安装器 preflight/apply/verify/rollback。
 - [ ] daemon/job lock 绑定 process identity。
 - [ ] taskkill 前验证 executable/start time/token。
-- [ ] 项目/任务归档使用单一事务。
+- [ ] 安装器改为 preflight/apply/verify/rollback。
 - [ ] watchdog 支持多 TeamHome。
 - [ ] 日志轮转。
-- [ ] 脱敏覆盖冒号格式。
-- [ ] 数据库 URI、并发迁移和只读连接回归。
+- [ ] 盘点并摘除已失效或已完成 task 的 worktree 注册；保留 branch、commit
+  和审计证据，不删除 blocked 任务历史。
+- [ ] 评估旧 `T-20261109-FE3227` 分支：已被新实现覆盖的部分标记
+  superseded，仍有价值的语义拆成新测试或后续任务，不整体合并旧分支。
+
+验收：
+
+- 安装、升级和失败恢复均可重复执行或回滚。
+- 不会因 PID 复用终止无关进程。
+- 历史 worktree 不再占用活动分配面，但所有代码和审计记录仍可恢复。
 
 ---
 
