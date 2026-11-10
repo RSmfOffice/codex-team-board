@@ -195,6 +195,32 @@ def agent_cache_profile(
     )
 
 
+def cache_profile_contract_status(profile: str | None) -> str:
+    """Classify a stored profile against the current model-visible contract."""
+
+    normalized = str(profile or "").strip()
+    if not normalized:
+        return "unknown"
+    parts = normalized.split(";")
+    if (
+        len(parts) < 2
+        or parts[0] != CACHE_PROFILE_PREFIX
+        or parts[1] != CORE_SURFACE_VERSION
+    ):
+        return "historical"
+    fields: dict[str, str] = {}
+    for part in parts[2:]:
+        name, separator, value = part.partition("=")
+        if separator:
+            fields[name] = value
+    if (
+        fields.get("contract") == PROMPT_CONTRACT_VERSION
+        and fields.get("manifest") == bundled_manifest_hash()
+    ):
+        return "current"
+    return "historical"
+
+
 def operation_help(
     definitions: Iterable[dict[str, Any]],
     *,

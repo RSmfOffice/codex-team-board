@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping
 
 from .agent_pool import AgentPool, AgentPoolError
+from .cache_contract import cache_profile_contract_status
 from .config import Settings
 from .db import connect, connect_readonly, utc_now
 from .scheduling import (
@@ -176,6 +177,146 @@ class TeamService:
                 "uncached": uncached_input_tokens,
             }
         )
+
+    @staticmethod
+    def _worktree_git(
+        cwd: Path,
+        *args: str,
+    ) -> subprocess.CompletedProcess[str]:
+        try:
+            return subprocess.run(
+                ["git", "-C", str(cwd), *args],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise TeamError(f"could not inspect task worktree: {exc}") from exc
+
+    def _validate_write_worktree_assignment(
+        self,
+        connection: sqlite3.Connection,
+        task: Mapping[str, Any],
+    ) -> Path:
+        values = dict(task)
+        if values.get("kind") != "write":
+            raise TeamError("worktree validation requires a write task")
+        worktree_value = str(values.get("worktree_path") or "").strip()
+        branch = str(values.get("branch") or "").strip()
+        if not worktree_value:
+            raise TeamError(
+                "write task requires an existing worktree; "
+                "call team_create_worktree first"
+            )
+        if not branch:
+            raise TeamError("write task worktree has no assigned branch")
+        try:
+            worktree = Path(worktree_value).expanduser().resolve(strict=True)
+        except OSError as exc:
+            raise TeamError(
+                "write task requires an existing worktree; "
+                "call team_create_worktree first"
+            ) from exc
+        if not worktree.is_dir():
+            raise TeamError(
+                "write task requires an existing worktree; "
+                "call team_create_worktree first"
+            )
+        project = connection.execute(
+            "SELECT root_path FROM projects WHERE project_id = ?",
+            (values["project_id"],),
+        ).fetchone()
+        if project is None:
+            raise TeamError(f"project not found: {values['project_id']}")
+        root = Path(str(project["root_path"])).expanduser().resolve()
+        if worktree == root:
+            raise TeamError(
+                "write task worktree must be isolated from the main checkout"
+            )
+        target_branch = str(values.get("target_branch") or "").strip()
+        if target_branch and branch == target_branch:
+            raise TeamError(
+                "write task branch must differ from its target branch"
+            )
+        other_tasks = connection.execute(
+            """
+            SELECT task_id, worktree_path, branch
+            FROM tasks
+            WHERE project_id = ? AND task_id != ?
+              AND (worktree_path IS NOT NULL OR branch IS NOT NULL)
+            """,
+            (values["project_id"], values["task_id"]),
+        ).fetchall()
+        for other in other_tasks:
+            other_path = str(other["worktree_path"] or "").strip()
+            if other_path:
+                try:
+                    resolved_other = Path(
+                        other_path
+                    ).expanduser().resolve()
+                except OSError:
+                    resolved_other = Path(
+                        other_path
+                    ).expanduser().absolute()
+                if resolved_other == worktree:
+                    raise TeamError(
+                        "worktree is already assigned to task "
+                        f"{other['task_id']}"
+                    )
+            if (
+                other["branch"]
+                and str(other["branch"]).strip() == branch
+            ):
+                raise TeamError(
+                    "worktree branch is already assigned to task "
+                    f"{other['task_id']}"
+                )
+        top = self._worktree_git(
+            worktree,
+            "rev-parse",
+            "--show-toplevel",
+        )
+        if top.returncode != 0:
+            raise TeamError(
+                top.stderr.strip()
+                or "write task worktree is not a Git worktree"
+            )
+        try:
+            top_path = Path(top.stdout.strip()).expanduser().resolve()
+        except OSError as exc:
+            raise TeamError("could not resolve task worktree root") from exc
+        if top_path != worktree:
+            raise TeamError(
+                "write task worktree path does not match its Git worktree root"
+            )
+        current_branch = self._worktree_git(
+            worktree,
+            "symbolic-ref",
+            "--short",
+            "HEAD",
+        )
+        if current_branch.returncode != 0:
+            raise TeamError(
+                current_branch.stderr.strip()
+                or "write task worktree has no checked-out branch"
+            )
+        if current_branch.stdout.strip() != branch:
+            raise TeamError(
+                "write task worktree branch does not match its assignment"
+            )
+        status = self._worktree_git(worktree, "status", "--porcelain")
+        if status.returncode != 0:
+            raise TeamError(
+                status.stderr.strip() or "could not inspect task worktree"
+            )
+        if status.stdout.strip():
+            raise TeamError(
+                "write task worktree is dirty; it must be clean before assignment"
+            )
+        return worktree
 
     @staticmethod
     def _project_unknown_usage(job: dict[str, Any]) -> None:
@@ -988,6 +1129,9 @@ class TeamService:
             cluster_agents = []
             for row in agent_rows:
                 agent = dict(row)
+                agent["profile_contract_status"] = (
+                    cache_profile_contract_status(agent.get("profile"))
+                )
                 total_rate = self._cache_hit_rate(
                     agent.get("total_input_tokens"),
                     agent.get("total_cached_input_tokens"),
@@ -1756,12 +1900,7 @@ class TeamService:
             ):
                 raise TeamError(f"task is leased by {task['claimed_by']}")
             if task["kind"] == "write":
-                worktree = task["worktree_path"]
-                if not worktree or not Path(worktree).is_dir():
-                    raise TeamError(
-                        "write task requires an existing worktree; "
-                        "call team_create_worktree first"
-                    )
+                self._validate_write_worktree_assignment(connection, task)
             now = utc_now()
             connection.execute(
                 """
@@ -1982,9 +2121,12 @@ class TeamService:
             if task["kind"] == "write":
                 if not resolved_commit:
                     raise TeamError("write task submission requires commit_sha")
-                worktree = task["worktree_path"]
-                if not worktree or not Path(worktree).is_dir():
-                    raise TeamError("write task worktree is missing")
+                worktree = str(
+                    self._validate_write_worktree_assignment(
+                        connection,
+                        task,
+                    )
+                )
                 status = subprocess.run(
                     ["git", "-C", str(worktree), "status", "--porcelain"],
                     capture_output=True,
@@ -2071,9 +2213,13 @@ class TeamService:
         resolved_merge = merge_commit.strip()
         worker_commit = ""
         if approve and task["kind"] == "write":
-            worktree = task["worktree_path"]
-            if not worktree or not Path(worktree).is_dir():
-                raise TeamError("write task worktree is missing")
+            with self.connection(write=False) as connection:
+                worktree = str(
+                    self._validate_write_worktree_assignment(
+                        connection,
+                        task,
+                    )
+                )
             status = subprocess.run(
                 ["git", "-C", str(worktree), "status", "--porcelain"],
                 capture_output=True,

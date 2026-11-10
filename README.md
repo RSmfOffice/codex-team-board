@@ -246,6 +246,11 @@ Worker 认领：
 .\scripts\team.ps1 task claim <task-id> --actor worker-auth
 ```
 
+`write` 任务 claim 前会验证 worktree 的完整归属：目录必须是独立 Git
+worktree，实际 checkout branch 必须等于 task 记录，路径和 branch 不能属于
+另一个 task，且 worktree 必须干净。submit 和 approve 时重复检查同一门禁，
+避免旧任务目录、旧分支或手工篡改把新任务带入错误工作区。
+
 认领结果中的 `claim_token` 不能写入 Git、日志、任务描述或最终回复。Worker 在
 指定 worktree 中完成修改、提交和测试后：
 
@@ -681,6 +686,11 @@ surface、access mode、Prompt Contract manifest、MCP instructions、sandbox
 mode、运行时身份和最终稳定 developer instructions；任一变化都会阻止旧 thread
 复用。`admin`/`legacy` 兼容工具面不会参与 Agent 自动复用，始终使用新 thread，
 避免管理工具面变化污染缓存身份。
+
+Dashboard 会为 managed Thread 派生 `profile_contract_status`：只有包含当前
+Prompt Contract 版本和 manifest hash 的 profile 标记为 `current`；`legacy`、
+`v0.5` 以及其他旧/部分 profile 标记为 `historical · not reusable`。该字段只由
+现有 profile 派生，不新增第二套 Thread 状态，也不删除历史 Thread。
 `continuity_reason` 说明相关 goal 为什么可以延续同一 Lead 上下文。创建或恢复
 目标时可以直接提供：
 

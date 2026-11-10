@@ -462,6 +462,44 @@ class AgentPoolTests(unittest.TestCase):
         )
         self.assertEqual(selected["agent_id"], agent["agent_id"])
 
+    def test_historical_profiles_never_enter_auto_or_explicit_reuse(self) -> None:
+        for index, profile in enumerate(
+            [
+                "legacy",
+                "v0.5",
+                "cache-v1;core-v1;manifest=partial",
+            ]
+        ):
+            self.register(
+                thread_id=f"historical-profile-{index}",
+                profile=profile,
+            )
+        current = self.register(
+            thread_id="current-contract-profile",
+            profile="cache-v1;core-v1-current",
+        )
+        for continuity_mode in ["auto", "reuse"]:
+            selected = self.pool.select_agent(
+                "P1",
+                "team_explorer",
+                "main",
+                continuity_mode,
+                "read",
+                "model-a",
+                "provider-a",
+                profile="cache-v1;core-v1-current",
+            )
+            self.assertEqual(selected["agent_id"], current["agent_id"])
+            self.pool.release(
+                selected["agent_id"],
+                {
+                    "input": 1,
+                    "cached": 0,
+                    "context": 1,
+                    "modelContextWindow": 100,
+                },
+            )
+
     def test_concurrent_selection_reserves_only_one_agent(self) -> None:
         agent = self.register(thread_id="concurrent")
 
