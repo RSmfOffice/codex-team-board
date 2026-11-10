@@ -115,6 +115,8 @@
   session metadata 和任务 ID，主 Thread、未知项目和非 subagent session 会被跳过。
 - Native Agent 尚无 usage 证据时，Dashboard 保持 unknown/`—`，不再把数据库默认
   token 列显示成真实 `0`；有 usage 后由下一次自动同步刷新。
+- 已登记的 native Thread 不再受自动发现 24 小时窗口限制，窗口外的 session
+  在时间戳或 usage 状态变化时仍会幂等刷新。
 - Dashboard revision 覆盖任务版本、Goal/Agent 更新时间、job 状态与 usage、
   Task/Goal/Agent 事件序列和消息序列；事件分页使用严格半开 cursor，避免重复或
   漏项。

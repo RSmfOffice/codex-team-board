@@ -1374,9 +1374,9 @@ class ClusterManager:
                 for row in connection.execute(
                     """
                     SELECT thread_id, runtime, project_id, role,
-                           workstream_key, current_task_id, last_seen_at,
-                           turn_count, model_context_window,
-                           last_input_tokens
+                           workstream_key, current_task_id, display_name,
+                           model_provider, last_seen_at, turn_count,
+                           model_context_window, last_input_tokens
                     FROM cluster_agents
                     """
                 ).fetchall()
@@ -1414,6 +1414,12 @@ class ClusterManager:
         skipped_existing: list[str] = []
         skipped_unknown_project: list[str] = []
         errors: list[dict[str, str]] = []
+        discovered_thread_ids = {
+            str(item["thread_id"]) for item in discovered
+        }
+        projects_by_id = {
+            str(project["project_id"]): project for project in projects
+        }
         for item in discovered:
             thread_id = str(item["thread_id"])
             project = matching_project(item.get("cwd"))
@@ -1503,6 +1509,61 @@ class ClusterManager:
                 **dict(existing or {}),
                 **result["agent"],
             }
+
+        for thread_id, existing in registered_threads.items():
+            if (
+                existing.get("runtime") != "native"
+                or thread_id in discovered_thread_ids
+            ):
+                continue
+            project = projects_by_id.get(str(existing.get("project_id")))
+            if project is None:
+                continue
+            inspection = inspect_native_session(thread_id)
+            if not inspection.get("session_found"):
+                continue
+            usage = (
+                inspection.get("usage")
+                if isinstance(inspection.get("usage"), Mapping)
+                else {}
+            )
+            usage_window = usage.get("model_context_window")
+            needs_refresh = (
+                existing.get("last_seen_at")
+                != inspection.get("last_seen_at")
+                or (
+                    bool(usage.get("available"))
+                    and int(existing.get("turn_count") or 0) == 0
+                )
+                or (
+                    usage_window is not None
+                    and existing.get("model_context_window") != usage_window
+                )
+            )
+            if not needs_refresh:
+                continue
+            try:
+                result = self.register_native_agent(
+                    project["root_path"],
+                    thread_id,
+                    str(existing["role"]),
+                    str(existing["workstream_key"]),
+                    actor=f"{actor}:{thread_id}",
+                    task_id=existing.get("current_task_id"),
+                    display_name=str(existing.get("display_name") or thread_id),
+                    model_provider=str(
+                        existing.get("model_provider") or ""
+                    ),
+                )
+            except (AgentPoolError, ClusterError, TeamError, OSError) as exc:
+                errors.append(
+                    {
+                        "thread_id": thread_id,
+                        "error": str(exc),
+                    }
+                )
+                continue
+            refreshed.append(result["agent"])
         return {
             "discovered": len(discovered),
             "max_age_hours": max_age_hours,

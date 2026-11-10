@@ -543,6 +543,7 @@ Merge commit:
 - [x] 解析 `token_usage_record` 与 `token_count` 的 last/total usage。
 - [x] 记录 last/total input、cached、uncached、context、model window、turn。
 - [x] 已登记 native Thread 在 session 更新后幂等刷新 usage。
+- [x] 已登记 native Thread 超出 discovery 时间窗后仍可刷新 usage。
 - [x] 无 usage 证据时 API 投影为 `null`，UI 显示 `—`。
 - [x] 显式 usage 零值仍按真实零值保留。
 

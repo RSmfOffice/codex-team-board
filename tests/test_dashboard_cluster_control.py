@@ -6,6 +6,7 @@ import sqlite3
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -448,6 +449,99 @@ class DashboardClusterControlTests(unittest.TestCase):
         self.assertIsNone(unknown_usage_agent["last_cached_input_tokens"])
         self.assertIsNone(unknown_usage_agent["last_uncached_input_tokens"])
         self.assertIsNone(unknown_usage_agent["context_tokens"])
+
+    def test_sync_refreshes_registered_native_outside_window(self) -> None:
+        sessions_root = self.base / "old-native-sessions"
+        sessions_root.mkdir()
+        thread_id = "01a1cafe-6666-7222-8333-944455556666"
+        session_path = sessions_root / f"rollout-{thread_id}.jsonl"
+        session_path.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "session_meta",
+                            "payload": {
+                                "id": thread_id,
+                                "cwd": str(self.repo),
+                                "source": {
+                                    "subagent": {
+                                        "thread_spawn": {
+                                            "parent_thread_id": "parent-old",
+                                            "agent_path": "/root/old-reviewer",
+                                        }
+                                    }
+                                },
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "event_msg",
+                            "payload": {
+                                "type": "token_count",
+                                "info": {
+                                    "total_token_usage": {
+                                        "input_tokens": 2000,
+                                        "cached_input_tokens": 1600,
+                                        "output_tokens": 100,
+                                    },
+                                    "last_token_usage": {
+                                        "input_tokens": 1000,
+                                        "cached_input_tokens": 800,
+                                        "output_tokens": 50,
+                                    },
+                                    "model_context_window": 996147,
+                                },
+                            },
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        old_timestamp = time.time() - 2 * 3600
+        os.utime(session_path, (old_timestamp, old_timestamp))
+        self.team.agent_pool.register_native_thread(
+            str(self.project["project_id"]),
+            "team_reviewer",
+            "native:parent-old",
+            thread_id,
+            f"native:{thread_id}",
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "CODEX_NATIVE_SESSIONS_ROOT": str(sessions_root),
+                "CODEX_TEAM_NATIVE_DISCOVERY_MAX_AGE_HOURS": "1",
+            },
+        ):
+            status, first = self.post(
+                "/api/agents/sync-native",
+                {"limit": 100},
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(first["discovered"], 0)
+            self.assertEqual(first["registered_count"], 0)
+            self.assertEqual(first["refreshed_count"], 1)
+            board = self.get("/api/board")
+            agent = next(
+                item
+                for item in board["cluster_agents"]
+                if item["thread_id"] == thread_id
+            )
+            self.assertTrue(agent["usage_available"])
+            self.assertEqual(agent["context_tokens"], 1000)
+            self.assertEqual(agent["model_context_window"], 996147)
+
+            status, second = self.post(
+                "/api/agents/sync-native",
+                {"limit": 100},
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(second["refreshed_count"], 0)
 
     def test_control_cluster_goal_pause_resume_and_cancel(self) -> None:
         cluster = ClusterManager(self.settings, team=self.team)
