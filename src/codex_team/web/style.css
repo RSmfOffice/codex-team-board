@@ -607,6 +607,8 @@ input[type="text"]:focus {
 .chip.archived { color: var(--amber); border-color: rgba(244,191,101,.35); }
 .chip.warning { color: var(--amber); border-color: rgba(244,191,101,.45); }
 .chip.critical { color: var(--red); border-color: rgba(255,114,134,.5); }
+.chip.workflow { color: var(--accent); border-color: rgba(88,211,255,.34); }
+.chip.workflow.historical { color: var(--amber); border-color: rgba(244,191,101,.45); }
 
 .messages-panel {
   margin: 0 24px 24px;

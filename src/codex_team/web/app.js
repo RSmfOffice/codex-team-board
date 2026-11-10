@@ -121,6 +121,15 @@ function cacheRateText(value, cachedValue, uncachedValue) {
   return rate === null ? "—" : `${Math.round(rate * 100)}%`;
 }
 
+function workflowEpochText(value) {
+  const normalized = String(value ?? "").trim();
+  if (!normalized) return "workflow unbound";
+  const shortened = normalized.length > 22
+    ? `${normalized.slice(0, 22)}…`
+    : normalized;
+  return `workflow ${shortened}`;
+}
+
 function jobRuntimeHtml(job) {
   if (!job) return "";
   const runtime = String(job.runtime || "").trim();
@@ -349,6 +358,7 @@ function renderCard(task) {
   const claimWait = task.status === "ready" && task.claim_wait_seconds
     ? `<span class="chip ${escapeHtml(task.claim_wait_state)}">等待认领 ${escapeHtml(ageText(task.claim_wait_seconds))}</span>`
     : "";
+  const workflowClass = task.workflow_epoch ? "" : " historical";
   return `
     <article class="card" data-task-id="${escapeHtml(task.task_id)}">
       <div class="card-top">
@@ -360,6 +370,7 @@ function renderCard(task) {
         <span class="chip owner">${escapeHtml(task.owner_role)}</span>
         <span class="chip">P${escapeHtml(task.priority)}</span>
         <span class="chip">${escapeHtml(task.project_name || "")}</span>
+        <span class="chip workflow${workflowClass}">${escapeHtml(workflowEpochText(task.workflow_epoch))}</span>
         ${blocker}${lease}${assigned}${claimWait}${archived}
       </div>
       ${jobRuntimeHtml(task.active_job)}
@@ -737,6 +748,7 @@ function renderCluster(goals, jobs, data) {
       );
     }
     const archivedClass = goal.archived_at ? " archived" : "";
+    const workflowClass = goal.workflow_epoch ? "" : " historical";
     return `
       <article class="cluster-card ${health.attention ? "attention" : ""} heartbeat-${escapeHtml(heartbeat.tone)}${archivedClass}"
                data-heartbeat-state="${escapeHtml(heartbeat.state)}"
@@ -751,6 +763,7 @@ function renderCluster(goals, jobs, data) {
         <div class="card-meta">
           <span class="chip">${escapeHtml(goal.project_name || "未知项目")}</span>
           <span class="chip owner">${escapeHtml(goal.autonomy)}</span>
+          <span class="chip workflow${workflowClass}">${escapeHtml(workflowEpochText(goal.workflow_epoch))}</span>
           <span class="chip">lead ticks ${escapeHtml(goal.lead_ticks ?? 0)}</span>
           <span class="chip active-jobs-chip">活动任务 ${escapeHtml(activeJobCount)} · ${escapeHtml(runText)}</span>
           ${checkpoint}
@@ -842,7 +855,7 @@ function renderAgentThreads(agents, events = []) {
       : "未绑定目标";
     const latestEvent = latestEventByAgent.get(agent.agent_id);
     const latestJob = agent.latest_job_id
-      ? `${agent.latest_job_id} · ${agent.latest_job_status || "unknown"}${agent.latest_job_thread_action ? ` · ${agent.latest_job_thread_action}` : ""}`
+      ? `${agent.latest_job_id} · ${agent.latest_job_status || "unknown"}${agent.latest_job_thread_action ? ` · ${agent.latest_job_thread_action}` : ""}${agent.latest_job_workflow_epoch ? ` · ${workflowEpochText(agent.latest_job_workflow_epoch)}` : ""}`
       : "无 job";
     const nativePrompt = agent.runtime === "native"
       ? agent.prompt_status || "unknown"
@@ -1381,6 +1394,7 @@ if (typeof window !== "undefined") {
     renderBoard,
     renderAgentThreads,
     waitDurationText,
+    workflowEpochText,
   });
 }
 

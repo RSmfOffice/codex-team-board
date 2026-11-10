@@ -251,6 +251,25 @@ worktree，实际 checkout branch 必须等于 task 记录，路径和 branch �
 另一个 task，且 worktree 必须干净。submit 和 approve 时重复检查同一门禁，
 避免旧任务目录、旧分支或手工篡改把新任务带入错误工作区。
 
+Goal、Task 和每次 cluster job 还绑定 `workflow_epoch`。该 epoch 由稳定的
+Prompt Contract、AGENTS、角色 prompts、Core schema、access/surface、运行时和
+模型配置派生。新 Goal/Task 只接受当前 epoch；旧 ready Task 会被阻断，旧 Goal
+不会自动 resume 或执行 Lead。需要升级旧 cohort 时必须显式迁移：
+
+```powershell
+.\scripts\team.ps1 cluster migrate-workflow <goal-id> `
+  --actor human `
+  --reason "reviewed current stable prefix"
+```
+
+有活动 job 或 running task 时迁移会被拒绝，避免把正在运行的旧工作流切换到
+新前缀。存在未完成任务时必须先写入 durable checkpoint，再执行显式迁移。
+Dashboard/API 会为 Goal、Task 和最近 job 显示 `workflow_epoch`。
+
+`WORKFLOW_EPOCH_VERSION` 只在状态机、任务字段、执行契约或 prefix 结构发生
+语义变化时升级；普通实现重构不得每个 commit 都升级，否则会无谓切断仍在兼容
+范围内的旧队列。
+
 认领结果中的 `claim_token` 不能写入 Git、日志、任务描述或最终回复。Worker 在
 指定 worktree 中完成修改、提交和测试后：
 
@@ -571,6 +590,7 @@ MCP 的 `team_cluster_control.action` 除 `pause`、`resume`、`cancel` 外，�
 - `team_cluster_control`
 - `team_goal_set_workstream`
 - `team_goal_set_checkpoint`
+- `team_goal_migrate_workflow`
 - `team_agent_register_native`
 - `team_agent_list`
 - `team_agent_reset`

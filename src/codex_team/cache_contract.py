@@ -4,8 +4,10 @@ import hashlib
 import json
 import os
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
+from . import __version__
+from .db import SCHEMA_VERSION
 from .prompt_contract import (
     PROMPT_CONTRACT_VERSION,
     bundled_manifest_hash,
@@ -16,7 +18,9 @@ from .prompt_contract import (
 
 CORE_SURFACE_VERSION = "core-v1"
 CACHE_PROFILE_PREFIX = "cache-v1"
+WORKFLOW_EPOCH_VERSION = "workflow-v1"
 SURFACES = frozenset({"core", "admin", "legacy"})
+CURRENT_MANIFEST_HASH = bundled_manifest_hash()
 
 READ_OPERATIONS = frozenset(
     {
@@ -52,6 +56,7 @@ WRITE_OPERATIONS = frozenset(
         "team_cluster_control",
         "team_goal_set_workstream",
         "team_goal_set_checkpoint",
+        "team_goal_migrate_workflow",
         "team_agent_register_native",
         "team_agent_reset",
     }
@@ -183,16 +188,61 @@ def agent_cache_profile(
     instructions_hash = sha256_text(instruction_text)
     runtime_version_hash = sha256_text(str(runtime_version).strip())
     runtime_identity_hash = sha256_text(str(runtime_identity).strip())
-    manifest_hash = bundled_manifest_hash()
+    manifest_hash = CURRENT_MANIFEST_HASH
     return (
         f"{CACHE_PROFILE_PREFIX};{CORE_SURFACE_VERSION};surface={selected_surface};"
         f"tools={tools_hash};policy={policy_hash};role={role_hash};"
         f"sandbox={sandbox_hash};access={selected_access};"
         f"instructions={instructions_hash};manifest={manifest_hash};"
         f"contract={PROMPT_CONTRACT_VERSION};"
+        f"workflow={WORKFLOW_EPOCH_VERSION};schema={SCHEMA_VERSION};"
         f"runtime_version={runtime_version_hash};"
         f"runtime_identity={runtime_identity_hash}"
     )
+
+
+def workflow_epoch(
+    *,
+    policy_hash: str,
+    role_prompts: Mapping[str, str],
+    native_role_hashes: Mapping[str, str],
+    runtime: str,
+    model: str,
+    model_provider: str,
+    surface: str | None = None,
+    access_mode: str | None = None,
+) -> str:
+    """Build the semantic cohort for new goals and task dispatch."""
+
+    selected_surface, surface_hash = tool_surface_identity(surface)
+    selected_access = access_mode or configured_access_mode()
+    payload = {
+        "epoch_version": WORKFLOW_EPOCH_VERSION,
+        "package_version": __version__,
+        "schema_version": SCHEMA_VERSION,
+        "prompt_contract": PROMPT_CONTRACT_VERSION,
+        "manifest_hash": CURRENT_MANIFEST_HASH,
+        "surface": selected_surface,
+        "surface_hash": surface_hash,
+        "access_mode": selected_access,
+        "instructions_hash": sha256_text(
+            instructions_for_surface(selected_surface, selected_access)
+        ),
+        "policy_hash": str(policy_hash),
+        "role_prompts": {
+            str(role): sha256_text(str(prompt))
+            for role, prompt in sorted(role_prompts.items())
+        },
+        "native_role_hashes": {
+            str(role): str(value)
+            for role, value in sorted(native_role_hashes.items())
+        },
+        "runtime": str(runtime).strip().lower(),
+        "model": str(model).strip(),
+        "model_provider": str(model_provider).strip(),
+    }
+    digest = sha256_text(canonical_json(payload))[:32]
+    return f"{WORKFLOW_EPOCH_VERSION}:{digest}"
 
 
 def cache_profile_contract_status(profile: str | None) -> str:
@@ -215,7 +265,9 @@ def cache_profile_contract_status(profile: str | None) -> str:
             fields[name] = value
     if (
         fields.get("contract") == PROMPT_CONTRACT_VERSION
-        and fields.get("manifest") == bundled_manifest_hash()
+        and fields.get("manifest") == CURRENT_MANIFEST_HASH
+        and fields.get("workflow") == WORKFLOW_EPOCH_VERSION
+        and fields.get("schema") == str(SCHEMA_VERSION)
     ):
         return "current"
     return "historical"

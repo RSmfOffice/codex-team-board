@@ -51,6 +51,7 @@ class MigrationTests(unittest.TestCase):
                         "merge_commit",
                         "target_branch",
                         "goal_id",
+                        "workflow_epoch",
                         "worktree_path",
                         "completed_at",
                         "archived_at",
@@ -69,6 +70,7 @@ class MigrationTests(unittest.TestCase):
                     ).fetchall()
                 }
                 self.assertIn("archived_at", cluster_goal_columns)
+                self.assertIn("workflow_epoch", cluster_goal_columns)
                 self.assertTrue(
                     {"workstream_key", "continuity_reason"}.issubset(
                         cluster_goal_columns
@@ -93,6 +95,7 @@ class MigrationTests(unittest.TestCase):
                         "cached_input_tokens",
                         "uncached_input_tokens",
                         "model_context_window",
+                        "workflow_epoch",
                     }.issubset(job_columns)
                 )
                 agent_columns = {
@@ -160,7 +163,7 @@ class MigrationTests(unittest.TestCase):
                 old = upgraded.execute(
                     """
                     SELECT usage_missing_fields, correlation_id, outcome,
-                           settled_at
+                           settled_at, workflow_epoch
                     FROM cluster_jobs WHERE job_id = 'J-OLD'
                     """
                 ).fetchone()
@@ -168,6 +171,7 @@ class MigrationTests(unittest.TestCase):
                 self.assertEqual(old["correlation_id"], "J-OLD")
                 self.assertEqual(old["outcome"], "completed")
                 self.assertEqual(old["settled_at"], "2026-11-08T00:00:00Z")
+                self.assertEqual(old["workflow_epoch"], "legacy-unbound")
                 self.assertEqual(
                     upgraded.execute("PRAGMA user_version").fetchone()[0],
                     SCHEMA_VERSION,
@@ -202,6 +206,7 @@ class MigrationTests(unittest.TestCase):
                         "thread_action",
                         "outcome",
                         "settled_at",
+                        "workflow_epoch",
                     }.issubset(columns)
                 )
                 operation_table = reopened.execute(
@@ -255,6 +260,7 @@ class MigrationTests(unittest.TestCase):
                         "stall_ticks",
                         "stall_signature",
                         "stalled_at",
+                        "workflow_epoch",
                     }
                     <= goal_columns
                 )

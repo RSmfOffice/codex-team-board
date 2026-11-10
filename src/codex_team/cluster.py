@@ -240,6 +240,10 @@ class WorkerClaimConflict(ClusterError):
     """A worker task was claimed by another owner before dispatch."""
 
 
+class WorkflowEpochMismatch(ClusterError):
+    """A goal or task cannot run under the current architecture epoch."""
+
+
 class _AppServerJobStartError(ClusterError):
     """An App Server job could not start after its one runtime restart."""
 
@@ -389,6 +393,10 @@ class ClusterManager:
         )
         project = self.team.register_project(repo)
         self.team.ensure_project_active(project)
+        workflow_epoch_value = self.team.current_workflow_epoch(
+            project["root_path"],
+            resolved_root=True,
+        )
         goal_id = self._new_id("G")
         effective_workstream = requested_workstream or goal_id
         now = utc_now()
@@ -407,14 +415,15 @@ class ClusterManager:
             connection.execute(
                 """
                 INSERT INTO cluster_goals(
-                    goal_id, project_id, objective, status, autonomy,
+                    goal_id, project_id, workflow_epoch, objective, status, autonomy,
                     max_worker_attempts, max_lead_attempts, workstream_key,
                     continuity_reason, created_at, updated_at
-                ) VALUES (?, ?, ?, 'planning', ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, 'planning', ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     goal_id,
                     project["project_id"],
+                    workflow_epoch_value,
                     objective,
                     autonomy,
                     max(1, min(int(max_worker_attempts), 10)),
@@ -434,6 +443,7 @@ class ClusterManager:
                     "objective": objective,
                     "workstream_key": effective_workstream,
                     "continuity_reason": continuity_reason,
+                    "workflow_epoch": workflow_epoch_value,
                 },
             )
         return self.get_goal(goal_id)
@@ -463,13 +473,18 @@ class ClusterManager:
         )
         project = self.team.register_project(repo)
         self.team.ensure_project_active(project)
+        workflow_epoch_value = self.team.current_workflow_epoch(
+            project["root_path"],
+            resolved_root=True,
+        )
         now = utc_now()
         created = False
         with self.team.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             active = connection.execute(
                 """
-                SELECT goal_id, status, objective, workstream_key, continuity_reason
+                SELECT goal_id, status, objective, workstream_key,
+                       continuity_reason, workflow_epoch
                 FROM cluster_goals
                 WHERE project_id = ?
                   AND status IN ('planning', 'active', 'paused')
@@ -486,6 +501,11 @@ class ClusterManager:
                 (project["project_id"],),
             ).fetchone()
             if active:
+                if active["workflow_epoch"] != workflow_epoch_value:
+                    raise ClusterError(
+                        "existing goal has incompatible workflow epoch; "
+                        "migrate or archive it before continuing"
+                    )
                 goal_id = str(active["goal_id"])
                 existing_workstream = str(active["workstream_key"] or "").strip()
                 effective_workstream = (
@@ -532,14 +552,16 @@ class ClusterManager:
                 connection.execute(
                     """
                     INSERT INTO cluster_goals(
-                        goal_id, project_id, objective, status, autonomy,
+                        goal_id, project_id, workflow_epoch, objective, status,
+                        autonomy,
                         max_worker_attempts, max_lead_attempts, workstream_key,
                         continuity_reason, created_at, updated_at
-                    ) VALUES (?, ?, ?, 'planning', ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, 'planning', ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         goal_id,
                         project["project_id"],
+                        workflow_epoch_value,
                         objective,
                         autonomy,
                         max(1, min(int(max_worker_attempts), 10)),
@@ -560,6 +582,7 @@ class ClusterManager:
                         "via": "ensure_goal",
                         "workstream_key": effective_workstream,
                         "continuity_reason": continuity_reason,
+                        "workflow_epoch": workflow_epoch_value,
                     },
                 )
         goal = self.get_goal(goal_id)
@@ -602,6 +625,135 @@ class ClusterManager:
             )
             return result
 
+    def migrate_goal_workflow_epoch(
+        self,
+        goal_id: str,
+        *,
+        actor: str = "human",
+        reason: str = "explicit workflow epoch migration",
+    ) -> dict[str, Any]:
+        actor = str(actor or "").strip()
+        reason = str(reason or "").strip()
+        if not actor:
+            raise ClusterError("actor is required")
+        if not reason:
+            raise ClusterError("migration reason is required")
+        now = utc_now()
+        with self.team.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            goal = connection.execute(
+                """
+                SELECT g.*, p.root_path
+                FROM cluster_goals g
+                JOIN projects p ON p.project_id = g.project_id
+                WHERE g.goal_id = ?
+                """,
+                (goal_id,),
+            ).fetchone()
+            if goal is None:
+                raise ClusterError(f"cluster goal not found: {goal_id}")
+            if goal["archived_at"]:
+                raise ClusterError("archived goal cannot migrate workflow epoch")
+            active_jobs = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM cluster_jobs
+                WHERE goal_id = ? AND status IN ('starting', 'running')
+                """,
+                (goal_id,),
+            ).fetchone()["count"]
+            if int(active_jobs):
+                raise ClusterError(
+                    "cannot migrate workflow epoch while the goal has active jobs"
+                )
+            current_epoch = self.team.current_workflow_epoch(
+                goal["root_path"],
+                resolved_root=True,
+            )
+            previous_epoch = str(goal["workflow_epoch"] or "")
+            tasks = connection.execute(
+                """
+                SELECT task_id, status, workflow_epoch
+                FROM tasks
+                WHERE goal_id = ?
+                ORDER BY task_id
+                """,
+                (goal_id,),
+            ).fetchall()
+            if any(task["status"] == "running" for task in tasks):
+                raise ClusterError(
+                    "cannot migrate workflow epoch with a running task"
+                )
+            needs_migration = (
+                previous_epoch != current_epoch
+                or any(
+                    task["status"] not in TERMINAL_TASK_STATUSES
+                    and task["workflow_epoch"] != current_epoch
+                    for task in tasks
+                )
+            )
+            if (
+                needs_migration
+                and any(
+                    task["status"] not in TERMINAL_TASK_STATUSES
+                    for task in tasks
+                )
+                and not str(goal["checkpoint_summary"] or "").strip()
+            ):
+                raise ClusterError(
+                    "workflow epoch migration requires a durable checkpoint"
+                )
+            connection.execute(
+                """
+                UPDATE cluster_goals
+                SET workflow_epoch = ?, updated_at = ?
+                WHERE goal_id = ?
+                """,
+                (current_epoch, now, goal_id),
+            )
+            migrated_tasks: list[str] = []
+            for task in tasks:
+                if task["status"] in TERMINAL_TASK_STATUSES:
+                    continue
+                connection.execute(
+                    """
+                    UPDATE tasks
+                    SET workflow_epoch = ?, updated_at = ?, version = version + 1
+                    WHERE task_id = ?
+                    """,
+                    (current_epoch, now, task["task_id"]),
+                )
+                self.team._event(
+                    connection,
+                    str(task["task_id"]),
+                    "workflow_epoch_migrated",
+                    actor,
+                    {
+                        "previous_epoch": task["workflow_epoch"],
+                        "workflow_epoch": current_epoch,
+                        "reason": reason,
+                    },
+                )
+                migrated_tasks.append(str(task["task_id"]))
+            self._event(
+                connection,
+                goal_id,
+                "workflow_epoch_migrated",
+                actor,
+                {
+                    "previous_epoch": previous_epoch,
+                    "workflow_epoch": current_epoch,
+                    "migrated_tasks": migrated_tasks,
+                    "reason": reason,
+                },
+            )
+        return {
+            "goal": self.get_goal(goal_id),
+            "previous_epoch": previous_epoch,
+            "workflow_epoch": current_epoch,
+            "migrated_tasks": migrated_tasks,
+        }
+
     def list_goals(
         self,
         statuses: list[str] | None = None,
@@ -640,7 +792,12 @@ class ClusterManager:
         completed_at = utc_now() if status in TERMINAL_GOAL_STATUSES else None
         with self.team.connection() as connection:
             row = connection.execute(
-                "SELECT * FROM cluster_goals WHERE goal_id = ?",
+                """
+                SELECT g.*, p.root_path
+                FROM cluster_goals g
+                JOIN projects p ON p.project_id = g.project_id
+                WHERE g.goal_id = ?
+                """,
                 (goal_id,),
             ).fetchone()
             if row is None:
@@ -656,6 +813,15 @@ class ClusterManager:
                     f"invalid goal transition: {current_status} -> {status}"
                 )
             if status == "active":
+                current_epoch = self.team.current_workflow_epoch(
+                    row["root_path"],
+                    resolved_root=True,
+                )
+                if row["workflow_epoch"] != current_epoch:
+                    raise ClusterError(
+                        "goal workflow epoch is incompatible with current "
+                        "architecture; migrate it before resume"
+                    )
                 competing = connection.execute(
                     """
                     SELECT goal_id FROM cluster_goals
@@ -1555,6 +1721,25 @@ class ClusterManager:
                     True,
                     True,
                 )
+            except WorkflowEpochMismatch as exc:
+                self.team.block_task(
+                    task["task_id"],
+                    actor="teamd",
+                    reason=str(exc),
+                )
+                with self.team.connection() as connection:
+                    self._event(
+                        connection,
+                        goal_id,
+                        "workflow_epoch_mismatch",
+                        "teamd",
+                        {
+                            "task_id": task["task_id"],
+                            "task_epoch": task.get("workflow_epoch"),
+                            "error": str(exc),
+                        },
+                    )
+                return None, True, True
             except WorkerClaimConflict as exc:
                 with self.team.connection() as connection:
                     self._event(
@@ -1598,6 +1783,24 @@ class ClusterManager:
         ):
             try:
                 return self._dispatch_lead(goal, tasks), True, True
+            except WorkflowEpochMismatch as exc:
+                self.set_goal_status(
+                    goal_id,
+                    "paused",
+                    reason=str(exc),
+                )
+                with self.team.connection() as connection:
+                    self._event(
+                        connection,
+                        goal_id,
+                        "workflow_epoch_mismatch",
+                        "teamd",
+                        {
+                            "goal_epoch": goal.get("workflow_epoch"),
+                            "error": str(exc),
+                        },
+                    )
+                return None, True, False
             except Exception as exc:
                 with self.team.connection() as connection:
                     connection.execute(
@@ -1866,6 +2069,7 @@ class ClusterManager:
         role = str(task["owner_role"])
         if role not in self.team.ROLE_FILES:
             raise ClusterError(f"unsupported worker role: {role}")
+        self._require_workflow_epoch(goal, task)
         job_id = self._new_id("J")
         if task["kind"] == "write":
             current = self.team.get_task(task["task_id"])
@@ -2023,6 +2227,30 @@ Do not return raw logs or a full transcript.
             )
             return True
 
+    def _require_workflow_epoch(
+        self,
+        goal: Mapping[str, Any],
+        task: Mapping[str, Any] | None = None,
+    ) -> str:
+        current = self.team.current_workflow_epoch(
+            goal["root_path"],
+            resolved_root=True,
+        )
+        expected = str(
+            (task or goal).get("workflow_epoch") or ""
+        ).strip()
+        boundary = (
+            f"task {task['task_id']}"
+            if task is not None
+            else f"goal {goal['goal_id']}"
+        )
+        if not expected or expected != current:
+            raise WorkflowEpochMismatch(
+                f"{boundary} workflow epoch {expected or '(unbound)'} "
+                f"does not match current {current}; migrate it explicitly"
+            )
+        return current
+
     @staticmethod
     def _worker_sandbox_mode(task: dict[str, Any]) -> str:
         return (
@@ -2044,6 +2272,7 @@ Do not return raw logs or a full transcript.
             "status": task.get("status"),
             "owner_role": task.get("owner_role"),
             "priority": task.get("priority"),
+            "workflow_epoch": task.get("workflow_epoch"),
         }
         if completed:
             return {
@@ -2103,6 +2332,7 @@ Do not return raw logs or a full transcript.
                 "objective": goal["objective"],
                 "autonomy": goal["autonomy"],
                 "workstream_key": goal.get("workstream_key"),
+                "workflow_epoch": goal.get("workflow_epoch"),
             },
             "counts": counts,
             "checkpoint": dict(checkpoint),
@@ -2120,6 +2350,7 @@ Do not return raw logs or a full transcript.
         goal: dict[str, Any],
         tasks: list[dict[str, Any]],
     ) -> dict[str, Any]:
+        self._require_workflow_epoch(goal)
         if int(goal["lead_ticks"]) >= 20:
             self.set_goal_status(goal["goal_id"], "failed", reason="lead tick limit exceeded")
             raise ClusterError("lead tick limit exceeded")
@@ -2184,6 +2415,8 @@ Do not return raw logs or a full transcript.
             "danger-full-access",
         }:
             raise ClusterError(f"invalid sandbox mode: {sandbox_mode}")
+        task = self.team.get_task(task_id) if task_id else None
+        workflow_epoch_value = self._require_workflow_epoch(goal, task)
         job_id = job_id or self._new_id("J")
         selected_runtime = self._select_job_runtime(
             goal,
@@ -2217,12 +2450,12 @@ Do not return raw logs or a full transcript.
             connection.execute(
                 """
                 INSERT INTO cluster_jobs(
-                    job_id, goal_id, task_id, kind, role, actor, status,
+                    job_id, goal_id, task_id, workflow_epoch, kind, role, actor, status,
                     attempt, log_path, output_path, runtime,
                     runtime_generation, error, started_at, correlation_id,
                     prompt_hash
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, 'starting',
+                    ?, ?, ?, ?, ?, ?, ?, 'starting',
                     ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
@@ -2230,6 +2463,7 @@ Do not return raw logs or a full transcript.
                     job_id,
                     goal["goal_id"],
                     task_id,
+                    workflow_epoch_value,
                     kind,
                     role,
                     actor,
@@ -2262,6 +2496,7 @@ Do not return raw logs or a full transcript.
                     "sandbox_mode": sandbox_mode,
                     "correlation_id": job_id,
                     "prompt_hash": prompt_hash,
+                    "workflow_epoch": workflow_epoch_value,
                 },
             )
         if selected_runtime == "app_server":

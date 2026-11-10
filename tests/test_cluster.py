@@ -4495,7 +4495,7 @@ class ClusterSchedulerTests(unittest.TestCase):
                 started = connection.execute(
                     """
                     SELECT correlation_id, prompt_hash, cache_profile,
-                           thread_action, outcome, settled_at
+                           thread_action, outcome, settled_at, workflow_epoch
                     FROM cluster_jobs WHERE job_id = ?
                     """,
                     (dispatched["job_id"],),
@@ -4503,6 +4503,10 @@ class ClusterSchedulerTests(unittest.TestCase):
             self.assertEqual(started["correlation_id"], dispatched["job_id"])
             self.assertEqual(len(started["prompt_hash"]), 64)
             self.assertIn("cache-v1", started["cache_profile"])
+            self.assertEqual(
+                started["workflow_epoch"],
+                task["workflow_epoch"],
+            )
             self.assertEqual(started["thread_action"], "fresh")
             self.assertEqual(started["outcome"], "")
             self.assertIsNone(started["settled_at"])
@@ -4786,6 +4790,9 @@ class ClusterSchedulerTests(unittest.TestCase):
             settings = _settings(base)
             team = TeamService(settings)
             repo = _repo(base, "ensure-goal-policy")
+            agents_path = repo / "AGENTS.md"
+            agents_path.write_text("stable policy\n", encoding="utf-8")
+            before = agents_path.read_bytes()
             manager = ClusterManager(
                 settings,
                 team=team,
@@ -4801,12 +4808,9 @@ class ClusterSchedulerTests(unittest.TestCase):
                     objective="Create a goal without prompt-file writes",
                 )
             self.assertTrue(first["created"])
-            self.assertFalse((repo / "AGENTS.md").exists())
+            self.assertFalse((repo / ".codex").exists())
 
             project = team.register_project(repo)
-            agents_path = repo / "AGENTS.md"
-            agents_path.write_text("stable policy\n", encoding="utf-8")
-            before = agents_path.read_bytes()
             with patch.object(
                 team,
                 "init_project",
@@ -4940,6 +4944,19 @@ class ClusterSchedulerTests(unittest.TestCase):
             ]
         )
         self.assertEqual(checkpoint_args.summary, "Durable checkpoint")
+        migrate_args = parser.parse_args(
+            [
+                "cluster",
+                "migrate-workflow",
+                "G-EXAMPLE",
+                "--actor",
+                "human",
+                "--reason",
+                "explicit upgrade",
+            ]
+        )
+        self.assertEqual(migrate_args.cluster_command, "migrate-workflow")
+        self.assertEqual(migrate_args.reason, "explicit upgrade")
         agent_args = parser.parse_args(["agent", "reset", "A-EXAMPLE"])
         self.assertEqual(agent_args.agent_command, "reset")
 
@@ -4951,6 +4968,7 @@ class ClusterSchedulerTests(unittest.TestCase):
                 "team_agent_reset",
                 "team_goal_set_checkpoint",
                 "team_goal_set_workstream",
+                "team_goal_migrate_workflow",
             }.issubset(tool_names)
         )
 
@@ -4996,6 +5014,22 @@ class ClusterSchedulerTests(unittest.TestCase):
             self.assertEqual(
                 checkpoint["checkpoint_summary"],
                 "MCP durable checkpoint",
+            )
+            with team.connection() as connection:
+                connection.execute(
+                    "UPDATE cluster_goals SET workflow_epoch = 'legacy-unbound' WHERE goal_id = ?",
+                    (goal["goal_id"],),
+                )
+            migrated = server.call_tool(
+                "team_goal_migrate_workflow",
+                {
+                    "goal_id": goal["goal_id"],
+                    "actor": "human",
+                    "reason": "MCP explicit migration",
+                },
+            )
+            self.assertTrue(
+                migrated["workflow_epoch"].startswith("workflow-v1:")
             )
             listed = server.call_tool(
                 "team_agent_list",
