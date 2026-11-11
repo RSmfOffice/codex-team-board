@@ -1294,7 +1294,8 @@ class DashboardClusterControlTests(unittest.TestCase):
                 {"goal_id": goal["goal_id"], "action": "cancel"},
             )
             self.assertEqual(status, 200)
-            self.assertEqual(canceled["goal"]["status"], "failed")
+            self.assertEqual(canceled["goal"]["status"], "canceled")
+            self.assertEqual(canceled["goal"]["raw_status"], "failed")
             self.assertIn("cancel requested", canceled["goal"]["last_error"])
             current_daemon.assert_called()
             canceled_task = self.team.get_task(task["task_id"])
@@ -1306,6 +1307,18 @@ class DashboardClusterControlTests(unittest.TestCase):
                 ).fetchone()
             self.assertEqual(job["status"], "interrupted")
             self.assertIn("cancel requested", job["error"])
+            canceled_board = self.get("/api/board")
+            canceled_goal = next(
+                item
+                for item in canceled_board["cluster_goals"]
+                if item["goal_id"] == goal["goal_id"]
+            )
+            self.assertEqual(canceled_goal["status"], "canceled")
+            self.assertEqual(canceled_goal["health"], "canceled")
+            self.assertEqual(
+                canceled_board["cluster_summary"]["goals_failed"],
+                0,
+            )
             status, invalid_resume = self.post(
                 "/api/clusters/control",
                 {"goal_id": goal["goal_id"], "action": "resume"},

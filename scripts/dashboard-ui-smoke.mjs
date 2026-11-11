@@ -200,6 +200,16 @@ expectText(
   "lastSummaryRevision",
   "pollBoard summary revision cache",
 );
+expectText(
+  pollBoardSource,
+  "boardRendered",
+  "pollBoard semantic render status",
+);
+expectText(
+  pollBoardSource,
+  "lastBoardRevision = revision",
+  "pollBoard 304 revision sync",
+);
 const revisableRequestSource = between(
   app,
   "async function requestRevisableJson",
@@ -266,6 +276,19 @@ const context = vm.createContext({
 vm.runInContext(app, context, { filename: "src/codex_team/web/app.js" });
 const hooks = window.TeamBoardTestHooks;
 assert.ok(hooks, "app.js did not expose test hooks");
+const fixedPollTime = new Date(2026, 10, 11, 12, 0, 0);
+assert.match(
+  hooks.pollStatusText({ changed: false, now: fixedPollTime }),
+  /已检查 · 无变化/,
+);
+assert.doesNotMatch(
+  hooks.pollStatusText({ changed: false, now: fixedPollTime }),
+  /已同步/,
+);
+assert.match(
+  hooks.pollStatusText({ changed: true, now: fixedPollTime }),
+  /已同步/,
+);
 
 const unchangedResponse = await hooks.requestRevisableJson(
   "/etag-unchanged",
@@ -683,7 +706,7 @@ assert.match(summaryHtml, /最老 16 分钟/);
 assert.match(summaryHtml, /data-metric="attention"/);
 assert.match(clusterHtmlBefore, /G-WARNING/);
 assert.match(clusterHtmlBefore, /G-CRITICAL/);
-assert.match(clusterHtmlBefore, /活动任务 2/);
+assert.match(clusterHtmlBefore, /执行中 2/);
 assert.match(clusterHtmlBefore, /checkpoint/);
 assert.match(clusterHtmlBefore, /心跳延迟/);
 assert.match(clusterHtmlBefore, /心跳超时/);
@@ -726,7 +749,10 @@ assert.match(agentThreadHtml, /contract historical · not reusable/);
 assert.match(agentThreadHtml, /context/);
 assert.match(agentThreadHtml, /cache/);
 assert.match(agentThreadHtml, /uncached/);
-assert.match(agentThreadHtml, /last cache\/uncached 1,200 \/ 400/);
+assert.match(
+  agentThreadHtml,
+  /last request cache\/uncached 1,200 \/ 400 · 75%/,
+);
 assert.match(agentThreadHtml, /T-1 · 实现真实消费者/);
 assert.match(agentThreadHtml, /75%/);
 assert.match(agentThreadHtml, /忙碌中不可重置/);
@@ -743,6 +769,7 @@ nativeBoard.cluster_agents = [{
   agent_id: "A-NATIVE",
   display_name: "Native Explorer",
   status: "loaded",
+  effective_status: "stored",
   runtime: "native",
   role: "team_explorer",
   workstream_key: "native-stream",
@@ -762,8 +789,18 @@ nativeBoard.cluster_agents = [{
   task_assignment_ambiguous: true,
   native_usage_status: "partial",
   native_usage_missing_fields: ["turn_count"],
+  last_input_tokens: 1000,
   last_cached_input_tokens: 800,
   last_uncached_input_tokens: 200,
+  last_cache_hit_rate: 0.8,
+  total_input_tokens: 4000,
+  total_cached_input_tokens: 3200,
+  total_uncached_input_tokens: 800,
+  cumulative_input_tokens: 4000,
+  cumulative_cached_input_tokens: 3200,
+  cumulative_uncached_input_tokens: 800,
+  cumulative_output_tokens: 120,
+  cumulative_cache_hit_rate: 0.8,
   context_tokens: 1000,
   model_context_window: 996147,
   cache_hit_rate: 0.8,
@@ -788,6 +825,7 @@ assert.match(
   /assignment ambiguous \/ unknown · ambiguous/,
 );
 assert.match(nativeAgentHtml, /usage partial/);
+assert.match(nativeAgentHtml, /已存储/);
 assert.match(
   nativeAgentHtml,
   /任务候选：T-NATIVE-1, T-NATIVE-2 · 需人工确认/,
@@ -798,10 +836,47 @@ assert.match(nativeAgentHtml, /Native thread 仅支持 same-task/);
 assert.match(nativeAgentHtml, /1,000 \/ 996,147/);
 assert.match(nativeAgentHtml, /80%/);
 assert.match(nativeAgentHtml, /200/);
+assert.match(nativeAgentHtml, /累计 input/);
+assert.match(nativeAgentHtml, /4,000/);
+assert.match(nativeAgentHtml, /累计 cache/);
+assert.match(nativeAgentHtml, /3,200/);
+assert.match(nativeAgentHtml, /累计 uncached \/ output/);
+assert.match(nativeAgentHtml, /800 \/ 120/);
+assert.match(
+  nativeAgentHtml,
+  /last request cache\/uncached 800 \/ 200 · 80%/,
+);
 assert.equal(
   hooks.renderBoard(secondBoard),
   true,
   "restoring managed diagnostics should redraw once",
+);
+
+const externalExecutionBoard = JSON.parse(JSON.stringify(secondBoard));
+externalExecutionBoard.tasks[0].status = "running";
+externalExecutionBoard.tasks[0].claimed_by = "main";
+externalExecutionBoard.tasks[0].lease_until = "2026-11-11T12:30:00Z";
+externalExecutionBoard.tasks[0].active_job = null;
+externalExecutionBoard.tasks[0].execution = {
+  source: "external_claim",
+  label: "外部 Agent",
+  actor: "main",
+  display_name: "main",
+};
+externalExecutionBoard.cluster_summary.active_executions = 1;
+externalExecutionBoard.cluster_summary.external_executions = 1;
+assert.equal(
+  hooks.renderBoard(externalExecutionBoard),
+  true,
+  "external claims without managed jobs should redraw",
+);
+const externalExecutionHtml = fakeElements.get("cards-running").innerHTML;
+assert.match(externalExecutionHtml, /认领 main/);
+assert.match(externalExecutionHtml, /外部 Agent · main/);
+assert.equal(
+  hooks.renderBoard(secondBoard),
+  true,
+  "restoring the managed board after external execution should redraw",
 );
 
 assert.match(taskCardHtml, /thread thread-task-1/);

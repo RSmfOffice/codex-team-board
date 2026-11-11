@@ -490,6 +490,15 @@ function renderCard(task) {
   const assigned = task.active_job
     ? `<span class="chip owner">已派发 ${escapeHtml(task.active_job.role)}</span>`
     : "";
+  const claimed = task.status === "running"
+    && task.claimed_by
+    && !task.active_job
+    ? `<span class="chip owner">认领 ${escapeHtml(task.claimed_by)}</span>`
+    : "";
+  const externalExecution = task.execution
+    && task.execution.source !== "managed_job"
+    ? `<span class="chip owner">${escapeHtml(task.execution.label || "执行中")} · ${escapeHtml(task.execution.display_name || task.execution.actor || "—")}</span>`
+    : "";
   const claimWait = task.status === "ready" && task.claim_wait_seconds
     ? `<span class="chip ${escapeHtml(task.claim_wait_state)}">等待认领 ${escapeHtml(ageText(task.claim_wait_seconds))}</span>`
     : "";
@@ -506,7 +515,7 @@ function renderCard(task) {
         <span class="chip">P${escapeHtml(task.priority)}</span>
         <span class="chip">${escapeHtml(task.project_name || "")}</span>
         <span class="chip workflow${workflowClass}">${escapeHtml(workflowEpochText(task.workflow_epoch))}</span>
-        ${blocker}${lease}${assigned}${claimWait}${archived}
+        ${blocker}${lease}${assigned}${claimed}${externalExecution}${claimWait}${archived}
       </div>
       ${jobRuntimeHtml(task.active_job)}
     </article>`;
@@ -566,6 +575,7 @@ function goalHealth(goal) {
     degraded: "降级",
     archived: "已归档",
     stalled: "已停滞",
+    canceled: "已取消",
   };
   const statusLabels = {
     planning: "规划中",
@@ -573,6 +583,7 @@ function goalHealth(goal) {
     paused: "已暂停",
     completed: "已完成",
     failed: "已终止",
+    canceled: "已取消",
   };
   const label = String(
     rawLabel
@@ -594,6 +605,7 @@ function nextActionText(goal) {
       paused: "可恢复目标继续推进",
       completed: "目标已完成，无需操作",
       failed: "目标已终止",
+      canceled: "目标已取消，无需操作",
     };
     return fallbacks[goal?.status] || "—";
   }
@@ -864,13 +876,28 @@ function renderCluster(goals, jobs, data) {
       goal.active_job_count,
       goalJobs.length,
     );
+    const goalExternalExecutions = (data.tasks || [])
+      .filter(
+        (task) =>
+          task.goal_id === goal.goal_id
+          && task.execution
+          && task.execution.source !== "managed_job",
+      );
+    const activeExecutionCount = nonNegativeNumber(
+      goal.active_execution_count,
+      activeJobCount + goalExternalExecutions.length,
+    );
     const heartbeatAge = waitDurationText(goal.heartbeat_age_seconds);
     const estimatedWait = waitDurationText(goal.estimated_wait_seconds);
-    const runText = goalJobs.length
-      ? goalJobs
-        .map((job) => `${job.kind}:${job.role} PID ${job.pid || "—"}`)
-        .join(" · ")
-      : "无活动进程";
+    const runText = [
+      ...goalJobs.map(
+        (job) => `${job.kind}:${job.role} PID ${job.pid || "—"}`,
+      ),
+      ...goalExternalExecutions.map(
+        (task) =>
+          `${task.execution.label}:${task.execution.display_name || task.execution.actor}`,
+      ),
+    ].join(" · ") || "无活动进程";
     const status = String(goal.status || "unknown");
     const controls = [];
     if (["planning", "active"].includes(status)) {
@@ -913,7 +940,7 @@ function renderCluster(goals, jobs, data) {
           <span class="chip owner">${escapeHtml(goal.autonomy)}</span>
           <span class="chip workflow${workflowClass}">${escapeHtml(workflowEpochText(goal.workflow_epoch))}</span>
           <span class="chip">lead ticks ${escapeHtml(goal.lead_ticks ?? 0)}</span>
-          <span class="chip active-jobs-chip">活动任务 ${escapeHtml(activeJobCount)} · ${escapeHtml(runText)}</span>
+          <span class="chip active-jobs-chip">执行中 ${escapeHtml(activeExecutionCount)} · ${escapeHtml(runText)}</span>
           ${checkpoint}
           ${goal.archived_at ? '<span class="chip archived">已归档</span>' : ""}
           ${health.attention ? '<span class="chip attention-chip">需关注</span>' : ""}
@@ -939,7 +966,11 @@ function renderCluster(goals, jobs, data) {
         ${controls.length ? `<div class="cluster-actions">${controls.join("")}</div>` : ""}
       </article>`;
   }).join("");
-  container.innerHTML = `<div class="cluster-title">${goals.length} 个目标 · ${activeJobs.length} 个活动进程</div>${cards}`;
+  const activeExecutionCount = (
+    (data.cluster_summary && data.cluster_summary.active_executions)
+    ?? activeJobs.length
+  );
+  container.innerHTML = `<div class="cluster-title">${goals.length} 个目标 · ${escapeHtml(activeExecutionCount)} 个活动执行</div>${cards}`;
 }
 
 function renderAgentThreads(agents, events = []) {
@@ -968,7 +999,9 @@ function renderAgentThreads(agents, events = []) {
     }
   }
   container.innerHTML = safeAgents.map((agent) => {
-    const status = String(agent.status || "unknown").toLowerCase();
+    const status = String(
+      agent.effective_status || agent.status || "unknown",
+    ).toLowerCase();
     const statusLabel = agentStatusLabels[status] || status;
     const workstream = agent.workstream_key ?? agent.workstream ?? "—";
     const thread = agent.thread_id ?? agent.thread ?? "—";
@@ -976,6 +1009,16 @@ function renderAgentThreads(agents, events = []) {
       .filter((value) => value !== undefined && value !== null && value !== "")
       .join(" · ") || "模型未知";
     const useLatestJobUsage = agent.cache_usage_source === "latest_job";
+    const cumulativeInput = agent.cumulative_input_tokens
+      ?? agent.total_input_tokens;
+    const cumulativeCached = agent.cumulative_cached_input_tokens
+      ?? agent.total_cached_input_tokens;
+    const cumulativeUncached = agent.cumulative_uncached_input_tokens
+      ?? agent.total_uncached_input_tokens;
+    const cumulativeOutput = agent.cumulative_output_tokens
+      ?? agent.output_tokens;
+    const cumulativeRate = agent.cumulative_cache_hit_rate
+      ?? agent.cache_hit_rate;
     const cached = useLatestJobUsage
       ? agent.latest_job_cached_input_tokens
       : agent.last_cached_input_tokens
@@ -990,6 +1033,7 @@ function renderAgentThreads(agents, events = []) {
     const windowTokens = useLatestJobUsage
       ? agent.latest_job_model_context_window
       : agent.model_context_window;
+    const usageScopeLabel = useLatestJobUsage ? "latest job" : "last request";
     const context = windowTokens !== undefined
       && windowTokens !== null
       && Number(windowTokens) > 0
@@ -1089,7 +1133,7 @@ function renderAgentThreads(agents, events = []) {
           <span>turn ${escapeHtml(turnText)}</span>
           <span>last ${escapeHtml(timeText(agent.last_used_at))}</span>
           <span>latest job ${escapeHtml(latestJob)}</span>
-          <span>last cache/uncached ${escapeHtml(tokenText(cached))} / ${escapeHtml(tokenText(uncached))}</span>
+          <span>${escapeHtml(usageScopeLabel)} cache/uncached ${escapeHtml(tokenText(cached))} / ${escapeHtml(tokenText(uncached))} · ${escapeHtml(cacheRateText(agent.last_cache_hit_rate, cached, uncached))}</span>
         </div>
         <div class="agent-thread-task">
           <div>任务：${escapeHtml(taskLabel)}</div>
@@ -1102,9 +1146,10 @@ function renderAgentThreads(agents, events = []) {
             : ""}
         </div>
         <div class="agent-thread-usage">
+          <div><span>累计 input</span><strong>${escapeHtml(tokenText(cumulativeInput))}</strong></div>
+          <div><span>累计 cache</span><strong>${escapeHtml(cacheRateText(cumulativeRate, cumulativeCached, cumulativeUncached))} · ${escapeHtml(tokenText(cumulativeCached))}</strong></div>
+          <div><span>累计 uncached / output</span><strong>${escapeHtml(tokenText(cumulativeUncached))} / ${escapeHtml(tokenText(cumulativeOutput))}</strong></div>
           <div><span>context</span><strong>${escapeHtml(context)}</strong></div>
-          <div><span>cache</span><strong>${escapeHtml(cacheRateText(agent.cache_hit_rate, cached, uncached))} · ${escapeHtml(tokenText(cached))}</strong></div>
-          <div><span>uncached</span><strong>${escapeHtml(tokenText(uncached))}</strong></div>
         </div>
         <div class="agent-thread-actions">
           <small>${escapeHtml(resetState)}</small>
@@ -1296,6 +1341,15 @@ function schedulePoll(delay) {
   }, delay);
 }
 
+function pollStatusText({
+  changed,
+  recovered = false,
+  now = new Date(),
+} = {}) {
+  const state = changed ? "已同步" : "已检查 · 无变化";
+  return `${state} ${now.toLocaleTimeString("zh-CN")}${recovered ? " · 已恢复" : ""}`;
+}
+
 async function pollBoard({ forceRender = false } = {}) {
   clearPollTimer();
   if (document.hidden) return false;
@@ -1306,6 +1360,7 @@ async function pollBoard({ forceRender = false } = {}) {
   }
   pollInFlight = true;
   activeRequest = new AbortController();
+  let boardRendered = false;
   try {
     if (!projectsLoaded) {
       await loadProjects(activeRequest.signal);
@@ -1344,14 +1399,19 @@ async function pollBoard({ forceRender = false } = {}) {
       if (!boardResponse.notModified) {
         const data = boardResponse.data;
         boardEtag = boardResponse.etag;
-        renderBoard(data, { force: forceRender });
+        boardRendered = renderBoard(data, { force: forceRender });
         lastBoardRevision = String(data.revision || revision);
+      } else {
+        lastBoardRevision = revision;
       }
     }
     const downBefore = pollFailures > 0;
     pollFailures = 0;
     setConnectionState(
-      `${boardRequired ? "已同步" : "已检查 · 无变化"} ${new Date().toLocaleTimeString("zh-CN")}${downBefore ? " · 已恢复" : ""}`,
+      pollStatusText({
+        changed: boardRendered,
+        recovered: downBefore,
+      }),
       "ok",
     );
     schedulePoll(POLL_INTERVAL_MS);
@@ -1677,6 +1737,7 @@ if (typeof window !== "undefined") {
     jobRuntimeHtml,
     nextActionText,
     renderBoard,
+    pollStatusText,
     renderAgentThreads,
     requestRevisableJson,
     summaryNumber,

@@ -2188,6 +2188,12 @@ class TeamFlowTests(unittest.TestCase):
         self.assertEqual(agent["ledger_total_cached_input_tokens"], 600)
         self.assertEqual(agent["ledger_total_uncached_input_tokens"], 200)
         self.assertEqual(agent["cache_hit_rate"], 0.75)
+        self.assertEqual(agent["cumulative_input_tokens"], 800)
+        self.assertEqual(agent["cumulative_cached_input_tokens"], 600)
+        self.assertEqual(agent["cumulative_uncached_input_tokens"], 200)
+        self.assertEqual(agent["cumulative_output_tokens"], 120)
+        self.assertEqual(agent["cumulative_cache_hit_rate"], 0.75)
+        self.assertEqual(agent["last_cache_hit_rate"], 0.75)
 
     def test_native_thread_registration_and_correlated_task_events(self) -> None:
         task = self.team.create_task(
@@ -2290,6 +2296,140 @@ class TeamFlowTests(unittest.TestCase):
         )
         self.assertEqual(dashboard_agent["runtime"], "native")
         self.assertEqual(dashboard_agent["prompt_status"], "delivered")
+
+    def test_dashboard_exposes_native_and_external_claims_without_jobs(
+        self,
+    ) -> None:
+        manager = ClusterManager(
+            self.settings,
+            team=self.team,
+            worktrees=self.worktrees,
+            runtime_mode="exec",
+        )
+        goal = manager.create_goal(
+            self.repo,
+            objective="Expose claims without managed jobs",
+        )
+        native_task = self.team.create_task(
+            self.repo,
+            title="Native claim execution",
+            description="Claim without a managed job.",
+            acceptance="Dashboard identifies the native execution.",
+            kind="read",
+            owner_role="team_explorer",
+            goal_id=str(goal["goal_id"]),
+        )
+        external_task = self.team.create_task(
+            self.repo,
+            title="Main claim execution",
+            description="Claim without a managed job.",
+            acceptance="Dashboard identifies the external execution.",
+            kind="read",
+            owner_role="team_explorer",
+            goal_id=str(goal["goal_id"]),
+        )
+        agent_id = "A-NATIVE-CLAIM-VISIBILITY"
+        thread_id = "01a1cafe-7777-7888-8999-aaaaaaaaaaaa"
+        now = utc_now()
+        with self.team.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO cluster_agents(
+                    agent_id, project_id, role, workstream_key,
+                    display_name, thread_id, runtime, actor,
+                    prompt_status, profile, status, lifecycle,
+                    lifecycle_source, session_stale, created_at, updated_at
+                ) VALUES (
+                    ?, ?, 'team_explorer', 'native-claim',
+                    'Native Claim', ?, 'native', 'native-claim-worker',
+                    'delivered', 'native', 'stored', 'idle',
+                    'session_events', 1, ?, ?
+                )
+                """,
+                (
+                    agent_id,
+                    native_task["project_id"],
+                    thread_id,
+                    now,
+                    now,
+                ),
+            )
+        self.team.claim_task(
+            str(native_task["task_id"]),
+            actor="native-claim-worker",
+        )
+        self.team.claim_task(
+            str(external_task["task_id"]),
+            actor="main",
+        )
+
+        dashboard = self.team.dashboard_snapshot(
+            str(native_task["project_id"])
+        )
+        self.assertEqual(dashboard["cluster_summary"]["active_jobs"], 0)
+        self.assertEqual(
+            dashboard["cluster_summary"]["active_executions"],
+            2,
+        )
+        self.assertEqual(
+            dashboard["cluster_summary"]["external_executions"],
+            2,
+        )
+        self.assertEqual(
+            dashboard["cluster_summary"]["native_executions"],
+            1,
+        )
+        tasks = {
+            task["task_id"]: task for task in dashboard["tasks"]
+        }
+        self.assertEqual(
+            tasks[str(native_task["task_id"])]["execution"]["source"],
+            "native_claim",
+        )
+        self.assertEqual(
+            tasks[str(external_task["task_id"])]["execution"]["source"],
+            "external_claim",
+        )
+        dashboard_goal = next(
+            item
+            for item in dashboard["cluster_goals"]
+            if item["goal_id"] == goal["goal_id"]
+        )
+        self.assertEqual(dashboard_goal["active_job_count"], 0)
+        self.assertEqual(dashboard_goal["active_execution_count"], 2)
+        with self.team.connection(write=False) as connection:
+            agent = dict(
+                connection.execute(
+                    """
+                    SELECT current_task_id, current_goal_id, status,
+                           lifecycle, assignment_source, assignment_confidence,
+                           session_stale
+                    FROM cluster_agents WHERE agent_id = ?
+                    """,
+                    (agent_id,),
+                ).fetchone()
+            )
+            agent_events = [
+                row["event_type"]
+                for row in connection.execute(
+                    """
+                    SELECT event_type FROM cluster_agent_events
+                    WHERE agent_id = ? ORDER BY event_id
+                    """,
+                    (agent_id,),
+                ).fetchall()
+            ]
+        self.assertEqual(
+            agent["current_task_id"],
+            native_task["task_id"],
+        )
+        self.assertEqual(agent["current_goal_id"], goal["goal_id"])
+        self.assertEqual(agent["status"], "loaded")
+        self.assertEqual(agent["lifecycle"], "active")
+        self.assertEqual(agent["assignment_source"], "claim")
+        self.assertEqual(agent["assignment_confidence"], "high")
+        self.assertEqual(agent["session_stale"], 0)
+        self.assertIn("native_task_bound", agent_events)
 
     def test_native_heartbeat_refreshes_agent_freshness_atomically(self) -> None:
         task = self.team.create_task(
@@ -2845,7 +2985,10 @@ class TeamFlowTests(unittest.TestCase):
             autonomy="auto",
         )
         manager.set_goal_status(goal["goal_id"], "active")
-        with self.assertRaisesRegex(TeamError, "only completed or failed"):
+        with self.assertRaisesRegex(
+            TeamError,
+            "only completed, canceled, or failed",
+        ):
             manager.set_goal_archived(goal["goal_id"], True)
 
         cascaded = self.team.create_task(

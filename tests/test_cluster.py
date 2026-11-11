@@ -1571,6 +1571,80 @@ class ClusterSchedulerTests(unittest.TestCase):
                 1,
             )
 
+    def test_recover_releases_orphan_auto_worker_reservation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            repo = _repo(base, "orphan-reservation")
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime_mode="exec",
+            )
+            try:
+                goal, tasks = self._goal_with_ready_tasks(
+                    manager,
+                    team,
+                    repo,
+                    1,
+                )
+                task = tasks[0]
+                actor = manager._worker_actor(
+                    str(task["owner_role"]),
+                    str(task["task_id"]),
+                    "J-ORPHAN-RESERVATION",
+                )
+                team.claim_task(
+                    str(task["task_id"]),
+                    actor=actor,
+                    lease_minutes=10,
+                )
+                manager.worker_reservation_grace_seconds = 0
+                recovered = (
+                    manager._recover_orphan_worker_reservations()
+                )
+                self.assertEqual(recovered["count"], 1)
+                self.assertEqual(recovered["released"], 1)
+                current = team.get_task(str(task["task_id"]))
+                self.assertEqual(current["status"], "ready")
+                self.assertIsNone(current["claimed_by"])
+                events = manager.get_goal(goal["goal_id"])["events"]
+                self.assertTrue(
+                    any(
+                        item["event_type"]
+                        == "worker_reservation_released"
+                        and item["data"]["task_id"] == task["task_id"]
+                        for item in events
+                    )
+                )
+
+                foreign = team.create_task(
+                    repo,
+                    title="Foreign claim",
+                    description="A non-scheduler claim must be preserved.",
+                    acceptance="Recovery ignores external owners.",
+                    kind="read",
+                    owner_role="team_explorer",
+                    goal_id=goal["goal_id"],
+                )
+                team.claim_task(
+                    str(foreign["task_id"]),
+                    actor="external-worker",
+                    lease_minutes=10,
+                )
+                preserved = (
+                    manager._recover_orphan_worker_reservations()
+                )
+                self.assertEqual(preserved["count"], 0)
+                self.assertEqual(preserved["released"], 0)
+                self.assertEqual(
+                    team.get_task(str(foreign["task_id"]))["claimed_by"],
+                    "external-worker",
+                )
+            finally:
+                manager.close()
+
     def test_dispatch_claim_conflict_does_not_start_or_replace_job(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
@@ -5118,7 +5192,22 @@ class ClusterSchedulerTests(unittest.TestCase):
                     active["goal_id"],
                     reason="guard test",
                 )
-                self.assertEqual(canceled["status"], "failed")
+                self.assertEqual(canceled["status"], "canceled")
+                self.assertEqual(canceled["raw_status"], "failed")
+                self.assertIn(
+                    active["goal_id"],
+                    {
+                        item["goal_id"]
+                        for item in manager.list_goals(["canceled"])
+                    },
+                )
+                self.assertNotIn(
+                    active["goal_id"],
+                    {
+                        item["goal_id"]
+                        for item in manager.list_goals(["failed"])
+                    },
+                )
                 self.assertFalse(
                     [
                         job
@@ -5225,7 +5314,8 @@ class ClusterSchedulerTests(unittest.TestCase):
                     failed_cancel_goal["goal_id"],
                     reason="interrupt failure test",
                 )
-            self.assertEqual(failed_cancel["status"], "failed")
+            self.assertEqual(failed_cancel["status"], "canceled")
+            self.assertEqual(failed_cancel["raw_status"], "failed")
             converged_job = next(
                 job
                 for job in failed_cancel["jobs"]
@@ -5241,6 +5331,78 @@ class ClusterSchedulerTests(unittest.TestCase):
                 interrupt_event["data"]["job_id"],
                 failed_cancel_job["job_id"],
             )
+
+    def test_failed_goal_reconciles_to_completed_when_all_tasks_are_done(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            repo = _repo(base, "terminal-reconcile")
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime_mode="exec",
+            )
+            try:
+                goal = manager.create_goal(
+                    repo,
+                    objective="Reconcile delivered work",
+                )
+                task = team.create_task(
+                    repo,
+                    title="Delivered task",
+                    description="The goal failed after delivery.",
+                    acceptance="Completed tasks reconcile the goal.",
+                    kind="read",
+                    owner_role="team_explorer",
+                    goal_id=goal["goal_id"],
+                )
+                claimed = team.claim_task(
+                    str(task["task_id"]),
+                    actor="reconcile-worker",
+                )
+                team.submit_task(
+                    str(task["task_id"]),
+                    actor="reconcile-worker",
+                    claim_token=claimed["claim_token"],
+                    result="delivered manually",
+                    tests="fixture",
+                )
+                team.review_task(
+                    str(task["task_id"]),
+                    actor="lead",
+                    approve=True,
+                    notes="done",
+                )
+                manager.set_goal_status(
+                    goal["goal_id"],
+                    "failed",
+                    reason="infrastructure stream failed",
+                )
+                result = manager._reconcile_delivered_terminal_goals()
+                self.assertEqual(result["reconciled"], 1)
+                reconciled = manager.get_goal(goal["goal_id"])
+                self.assertEqual(reconciled["status"], "completed")
+                self.assertEqual(reconciled["raw_status"], "completed")
+                self.assertIsNotNone(reconciled["completed_at"])
+                event = next(
+                    item
+                    for item in reconciled["events"]
+                    if item["event_type"]
+                    == "goal_status_reconciled"
+                )
+                self.assertEqual(
+                    event["data"]["previous_status"],
+                    "failed",
+                )
+                self.assertEqual(
+                    event["data"]["task_ids"],
+                    [task["task_id"]],
+                )
+            finally:
+                manager.close()
 
     def test_app_server_cancel_persists_logged_usage_without_breaking_completion(
         self,
