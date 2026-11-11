@@ -740,7 +740,8 @@ class AgentPool:
                     )
                 if existing["project_id"] != project_id:
                     raise AgentPoolError(
-                        "native thread project ownership is immutable"
+                        "native thread cannot move to a different project; "
+                        "project ownership is immutable"
                     )
                 if existing["workstream_key"] != workstream_key:
                     raise AgentPoolError(

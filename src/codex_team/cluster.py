@@ -1562,48 +1562,51 @@ class ClusterManager:
             resolved_assignment_source = "ambiguous"
             resolved_assignment_confidence = "unknown"
             assignment_ambiguous = True
-        agent = self.agent_pool.register_native_thread(
-            str(project["project_id"]),
-            effective_role,
-            workstream_key,
-            thread_id,
-            actor,
-            task_id=task_id,
-            parent_thread_id=inspection.get("parent_thread_id"),
-            agent_path=inspection.get("agent_path"),
-            agent_nickname=inspection.get("agent_nickname"),
-            display_name=display_name,
-            model=model,
-            model_provider=model_provider,
-            prompt_hash=str(inspection.get("prompt_hash") or ""),
-            prompt_status=str(
-                inspection.get("prompt_status") or "unknown"
-            ),
-            native_session_path=inspection.get("session_path"),
-            native_session_mtime_ns=int(
-                inspection.get("session_mtime_ns") or 0
-            ),
-            native_session_size=int(
-                inspection.get("session_size") or 0
-            ),
-            last_seen_at=inspection.get("last_seen_at"),
-            usage=(
-                inspection.get("usage")
-                if isinstance(inspection.get("usage"), Mapping)
-                else None
-            ),
-            identity_source=resolved_identity_source,
-            identity_confidence=resolved_identity_confidence,
-            lifecycle=str(inspection.get("lifecycle") or "unknown"),
-            lifecycle_source=str(
-                inspection.get("lifecycle_source") or "unknown"
-            ),
-            assignment_source=resolved_assignment_source,
-            assignment_confidence=resolved_assignment_confidence,
-            task_candidates=candidates,
-            task_assignment_ambiguous=assignment_ambiguous,
-            session_stale=bool(inspection.get("session_stale", True)),
-        )
+        try:
+            agent = self.agent_pool.register_native_thread(
+                str(project["project_id"]),
+                effective_role,
+                workstream_key,
+                thread_id,
+                actor,
+                task_id=task_id,
+                parent_thread_id=inspection.get("parent_thread_id"),
+                agent_path=inspection.get("agent_path"),
+                agent_nickname=inspection.get("agent_nickname"),
+                display_name=display_name,
+                model=model,
+                model_provider=model_provider,
+                prompt_hash=str(inspection.get("prompt_hash") or ""),
+                prompt_status=str(
+                    inspection.get("prompt_status") or "unknown"
+                ),
+                native_session_path=inspection.get("session_path"),
+                native_session_mtime_ns=int(
+                    inspection.get("session_mtime_ns") or 0
+                ),
+                native_session_size=int(
+                    inspection.get("session_size") or 0
+                ),
+                last_seen_at=inspection.get("last_seen_at"),
+                usage=(
+                    inspection.get("usage")
+                    if isinstance(inspection.get("usage"), Mapping)
+                    else None
+                ),
+                identity_source=resolved_identity_source,
+                identity_confidence=resolved_identity_confidence,
+                lifecycle=str(inspection.get("lifecycle") or "unknown"),
+                lifecycle_source=str(
+                    inspection.get("lifecycle_source") or "unknown"
+                ),
+                assignment_source=resolved_assignment_source,
+                assignment_confidence=resolved_assignment_confidence,
+                task_candidates=candidates,
+                task_assignment_ambiguous=assignment_ambiguous,
+                session_stale=bool(inspection.get("session_stale", True)),
+            )
+        except AgentPoolError as exc:
+            raise ClusterError(str(exc)) from exc
         if task_id:
             event_type = (
                 "native_prompt_missing"
@@ -4042,6 +4045,7 @@ Do not return raw logs or a full transcript.
             raise ClusterError("lead tick limit exceeded")
         checkpoint = self._checkpoint_context(goal)
         board = self._lead_board_digest(goal, tasks, checkpoint)
+        authority_token = self.team.operator_authority()
         turn_input = f"""# Current Goal
 {goal["objective"]}
 
@@ -4059,6 +4063,12 @@ Do not return raw logs or a full transcript.
   durable decisions, completed work, tests, rejected approaches, risks, and
   next action.
 - Do not copy raw logs or full transcripts into the checkpoint.
+
+## Local Authority
+- Privileged Team Board MCP operations require this local authority token:
+  `{authority_token}`
+- Keep it private. Never include it in checkpoints, task descriptions, logs,
+  results, messages, or other durable text.
 """
         return self._start_job(
             goal,

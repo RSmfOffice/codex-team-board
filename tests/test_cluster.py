@@ -2345,17 +2345,34 @@ class ClusterSchedulerTests(unittest.TestCase):
                 runtime_mode="exec",
             )
             try:
-                goal = manager.create_goal(
+                poison_goal = manager.create_goal(
                     repo,
-                    objective="Settle independent jobs",
+                    objective="Settle poisoned job",
+                )
+                manager.set_goal_status(
+                    poison_goal["goal_id"],
+                    "failed",
+                    reason="fixture boundary",
+                )
+                healthy_goal = manager.create_goal(
+                    repo,
+                    objective="Settle healthy job",
                 )
                 now = utc_now()
                 jobs = (
-                    ("J-POISON", "2026-11-11T00:00:00Z"),
-                    ("J-HEALTHY", "2026-11-11T00:00:01Z"),
+                    (
+                        "J-POISON",
+                        poison_goal["goal_id"],
+                        "2026-11-11T00:00:00Z",
+                    ),
+                    (
+                        "J-HEALTHY",
+                        healthy_goal["goal_id"],
+                        "2026-11-11T00:00:01Z",
+                    ),
                 )
                 with team.connection() as connection:
-                    for job_id, started_at in jobs:
+                    for job_id, goal_id, started_at in jobs:
                         log_path = base / f"{job_id}.jsonl"
                         output_path = base / f"{job_id}.md"
                         log_path.write_text("", encoding="utf-8")
@@ -2370,7 +2387,7 @@ class ClusterSchedulerTests(unittest.TestCase):
                             """,
                             (
                                 job_id,
-                                goal["goal_id"],
+                                goal_id,
                                 str(log_path),
                                 str(output_path),
                                 started_at,
@@ -4016,9 +4033,13 @@ class ClusterSchedulerTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.stdin = io.StringIO()
                 self.stdout = io.StringIO()
+                self.stderr = io.StringIO()
 
             def poll(self) -> None:
                 return None
+
+            def wait(self, timeout: float | None = None) -> int:
+                return 0
 
         for case_name in ("thread", "turn"):
             with (
@@ -5028,6 +5049,11 @@ class ClusterSchedulerTests(unittest.TestCase):
                 completed = manager.create_goal(
                     repo,
                     objective="Already complete",
+                )
+                manager.set_goal_status(
+                    completed["goal_id"],
+                    "active",
+                    reason="fixture activate",
                 )
                 manager.set_goal_status(
                     completed["goal_id"],
@@ -6399,6 +6425,7 @@ class ClusterSchedulerTests(unittest.TestCase):
                     thread_id,
                     cwd=repo_a,
                     task_id=task_a["task_id"],
+                    role="team_explorer",
                 )
                 old = time.time() - 3600
                 os.utime(path, (old, old))
@@ -6453,6 +6480,7 @@ class ClusterSchedulerTests(unittest.TestCase):
                     thread_id,
                     cwd=repo_a,
                     task_id=task_a["task_id"],
+                    role="team_explorer",
                 )
                 with patch.dict(
                     os.environ,
@@ -6467,7 +6495,11 @@ class ClusterSchedulerTests(unittest.TestCase):
                         actor="native-refresh-test",
                         project_id=goal_a["project_id"],
                     )
-                self.assertEqual(first_sync["refreshed_count"], 1)
+                self.assertEqual(
+                    first_sync["refreshed_count"],
+                    1,
+                    first_sync,
+                )
                 refreshed = AgentPool(settings).list_agents(
                     goal_a["project_id"],
                 )[0]
@@ -6491,6 +6523,7 @@ class ClusterSchedulerTests(unittest.TestCase):
                     thread_id,
                     cwd=repo_b,
                     task_id=task_b["task_id"],
+                    role="team_explorer",
                 )
                 with patch.dict(
                     os.environ,
