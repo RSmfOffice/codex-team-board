@@ -19,7 +19,12 @@ from .cache_contract import (
     workflow_epoch as build_workflow_epoch,
 )
 from .config import Settings
-from .db import connect, connect_readonly, utc_now
+from .db import (
+    connect,
+    connect_readonly,
+    read_dashboard_revision,
+    utc_now,
+)
 from .scheduling import (
     DEFAULT_GLOBAL_JOB_CAPACITY,
     DEFAULT_GOAL_WORKER_CAPACITY,
@@ -379,6 +384,8 @@ class TeamService:
                     name = excluded.name,
                     root_path = excluded.root_path,
                     updated_at = excluded.updated_at
+                WHERE projects.name IS NOT excluded.name
+                   OR projects.root_path IS NOT excluded.root_path
                 """,
                 (project_id, root.name, str(root), now, now),
             )
@@ -1132,195 +1139,19 @@ class TeamService:
         }
 
     @staticmethod
+    def _begin_snapshot(connection: sqlite3.Connection) -> None:
+        """Pin all reads in this method to one SQLite snapshot."""
+
+        connection.execute("BEGIN DEFERRED")
+
+    @staticmethod
     def _dashboard_revision(
         connection: sqlite3.Connection,
         project_id: str | None,
         include_archived: bool,
     ) -> str:
-        project_where = ["1 = 1"]
-        project_params: list[Any] = []
-        if project_id:
-            project_where.append("project_id = ?")
-            project_params.append(project_id)
-        elif not include_archived:
-            project_where.append("archived_at IS NULL")
-
-        task_where = ["1 = 1"]
-        task_params: list[Any] = []
-        if project_id:
-            task_where.append("t.project_id = ?")
-            task_params.append(project_id)
-        elif not include_archived:
-            task_where.append("p.archived_at IS NULL")
-        if not include_archived:
-            task_where.extend(
-                [
-                    "t.archived_at IS NULL",
-                    "(g.goal_id IS NULL OR g.archived_at IS NULL)",
-                ]
-            )
-
-        goal_where = ["1 = 1"]
-        goal_params: list[Any] = []
-        if project_id:
-            goal_where.append("g.project_id = ?")
-            goal_params.append(project_id)
-        elif not include_archived:
-            goal_where.append("p.archived_at IS NULL")
-        if not include_archived:
-            goal_where.append("g.archived_at IS NULL")
-
-        agent_where = ["1 = 1"]
-        agent_params: list[Any] = []
-        if project_id:
-            agent_where.append("a.project_id = ?")
-            agent_params.append(project_id)
-        elif not include_archived:
-            agent_where.append("p.archived_at IS NULL")
-        if not include_archived:
-            agent_where.append("a.archived_at IS NULL")
-
-        message_where = ["1 = 1"]
-        message_params: list[Any] = []
-        if project_id:
-            message_where.append("m.project_id = ?")
-            message_params.append(project_id)
-        elif not include_archived:
-            message_where.append("p.archived_at IS NULL")
-        if not include_archived:
-            message_where.append(
-                "(t.task_id IS NULL OR t.archived_at IS NULL)"
-            )
-
-        signature = {
-            "projects": connection.execute(
-                f"""
-                SELECT COUNT(*) AS count,
-                       COALESCE(MAX(updated_at), '') AS latest
-                FROM projects
-                WHERE {' AND '.join(project_where)}
-                """,
-                tuple(project_params),
-            ).fetchone(),
-            "tasks": connection.execute(
-                f"""
-                SELECT COUNT(*) AS count,
-                       COALESCE(MAX(t.updated_at), '') AS latest,
-                       COALESCE(SUM(t.version), 0) AS versions
-                FROM tasks t
-                JOIN projects p ON p.project_id = t.project_id
-                LEFT JOIN cluster_goals g ON g.goal_id = t.goal_id
-                WHERE {' AND '.join(task_where)}
-                """,
-                tuple(task_params),
-            ).fetchone(),
-            "goals": connection.execute(
-                f"""
-                SELECT COUNT(*) AS count,
-                       COALESCE(MAX(g.updated_at), '') AS latest,
-                       COALESCE(SUM(g.lead_ticks), 0) AS lead_ticks
-                FROM cluster_goals g
-                JOIN projects p ON p.project_id = g.project_id
-                WHERE {' AND '.join(goal_where)}
-                """,
-                tuple(goal_params),
-            ).fetchone(),
-            "agents": connection.execute(
-                f"""
-                SELECT COUNT(*) AS count,
-                       COALESCE(MAX(a.updated_at), '') AS latest,
-                       COALESCE(SUM(a.turn_count), 0) AS turns,
-                       COALESCE(SUM(a.total_cached_input_tokens), 0)
-                           AS cached_input_tokens,
-                       COALESCE(SUM(a.total_uncached_input_tokens), 0)
-                           AS uncached_input_tokens
-                FROM cluster_agents a
-                JOIN projects p ON p.project_id = a.project_id
-                WHERE {' AND '.join(agent_where)}
-                """,
-                tuple(agent_params),
-            ).fetchone(),
-            "jobs": connection.execute(
-                f"""
-                SELECT COUNT(*) AS count,
-                       COALESCE(
-                           MAX(COALESCE(j.finished_at, j.started_at)),
-                           ''
-                       ) AS latest,
-                       SUM(CASE WHEN j.status = 'starting' THEN 1 ELSE 0 END)
-                           AS starting,
-                       SUM(CASE WHEN j.status = 'running' THEN 1 ELSE 0 END)
-                           AS running,
-                       SUM(CASE WHEN j.status = 'failed' THEN 1 ELSE 0 END)
-                           AS failed,
-                       COALESCE(SUM(j.input_tokens), 0) AS input_tokens,
-                       COALESCE(SUM(j.cached_input_tokens), 0)
-                           AS cached_input_tokens,
-                       COALESCE(SUM(j.uncached_input_tokens), 0)
-                           AS uncached_input_tokens,
-                       COALESCE(SUM(j.context_tokens), 0) AS context_tokens
-                FROM cluster_jobs j
-                JOIN cluster_goals g ON g.goal_id = j.goal_id
-                JOIN projects p ON p.project_id = g.project_id
-                WHERE {' AND '.join(goal_where)}
-                """,
-                tuple(goal_params),
-            ).fetchone(),
-            "task_events": connection.execute(
-                f"""
-                SELECT COALESCE(MAX(e.event_id), 0) AS latest
-                FROM task_events e
-                JOIN tasks t ON t.task_id = e.task_id
-                JOIN projects p ON p.project_id = t.project_id
-                LEFT JOIN cluster_goals g ON g.goal_id = t.goal_id
-                WHERE {' AND '.join(task_where)}
-                """,
-                tuple(task_params),
-            ).fetchone(),
-            "goal_events": connection.execute(
-                f"""
-                SELECT COALESCE(MAX(e.event_id), 0) AS latest
-                FROM cluster_events e
-                JOIN cluster_goals g ON g.goal_id = e.goal_id
-                JOIN projects p ON p.project_id = g.project_id
-                WHERE {' AND '.join(goal_where)}
-                """,
-                tuple(goal_params),
-            ).fetchone(),
-            "agent_events": connection.execute(
-                f"""
-                SELECT COALESCE(MAX(e.event_id), 0) AS latest
-                FROM cluster_agent_events e
-                JOIN cluster_agents a ON a.agent_id = e.agent_id
-                JOIN projects p ON p.project_id = a.project_id
-                WHERE {' AND '.join(agent_where)}
-                """,
-                tuple(agent_params),
-            ).fetchone(),
-            "messages": connection.execute(
-                f"""
-                SELECT COUNT(*) AS count,
-                       COALESCE(MAX(m.message_id), 0) AS latest
-                FROM messages m
-                JOIN projects p ON p.project_id = m.project_id
-                LEFT JOIN tasks t ON t.task_id = m.task_id
-                WHERE {' AND '.join(message_where)}
-                """,
-                tuple(message_params),
-            ).fetchone(),
-        }
-        canonical: dict[str, dict[str, Any]] = {}
-        for name, row in signature.items():
-            canonical[name] = dict(row) if row is not None else {}
-        digest = hashlib.sha256(
-            json.dumps(
-                canonical,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()[:24]
-        return f"v1:{digest}"
+        del project_id, include_archived
+        return f"v2:{read_dashboard_revision(connection)}"
 
     def dashboard_revision(
         self,
@@ -1329,6 +1160,7 @@ class TeamService:
         include_archived: bool = False,
     ) -> str:
         with self.connection(write=False) as connection:
+            self._begin_snapshot(connection)
             return self._dashboard_revision(
                 connection,
                 project_id,
@@ -1356,6 +1188,7 @@ class TeamService:
             DEFAULT_HEARTBEAT_WARNING_SECONDS,
         )
         with self.connection(write=False) as connection:
+            self._begin_snapshot(connection)
             if project_id:
                 projects = [
                     dict(row)
@@ -1602,6 +1435,7 @@ class TeamService:
             where.append("e.event_id < ?")
             parameters.append(int(before_event_id))
         with self.connection(write=False) as connection:
+            self._begin_snapshot(connection)
             rows = connection.execute(
                 f"""
                 SELECT e.event_id, e.task_id, e.event_type, e.actor,
@@ -1725,6 +1559,7 @@ class TeamService:
             ),
         )
         with self.connection(write=False) as connection:
+            self._begin_snapshot(connection)
             if project_id:
                 project_rows = connection.execute(
                     "SELECT * FROM projects WHERE project_id = ?",

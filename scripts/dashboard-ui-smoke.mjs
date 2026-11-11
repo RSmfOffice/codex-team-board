@@ -178,6 +178,32 @@ expectText(
 );
 expectText(pollBoardSource, "boardRequired", "pollBoard revision gate");
 expectText(pollBoardSource, "/api/board", "pollBoard conditional board fetch");
+expectText(
+  pollBoardSource,
+  "requestRevisableJson",
+  "pollBoard conditional requests",
+);
+expectText(pollBoardSource, "summaryEtag", "pollBoard summary validator");
+expectText(
+  pollBoardSource,
+  "lastSummaryRevision",
+  "pollBoard summary revision cache",
+);
+const revisableRequestSource = between(
+  app,
+  "async function requestRevisableJson",
+  "function fillProjectSelect",
+);
+expectText(
+  revisableRequestSource,
+  'headers["If-None-Match"] = etag',
+  "If-None-Match validator",
+);
+expectText(
+  revisableRequestSource,
+  "response.status === 304",
+  "not-modified response handling",
+);
 
 const visibilitySource = between(
   app,
@@ -198,9 +224,28 @@ expectText(scheduleSource, "document.hidden", "poll scheduler");
 
 const documentObject = { getElementById: () => null };
 const window = {};
+const fetchCalls = [];
+async function fakeFetch(url, options = {}) {
+  fetchCalls.push({ url, options });
+  if (url === "/etag-unchanged") {
+    return {
+      status: 304,
+      ok: false,
+      headers: { get: () => 'W/"v2:1"' },
+      json: async () => ({}),
+    };
+  }
+  return {
+    status: 200,
+    ok: true,
+    headers: { get: () => 'W/"v2:2"' },
+    json: async () => ({ revision: "v2:2" }),
+  };
+}
 const context = vm.createContext({
   window,
   document: documentObject,
+  fetch: fakeFetch,
   console,
   URLSearchParams,
   AbortController,
@@ -210,6 +255,28 @@ const context = vm.createContext({
 vm.runInContext(app, context, { filename: "src/codex_team/web/app.js" });
 const hooks = window.TeamBoardTestHooks;
 assert.ok(hooks, "app.js did not expose test hooks");
+
+const unchangedResponse = await hooks.requestRevisableJson(
+  "/etag-unchanged",
+  { cache: "no-store" },
+  "etag",
+  'W/"v2:1"',
+);
+assert.equal(unchangedResponse.notModified, true);
+assert.equal(unchangedResponse.etag, 'W/"v2:1"');
+assert.equal(
+  fetchCalls[0].options.headers["If-None-Match"],
+  'W/"v2:1"',
+);
+const changedResponse = await hooks.requestRevisableJson(
+  "/etag-changed",
+  { cache: "no-store" },
+  "etag",
+  'W/"v2:1"',
+);
+assert.equal(changedResponse.notModified, false);
+assert.equal(changedResponse.data.revision, "v2:2");
+assert.equal(changedResponse.etag, 'W/"v2:2"');
 
 function fakeElement() {
   const classes = new Set();

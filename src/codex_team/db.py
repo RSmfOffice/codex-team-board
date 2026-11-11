@@ -6,7 +6,29 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 25
+
+# Shared revision contract:
+# - `dashboard_revision.revision` is a non-negative, monotonically increasing
+#   integer for the whole database.
+# - The semantic-table triggers below are the only writers. Each inserted,
+#   updated, or deleted row advances the value exactly once in that SQLite
+#   transaction, so rollbacks also roll back the revision.
+# - TeamService and the Dashboard HTTP API read this value; WebUI compares the
+#   contextualized API revision. New Dashboard semantic tables must be added to
+#   DASHBOARD_REVISION_TABLES and covered by the trigger contract test.
+DASHBOARD_REVISION_TABLES = (
+    "projects",
+    "tasks",
+    "task_dependencies",
+    "task_events",
+    "messages",
+    "cluster_goals",
+    "cluster_jobs",
+    "cluster_agents",
+    "cluster_agent_events",
+    "cluster_events",
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
@@ -269,6 +291,14 @@ CREATE TABLE IF NOT EXISTS cluster_events (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS dashboard_revision (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    revision INTEGER NOT NULL CHECK(revision >= 0)
+);
+
+INSERT OR IGNORE INTO dashboard_revision(singleton, revision)
+VALUES (1, 0);
+
 CREATE TABLE IF NOT EXISTS metadata (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -279,6 +309,30 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
     applied_at TEXT NOT NULL
 );
 """
+
+
+def _revision_trigger_sql() -> str:
+    statements: list[str] = []
+    for table in DASHBOARD_REVISION_TABLES:
+        for operation in ("INSERT", "UPDATE", "DELETE"):
+            trigger = (
+                f"trg_dashboard_revision_{table}_{operation.lower()}"
+            )
+            statements.append(
+                f"""
+CREATE TRIGGER IF NOT EXISTS {trigger}
+AFTER {operation} ON {table}
+BEGIN
+    UPDATE dashboard_revision
+    SET revision = revision + 1
+    WHERE singleton = 1;
+END;
+""".strip()
+            )
+    return "\n\n".join(statements)
+
+
+REVISION_TRIGGERS = _revision_trigger_sql()
 
 INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_tasks_project_status
@@ -469,6 +523,7 @@ def connect(path: Path) -> sqlite3.Connection:
                 connection,
                 previous_schema_version=previous_schema_version,
             )
+            connection.executescript(REVISION_TRIGGERS)
             connection.executescript(INDEXES)
             connection.execute(
                 """
@@ -497,6 +552,24 @@ def connect(path: Path) -> sqlite3.Connection:
                 connection.close()
             raise
     raise sqlite3.OperationalError("database initialization retry exhausted")
+
+
+def read_dashboard_revision(connection: sqlite3.Connection) -> int:
+    """Return the committed or transaction-visible monotonic revision."""
+
+    row = connection.execute(
+        """
+        SELECT revision
+        FROM dashboard_revision
+        WHERE singleton = 1
+        """
+    ).fetchone()
+    if row is None:
+        raise sqlite3.DatabaseError("dashboard revision ledger is missing")
+    revision = int(row["revision"])
+    if revision < 0:
+        raise sqlite3.DatabaseError("dashboard revision is negative")
+    return revision
 
 
 def connect_readonly(path: Path) -> sqlite3.Connection:
@@ -603,6 +676,15 @@ def _upgrade_schema(
                 THEN started_at
                 ELSE settled_at
             END
+        WHERE correlation_id IS NULL
+           OR (
+                status IN ('completed', 'failed', 'interrupted', 'lost')
+                AND TRIM(COALESCE(outcome, '')) = ''
+           )
+           OR (
+                status IN ('completed', 'failed', 'interrupted', 'lost')
+                AND settled_at IS NULL
+           )
         """
     )
     connection.execute(
@@ -621,6 +703,9 @@ def _upgrade_schema(
                 THEN 'unknown'
                 ELSE prompt_status
             END
+        WHERE profile IS NULL OR TRIM(profile) = ''
+           OR runtime IS NULL OR TRIM(runtime) = ''
+           OR prompt_status IS NULL OR TRIM(prompt_status) = ''
         """
     )
     if previous_schema_version < 24:
