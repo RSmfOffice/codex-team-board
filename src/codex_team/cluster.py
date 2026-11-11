@@ -1001,6 +1001,8 @@ class ClusterManager:
                     usage = self._app_job_usage(job, state)
                     if _usage_has_evidence(usage):
                         usage_source = "app_server.token_usage"
+                    else:
+                        usage = None
                 settled = self._settle_job_row(
                     connection,
                     job["job_id"],
@@ -2117,22 +2119,25 @@ class ClusterManager:
                 thread_id,
                 task_id=existing.get("current_task_id"),
             )
-            inspected_project = matching_project(inspection.get("cwd"))
-            if (
-                inspected_project is None
-                or str(inspected_project["project_id"])
-                != str(project["project_id"])
-            ):
-                errors.append(
-                    {
-                        "thread_id": thread_id,
-                        "error": (
-                            "native session cwd cannot verify the "
-                            "registered project ownership"
-                        ),
-                    }
+            if inspection.get("session_found", True):
+                inspected_project = matching_project(
+                    inspection.get("cwd")
                 )
-                continue
+                if (
+                    inspected_project is None
+                    or str(inspected_project["project_id"])
+                    != str(project["project_id"])
+                ):
+                    errors.append(
+                        {
+                            "thread_id": thread_id,
+                            "error": (
+                                "native session cwd cannot verify the "
+                                "registered project ownership"
+                            ),
+                        }
+                    )
+                    continue
             try:
                 state = normalized_native_state(
                     inspection,
