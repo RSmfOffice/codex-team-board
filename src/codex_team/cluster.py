@@ -84,6 +84,10 @@ TICK_PHASE_ORDER = (
     "health",
     "publish",
 )
+TICK_RETRY_BUDGET = 4
+TICK_PHASE_MAX_ATTEMPTS = 2
+TICK_PHASE_RETRY_BASE_SECONDS = 0.05
+TICK_PHASE_RETRY_MAX_SECONDS = 0.5
 LEAD_DEVELOPER_INSTRUCTIONS = """You are the managed Lead for an automated
 Codex work cluster. Do not spawn subagents; the deterministic teamd dispatcher
 launches Workers. You may use shell tools and the stable codexTeamBoard Core
@@ -381,6 +385,7 @@ class ClusterManager:
         self.app_turn_jobs: dict[str, str] = {}
         self._app_state_lock = threading.RLock()
         self._tick_lock = threading.Lock()
+        self._phase_failure_state: dict[str, dict[str, Any]] = {}
         self._runtime_fallback_reason = ""
         self.runtime = runtime
         if self.runtime is None and self.agent_runtime == "app_server":
@@ -1945,69 +1950,347 @@ class ClusterManager:
     def _tick_locked(self) -> dict[str, Any]:
         tick_id = self._new_id("TICK")
         phases: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+        failed_phases: list[str] = []
+        skipped: list[dict[str, Any]] = []
+        retry_used = 0
         phase_data: dict[str, Any] = {
             "worktree_recovery": [],
             "scheduled": [],
             "goals": [],
-            "failed_phase": None,
-            "error": "",
+            "prepare_ready": False,
+            "worker_alerts": 0,
+            "goal_alerts": 0,
         }
 
-        def run_phase(name: str, action: Any) -> bool:
-            started = time.perf_counter()
-            try:
-                counts = action()
-                if not isinstance(counts, Mapping):
-                    counts = {"count": int(counts or 0)}
-                phases.append(
+        def normalize_errors(
+            name: str,
+            raw_errors: Any,
+        ) -> list[dict[str, Any]]:
+            if raw_errors is None:
+                return []
+            if isinstance(raw_errors, Mapping):
+                candidates = [raw_errors]
+            elif isinstance(raw_errors, (list, tuple)):
+                candidates = list(raw_errors)
+            else:
+                candidates = [raw_errors]
+            normalized: list[dict[str, Any]] = []
+            for candidate in candidates:
+                if isinstance(candidate, Mapping):
+                    message = self._redact_error(
+                        str(
+                            candidate.get("redacted_error")
+                            or candidate.get("error")
+                            or candidate.get("message")
+                            or f"{name} phase reported a failure"
+                        )
+                    )
+                    error_code = str(
+                        candidate.get("error_code")
+                        or f"{name}_phase_failure"
+                    )
+                    source = str(candidate.get("source") or name)
+                    detail = {
+                        key: value
+                        for key, value in candidate.items()
+                        if key
+                        not in {"redacted_error", "error", "message"}
+                    }
+                else:
+                    message = self._redact_error(str(candidate))
+                    error_code = f"{name}_phase_failure"
+                    source = name
+                    detail = {}
+                normalized.append(
                     {
-                        "name": name,
-                        "ok": True,
-                        "duration_ms": round(
-                            (time.perf_counter() - started) * 1000,
-                            3,
-                        ),
-                        "counts": dict(counts),
+                        **detail,
+                        "phase": name,
+                        "source": source,
+                        "error_code": error_code,
+                        "redacted_error": message,
                     }
                 )
-                return True
-            except Exception as exc:
-                message = self._redact_error(str(exc))
-                phase_data["failed_phase"] = name
-                phase_data["error"] = message
-                phases.append(
+            return normalized
+
+        def append_phase(
+            name: str,
+            *,
+            ok: bool,
+            attempts: int,
+            duration_ms: float,
+            counts: Mapping[str, Any] | None = None,
+            phase_errors: list[dict[str, Any]] | None = None,
+            retry_suppressed: bool = False,
+        ) -> None:
+            normalized = list(phase_errors or [])
+            first_error = normalized[0] if normalized else None
+            phases.append(
+                {
+                    "name": name,
+                    "ok": ok,
+                    "degraded": not ok,
+                    "attempts": attempts,
+                    "duration_ms": round(duration_ms, 3),
+                    "counts": dict(counts or {"count": 0}),
+                    "error_code": (
+                        "" if ok else str(
+                            (first_error or {}).get("error_code")
+                            or f"{name}_phase_failure"
+                        )
+                    ),
+                    "redacted_error": (
+                        "" if ok else str(
+                            (first_error or {}).get("redacted_error") or ""
+                        )
+                    ),
+                    "retry_suppressed": bool(retry_suppressed),
+                }
+            )
+            if ok:
+                return
+            if name not in failed_phases:
+                failed_phases.append(name)
+            errors.extend(normalized)
+
+        def run_phase(
+            name: str,
+            action: Any,
+            *,
+            gate_blockers: list[str] | None = None,
+        ) -> bool:
+            nonlocal retry_used
+            blockers = list(gate_blockers or [])
+            if blockers:
+                skipped.append(
                     {
                         "name": name,
-                        "ok": False,
-                        "duration_ms": round(
-                            (time.perf_counter() - started) * 1000,
-                            3,
-                        ),
-                        "counts": {"count": 0},
-                        "error": message,
+                        "reason": "prerequisites_unavailable",
+                        "blocked_by": blockers,
                     }
                 )
                 return False
+
+            started = time.perf_counter()
+            attempts = 0
+            while attempts < TICK_PHASE_MAX_ATTEMPTS:
+                attempts += 1
+                retried_this_phase = False
+                try:
+                    result = action()
+                    if isinstance(result, Mapping):
+                        counts = dict(result)
+                    else:
+                        counts = {"count": int(result or 0)}
+                    raw_errors = counts.pop("_errors", [])
+                    degraded = bool(counts.pop("_degraded", False))
+                    normalized = normalize_errors(name, raw_errors)
+                    if normalized or degraded:
+                        if not normalized:
+                            normalized = normalize_errors(
+                                name,
+                                f"{name} phase reported degraded work",
+                            )
+                        append_phase(
+                            name,
+                            ok=False,
+                            attempts=attempts,
+                            duration_ms=(
+                                time.perf_counter() - started
+                            ) * 1000,
+                            counts=counts,
+                            phase_errors=normalized,
+                        )
+                        return False
+                    self._phase_failure_state.pop(name, None)
+                    append_phase(
+                        name,
+                        ok=True,
+                        attempts=attempts,
+                        duration_ms=(
+                            time.perf_counter() - started
+                        ) * 1000,
+                        counts=counts,
+                    )
+                    return True
+                except Exception as exc:
+                    normalized = normalize_errors(
+                        name,
+                        self._phase_error_record(name, exc),
+                    )
+                    first_error = normalized[0]
+                    signature = hashlib.sha256(
+                        (
+                            f"{first_error['error_code']}\0"
+                            f"{first_error['redacted_error']}"
+                        ).encode("utf-8")
+                    ).hexdigest()[:16]
+                    previous = self._phase_failure_state.get(name)
+                    same_signature = bool(
+                        previous
+                        and previous.get("signature") == signature
+                    )
+                    consecutive = (
+                        int(previous.get("failures") or 0) + 1
+                        if previous
+                        else 1
+                    )
+                    self._phase_failure_state[name] = {
+                        "signature": signature,
+                        "failures": consecutive,
+                        "error_code": first_error["error_code"],
+                        "redacted_error": first_error["redacted_error"],
+                    }
+                    can_retry = bool(
+                        attempts < TICK_PHASE_MAX_ATTEMPTS
+                        and retry_used < TICK_RETRY_BUDGET
+                        and not same_signature
+                    )
+                    if can_retry:
+                        retry_used += 1
+                        retried_this_phase = True
+                        delay = min(
+                            TICK_PHASE_RETRY_BASE_SECONDS
+                            * (2 ** (consecutive - 1)),
+                            TICK_PHASE_RETRY_MAX_SECONDS,
+                        )
+                        time.sleep(delay)
+                        continue
+                    append_phase(
+                        name,
+                        ok=False,
+                        attempts=attempts,
+                        duration_ms=(
+                            time.perf_counter() - started
+                        ) * 1000,
+                        phase_errors=normalized,
+                        retry_suppressed=(
+                            bool(previous) and same_signature
+                            and not retried_this_phase
+                        ),
+                    )
+                    return False
+            return False
 
         def settle() -> Mapping[str, Any]:
             return self._reconcile_jobs()
 
         def recover() -> Mapping[str, Any]:
             recovered = self.worktrees.recover_pending()
-            phase_data["worktree_recovery"] = recovered
+            annotated = [
+                self._annotate_worktree_recovery(item)
+                for item in recovered
+            ]
+            recovery_errors: list[dict[str, Any]] = []
+            for item in annotated:
+                if item.get("status") != "failed":
+                    continue
+                task_id = str(item.get("task_id") or "")
+                if not task_id:
+                    continue
+                try:
+                    manual_reason = (
+                        "worktree recovery requires manual action: "
+                        f"{item.get('manual_action') or item.get('redacted_error')}"
+                    )
+                    blocked = self._block_worktree_task_for_manual_action(
+                        task_id,
+                        manual_reason,
+                    )
+                    item["task_status"] = blocked["status"]
+                    if blocked["status"] == "blocked":
+                        item["task_blocked"] = True
+                    elif blocked["status"] in {"running", "claimed"}:
+                        recovery_errors.append(
+                            {
+                                "source": "worktree_recovery",
+                                "task_id": task_id,
+                                "operation_id": item.get("operation_id", ""),
+                                "error_code": "worktree_foreign_claim_preserved",
+                                "redacted_error": (
+                                    "worktree recovery needs manual action, "
+                                    "but the task is owned by an active claim"
+                                ),
+                                "manual_action": item.get("manual_action", ""),
+                            }
+                        )
+                except Exception as exc:
+                    recovery_errors.append(
+                        {
+                            **self._phase_error_record(
+                                "recover",
+                                exc,
+                                source="worktree_task_block",
+                            ),
+                            "task_id": task_id,
+                            "operation_id": item.get("operation_id", ""),
+                        }
+                    )
+            phase_data["worktree_recovery"] = annotated
+            recovery_errors.extend(
+                {
+                    "source": "worktree_recovery",
+                    "task_id": item.get("task_id", ""),
+                    "operation_id": item.get("operation_id", ""),
+                    "error_code": item["error_code"],
+                    "redacted_error": item["redacted_error"],
+                    "manual_action": item.get("manual_action", ""),
+                }
+                for item in annotated
+                if item.get("status") in {"failed", "deferred"}
+            )
             return {
-                "count": len(recovered),
+                "count": len(annotated),
                 "completed": sum(
-                    item.get("status") == "completed" for item in recovered
+                    item.get("status") == "completed" for item in annotated
                 ),
                 "failed": sum(
-                    item.get("status") == "failed" for item in recovered
+                    item.get("status") == "failed" for item in annotated
                 ),
+                "deferred": sum(
+                    item.get("status") == "deferred" for item in annotated
+                ),
+                "manual": len(recovery_errors),
+                "_errors": recovery_errors,
             }
 
         def control() -> Mapping[str, Any]:
-            reset_counts = self._apply_agent_reset_requests()
-            archive_counts = self._sync_project_agent_archive()
+            control_errors: list[dict[str, Any]] = []
+            try:
+                reset_counts = self._apply_agent_reset_requests()
+            except Exception as exc:
+                reset_counts = {}
+                control_errors.append(
+                    {
+                        **self._phase_error_record(
+                            "control",
+                            exc,
+                            source="agent_reset",
+                        ),
+                        "phase": "control",
+                    }
+                )
+            try:
+                archive_counts = self._sync_project_agent_archive()
+            except Exception as exc:
+                archive_counts = {}
+                control_errors.append(
+                    {
+                        **self._phase_error_record(
+                            "control",
+                            exc,
+                            source="agent_archive",
+                        ),
+                        "phase": "control",
+                    }
+                )
+            control_errors.extend(
+                normalize_errors(
+                    "control",
+                    archive_counts.get("errors", []),
+                )
+            )
+            phase_data["control_errors"] = control_errors
             return {
                 "count": int(reset_counts.get("count", 0))
                 + int(archive_counts.get("count", 0)),
@@ -2015,12 +2298,15 @@ class ClusterManager:
                 "project_archives": int(
                     archive_counts.get("count", 0)
                 ),
+                "_errors": control_errors,
             }
 
         def prepare() -> Mapping[str, Any]:
             goals = self.list_goals(["planning", "active"])
+            phase_data["goals"] = goals
             schedulable: list[dict[str, Any]] = []
             paused = 0
+            prepare_errors: list[dict[str, Any]] = []
             for goal in goals:
                 try:
                     if self._prepare_goal(goal):
@@ -2028,12 +2314,26 @@ class ClusterManager:
                 except WorkflowEpochMismatch as exc:
                     self._pause_workflow_mismatch(goal, exc)
                     paused += 1
-            phase_data["goals"] = goals
+                except Exception as exc:
+                    prepare_errors.append(
+                        {
+                            **self._phase_error_record(
+                                "prepare",
+                                exc,
+                                source="prepare_goal",
+                            ),
+                            "goal_id": goal.get("goal_id"),
+                        }
+                    )
             phase_data["schedulable"] = schedulable
+            phase_data["prepare_errors"] = prepare_errors
+            phase_data["prepare_ready"] = True
             return {
                 "count": len(goals),
                 "schedulable": len(schedulable),
                 "paused_epoch_mismatch": paused,
+                "goal_errors": len(prepare_errors),
+                "_errors": prepare_errors,
             }
 
         def dispatch() -> Mapping[str, Any]:
@@ -2044,10 +2344,37 @@ class ClusterManager:
             return {"count": len(scheduled)}
 
         def health() -> Mapping[str, Any]:
-            worker_health = self._check_worker_health()
-            goal_health = self._check_goal_stalls(
-                list(phase_data.get("goals") or []),
-                list(phase_data.get("scheduled") or []),
+            health_errors: list[dict[str, Any]] = []
+            try:
+                worker_health = self._check_worker_health()
+            except Exception as exc:
+                worker_health = {}
+                health_errors.append(
+                    self._phase_error_record(
+                        "health",
+                        exc,
+                        source="worker_health",
+                    )
+                )
+            try:
+                goal_health = self._check_goal_stalls(
+                    list(phase_data.get("goals") or []),
+                    list(phase_data.get("scheduled") or []),
+                )
+            except Exception as exc:
+                goal_health = {}
+                health_errors.append(
+                    self._phase_error_record(
+                        "health",
+                        exc,
+                        source="goal_health",
+                    )
+                )
+            phase_data["worker_alerts"] = int(
+                worker_health.get("alerts", 0)
+            )
+            phase_data["goal_alerts"] = int(
+                goal_health.get("count", 0)
             )
             return {
                 "count": int(worker_health.get("count", 0))
@@ -2055,19 +2382,24 @@ class ClusterManager:
                 "workers": int(worker_health.get("count", 0)),
                 "alerts": int(worker_health.get("alerts", 0)),
                 "goals": int(goal_health.get("count", 0)),
+                "_errors": health_errors,
             }
 
-        business_phases = (
-            ("settle", settle),
-            ("recover", recover),
-            ("control", control),
-            ("prepare", prepare),
-            ("dispatch", dispatch),
-            ("health", health),
+        settle_ok = run_phase("settle", settle)
+        run_phase("recover", recover)
+        run_phase("control", control)
+        run_phase("prepare", prepare)
+        dispatch_blockers: list[str] = []
+        if not settle_ok:
+            dispatch_blockers.append("settle")
+        if not phase_data.get("prepare_ready"):
+            dispatch_blockers.append("prepare")
+        run_phase(
+            "dispatch",
+            dispatch,
+            gate_blockers=dispatch_blockers,
         )
-        for name, action in business_phases:
-            if not run_phase(name, action):
-                break
+        run_phase("health", health)
 
         def publish() -> Mapping[str, Any]:
             phase_data["tick_at"] = utc_now()
@@ -2075,25 +2407,220 @@ class ClusterManager:
 
         run_phase("publish", publish)
         completed_names = {phase["name"] for phase in phases}
-        skipped = [
+        skipped_names = [
             name for name in TICK_PHASE_ORDER if name not in completed_names
         ]
-        failed_phase = phase_data.get("failed_phase")
+        degraded = bool(failed_phases)
+        failed_phase = failed_phases[0] if failed_phases else None
+        first_error = errors[0]["redacted_error"] if errors else ""
+        worktree_manual_actions = [
+            {
+                "operation_id": item.get("operation_id"),
+                "task_id": item.get("task_id"),
+                "error_code": item.get("error_code"),
+                "manual_action": item.get("manual_action"),
+            }
+            for item in phase_data.get("worktree_recovery") or []
+            if item.get("manual_action")
+        ]
+        health_summary = {
+            "ok": not degraded,
+            "degraded": degraded,
+            "failed_phases": list(failed_phases),
+            "degraded_phases": list(failed_phases),
+            "skipped_phases": skipped_names,
+            "errors": errors,
+            "worker_alerts": int(phase_data.get("worker_alerts") or 0),
+            "goal_alerts": int(phase_data.get("goal_alerts") or 0),
+            "worktree_manual_actions": worktree_manual_actions,
+        }
+        retry = {
+            "limit": TICK_RETRY_BUDGET,
+            "used": retry_used,
+            "exhausted": retry_used >= TICK_RETRY_BUDGET,
+        }
         return {
-            "ok": failed_phase is None,
+            "ok": not degraded,
             "tick_id": tick_id,
             "tick_at": phase_data.get("tick_at") or utc_now(),
             "phase_order": list(TICK_PHASE_ORDER),
             "phases": phases,
             "failed_phase": failed_phase,
-            "skipped_phases": skipped,
-            "error": phase_data.get("error") or "",
+            "failed_phases": list(failed_phases),
+            "degraded": degraded,
+            "degraded_phases": list(failed_phases),
+            "skipped_phases": skipped_names,
+            "skips": skipped,
+            "error": first_error,
+            "error_code": (
+                errors[0]["error_code"] if errors else ""
+            ),
+            "errors": errors,
+            "retry": retry,
+            "retry_used": retry_used,
+            "retry_budget": TICK_RETRY_BUDGET,
+            "health": health_summary,
             "scheduled": list(phase_data.get("scheduled") or []),
             "goals": len(phase_data.get("goals") or []),
             "worktree_recovery": list(
                 phase_data.get("worktree_recovery") or []
             ),
         }
+
+    def _phase_error_record(
+        self,
+        phase: str,
+        exc: Exception,
+        *,
+        source: str | None = None,
+    ) -> dict[str, str]:
+        message = self._redact_error(str(exc))
+        lowered = message.casefold()
+        if "branch exists but worktree target is missing" in lowered:
+            error_code = "worktree_branch_without_directory"
+        elif "worktree target exists but branch/root do not match intent" in lowered:
+            error_code = "worktree_target_mismatch"
+        elif "repository root is missing" in lowered:
+            error_code = "worktree_repository_missing"
+        elif "repository lock" in lowered or "lock timeout" in lowered:
+            error_code = "repository_lock_timeout"
+        elif isinstance(exc, TimeoutError):
+            error_code = "phase_timeout"
+        elif isinstance(exc, OSError):
+            error_code = "phase_os_error"
+        elif isinstance(exc, AssertionError):
+            error_code = "phase_assertion_error"
+        else:
+            error_code = f"{phase}_phase_failure"
+        return {
+            "source": source or phase,
+            "error_code": error_code,
+            "redacted_error": message,
+        }
+
+    def _annotate_worktree_recovery(
+        self,
+        item: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        annotated = dict(item)
+        operation_id = str(annotated.get("operation_id") or "")
+        message = self._redact_error(
+            str(
+                annotated.get("error")
+                or annotated.get("redacted_error")
+                or ""
+            )
+        )
+        task_id = str(annotated.get("task_id") or "")
+        if operation_id and (not task_id or not message):
+            with self.team.connection(write=False) as connection:
+                operation = connection.execute(
+                    """
+                    SELECT task_id, error
+                    FROM external_operations
+                    WHERE operation_id = ?
+                      AND operation_type = 'worktree_create'
+                    """,
+                    (operation_id,),
+                ).fetchone()
+            if operation is not None:
+                task_id = task_id or str(operation["task_id"] or "")
+                message = message or self._redact_error(
+                    str(operation["error"] or "")
+                )
+        lowered = message.casefold()
+        if "branch exists but worktree target is missing" in lowered:
+            error_code = "worktree_branch_without_directory"
+            manual_action = (
+                "Inspect the recorded branch and target path. If both belong "
+                "to the task, recreate the missing worktree with "
+                "`git worktree add <path> <branch>`; if the branch is stale, "
+                "delete it intentionally. Automatic deletion is disabled."
+            )
+        elif "worktree target exists but branch/root do not match intent" in lowered:
+            error_code = "worktree_target_mismatch"
+            manual_action = (
+                "Inspect the target directory, repository root, and branch. "
+                "Move or remove only the confirmed task-owned directory, then "
+                "retry worktree creation. Automatic deletion is disabled."
+            )
+        elif "repository root is missing" in lowered:
+            error_code = "worktree_repository_missing"
+            manual_action = (
+                "Restore or relocate the recorded repository root, then retry "
+                "worktree recovery. No Git state was changed automatically."
+            )
+        elif annotated.get("status") == "deferred":
+            error_code = "repository_lock_timeout"
+            manual_action = ""
+        else:
+            error_code = "worktree_recovery_failed"
+            manual_action = (
+                "Inspect the external operation, task worktree pointer, and "
+                "Git worktree list before retrying. Automatic deletion is "
+                "disabled while the intended state is uncertain."
+            )
+        requires_manual_action = annotated.get("status") == "failed"
+        annotated.update(
+            {
+                "task_id": task_id or None,
+                "error_code": error_code,
+                "redacted_error": message,
+                "requires_manual_action": requires_manual_action,
+                "manual_action": manual_action if requires_manual_action else "",
+            }
+        )
+        annotated.pop("error", None)
+        return annotated
+
+    def _block_worktree_task_for_manual_action(
+        self,
+        task_id: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        with self.team.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            task = connection.execute(
+                """
+                SELECT status, claimed_by, claim_token
+                FROM tasks
+                WHERE task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if task is None:
+                raise TeamError(f"task not found: {task_id}")
+            status = str(task["status"])
+            if status == "blocked":
+                return {"status": "blocked", "changed": False}
+            if task["claimed_by"] or task["claim_token"]:
+                return {"status": "claimed", "changed": False}
+            if status not in {"ready", "backlog"}:
+                return {"status": status, "changed": False}
+            updated = connection.execute(
+                """
+                UPDATE tasks
+                SET status = 'blocked', blocker = ?, claimed_by = NULL,
+                    claim_token = NULL, lease_until = NULL,
+                    updated_at = ?, version = version + 1
+                WHERE task_id = ?
+                  AND status IN ('ready', 'backlog')
+                  AND claimed_by IS NULL
+                  AND claim_token IS NULL
+                """,
+                (reason, now, task_id),
+            )
+            if updated.rowcount != 1:
+                return {"status": "claimed", "changed": False}
+            self.team._event(
+                connection,
+                task_id,
+                "blocked",
+                "teamd",
+                {"reason": reason},
+            )
+        return {"status": "blocked", "changed": True}
 
     def _sync_project_agent_archive(self) -> dict[str, Any]:
         with self.team.connection(write=False) as connection:
@@ -2119,6 +2646,7 @@ class ClusterManager:
             ]
         processed = 0
         failed = 0
+        errors: list[dict[str, Any]] = []
         for project in projects:
             try:
                 self.agent_pool.archive_project(
@@ -2126,14 +2654,25 @@ class ClusterManager:
                     project["archived_at"] is not None,
                 )
                 processed += 1
-            except Exception:
+            except Exception as exc:
                 # A live Agent can be cleaned up after the current job releases.
                 failed += 1
+                errors.append(
+                    {
+                        **self._phase_error_record(
+                            "control",
+                            exc,
+                            source="agent_archive",
+                        ),
+                        "project_id": str(project["project_id"]),
+                    }
+                )
                 continue
         return {
             "count": processed + failed,
             "processed": processed,
             "failed": failed,
+            "errors": errors,
         }
 
     def _prepare_goal(self, goal: dict[str, Any]) -> bool:

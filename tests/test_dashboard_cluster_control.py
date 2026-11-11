@@ -10,9 +10,11 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from contextlib import ExitStack, nullcontext
 from pathlib import Path
 from unittest.mock import patch
 
+from codex_team import clusterd
 from codex_team.cluster import ClusterError, ClusterManager
 from codex_team.config import Settings
 from codex_team.dashboard import build_server
@@ -207,6 +209,172 @@ class DashboardClusterControlTests(unittest.TestCase):
             },
         )
         self.assertEqual(board["cluster_runtime"], health["cluster_runtime"])
+
+    def test_dashboard_exposes_degraded_tick_phase_health(self) -> None:
+        daemon = {
+            "running": True,
+            "config_mismatch": False,
+            "expected_identity": {
+                "runtime": "app_server",
+                "version": "0.5.0",
+            },
+            "state": {
+                "ok": False,
+                "tick_id": "TICK-DEGRADED",
+                "tick_at": "2026-11-11T07:00:00Z",
+                "degraded": True,
+                "failed_phase": "settle",
+                "failed_phases": ["settle"],
+                "degraded_phases": ["settle", "health"],
+                "skipped_phases": ["dispatch"],
+                "error_code": "settle_phase_failure",
+                "error": "database unavailable",
+                "phases": [
+                    {
+                        "name": "settle",
+                        "ok": False,
+                        "degraded": True,
+                        "attempts": 2,
+                        "duration_ms": 1.25,
+                        "error_code": "settle_phase_failure",
+                        "redacted_error": "database unavailable",
+                        "retry_suppressed": False,
+                    }
+                ],
+                "retry": {
+                    "limit": 4,
+                    "used": 1,
+                    "exhausted": False,
+                },
+                "health": {
+                    "ok": False,
+                    "degraded": True,
+                    "failed_phases": ["settle"],
+                    "degraded_phases": ["settle", "health"],
+                    "skipped_phases": ["dispatch"],
+                    "errors": [
+                        {
+                            "phase": "settle",
+                            "error_code": "settle_phase_failure",
+                            "redacted_error": "database unavailable",
+                        }
+                    ],
+                },
+            },
+        }
+        with patch(
+            "codex_team.dashboard.daemon_status",
+            return_value=daemon,
+        ):
+            health = self.get("/api/health")
+            board = self.get("/api/board")
+
+        runtime = health["cluster_runtime"]
+        self.assertEqual(board["cluster_runtime"], runtime)
+        tick = runtime["tick"]
+        self.assertTrue(tick["degraded"])
+        self.assertEqual(tick["failed_phase"], "settle")
+        self.assertEqual(
+            tick["degraded_phases"],
+            ["settle", "health"],
+        )
+        self.assertEqual(tick["skipped_phases"], ["dispatch"])
+        self.assertEqual(tick["error_code"], "settle_phase_failure")
+        self.assertEqual(tick["phases"][0]["attempts"], 2)
+        self.assertEqual(tick["retry"]["used"], 1)
+        self.assertTrue(tick["health"]["degraded"])
+
+    def test_degraded_tick_round_trips_from_manager_to_dashboard(
+        self,
+    ) -> None:
+        manager = ClusterManager(
+            self.settings,
+            team=self.team,
+            runtime_mode="exec",
+            agent_command=["codex"],
+        )
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(
+                    manager,
+                    "_reconcile_jobs",
+                    side_effect=RuntimeError(
+                        "claim_token=integration-secret"
+                    ),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    manager.worktrees,
+                    "recover_pending",
+                    return_value=[],
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    manager,
+                    "_apply_agent_reset_requests",
+                    return_value={"count": 0},
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    manager,
+                    "_sync_project_agent_archive",
+                    return_value={"count": 0},
+                )
+            )
+            stack.enter_context(
+                patch.object(manager, "list_goals", return_value=[])
+            )
+            stack.enter_context(
+                patch.object(manager, "_schedule_goals", return_value=[])
+            )
+            stack.enter_context(
+                patch.object(
+                    manager,
+                    "_check_worker_health",
+                    return_value={"count": 0},
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    manager,
+                    "_check_goal_stalls",
+                    return_value={"count": 0},
+                )
+            )
+            stack.enter_context(patch("codex_team.cluster.time.sleep"))
+            stack.enter_context(
+                patch.object(Settings, "load", return_value=self.settings)
+            )
+            stack.enter_context(
+                patch.object(
+                    clusterd,
+                    "ClusterManager",
+                    return_value=manager,
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    clusterd,
+                    "acquire_lock",
+                    return_value=nullcontext(),
+                )
+            )
+            exit_code = clusterd.run(once=True)
+
+        health = self.get("/api/health")
+        tick = health["cluster_runtime"]["tick"]
+        serialized = json.dumps(tick, ensure_ascii=False)
+        self.assertEqual(exit_code, 1)
+        self.assertTrue(tick["degraded"])
+        self.assertEqual(tick["failed_phase"], "settle")
+        self.assertEqual(tick["error_code"], "settle_phase_failure")
+        self.assertEqual(tick["phases"][0]["attempts"], 2)
+        self.assertIn("dispatch", tick["skipped_phases"])
+        self.assertNotIn("integration-secret", serialized)
+        self.assertIn("[REDACTED]", serialized)
 
     def test_sync_native_agents_is_idempotent_and_preserves_failed(self) -> None:
         task = self.team.create_task(
