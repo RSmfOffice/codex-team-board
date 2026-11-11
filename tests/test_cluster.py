@@ -6587,6 +6587,7 @@ class ClusterSchedulerTests(unittest.TestCase):
                     "goal_id": goal["goal_id"],
                     "workstream_key": "mcp-workstream",
                     "continuity_reason": "related MCP work",
+                    "authority_token": team.operator_authority(),
                 },
             )
             self.assertEqual(updated["workstream_key"], "mcp-workstream")
@@ -6595,6 +6596,7 @@ class ClusterSchedulerTests(unittest.TestCase):
                 {
                     "goal_id": goal["goal_id"],
                     "summary": "MCP durable checkpoint",
+                    "authority_token": team.operator_authority(),
                 },
             )
             self.assertEqual(
@@ -6612,6 +6614,7 @@ class ClusterSchedulerTests(unittest.TestCase):
                     "goal_id": goal["goal_id"],
                     "actor": "human",
                     "reason": "MCP explicit migration",
+                    "authority_token": team.operator_authority(),
                 },
             )
             self.assertTrue(
@@ -6628,6 +6631,7 @@ class ClusterSchedulerTests(unittest.TestCase):
                     "agent_id": agent["agent_id"],
                     "actor": "human",
                     "reason": "test reset through MCP",
+                    "authority_token": team.operator_authority(),
                 },
             )
             self.assertIsNotNone(reset["reset_requested_at"])
@@ -6702,6 +6706,7 @@ class ClusterSchedulerTests(unittest.TestCase):
                             {
                                 "goal_id": goal["goal_id"],
                                 "action": "resume",
+                                "authority_token": team.operator_authority(),
                             },
                         )
                 self.assertEqual(
