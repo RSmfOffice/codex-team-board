@@ -374,6 +374,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlsplit(self.path)
+        if parsed.path.startswith("/api/"):
+            rejection = self._loopback_host_rejection()
+            if rejection is not None:
+                status, message = rejection
+                self._send_json({"error": message}, status=status)
+                return
         if parsed.path == "/favicon.ico":
             self.send_response(HTTPStatus.NO_CONTENT)
             self.send_header("Cache-Control", "public, max-age=86400")
@@ -688,8 +694,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 status=HTTPStatus.BAD_REQUEST,
             )
 
-    def _write_request_rejection(
+    def _loopback_host_rejection(
         self,
+        *,
+        request_kind: str = "API",
     ) -> tuple[HTTPStatus, str] | None:
         authority = str(self.headers.get("Host") or "").strip()
         try:
@@ -697,13 +705,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except ValueError:
             return (
                 HTTPStatus.FORBIDDEN,
-                "write requests require a valid loopback Host header",
+                f"{request_kind} requests require a valid loopback Host header",
             )
         if not _is_loopback_host(hostname):
             return (
                 HTTPStatus.FORBIDDEN,
-                "write requests require a loopback Host header",
+                f"{request_kind} requests require a loopback Host header",
             )
+        return None
+
+    def _write_request_rejection(
+        self,
+    ) -> tuple[HTTPStatus, str] | None:
+        rejection = self._loopback_host_rejection(request_kind="write")
+        if rejection is not None:
+            return rejection
+        authority = str(self.headers.get("Host") or "").strip()
         content_type = str(
             self.headers.get("Content-Type") or ""
         ).split(";", 1)[0].strip().lower()
