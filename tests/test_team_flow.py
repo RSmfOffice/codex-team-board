@@ -2138,6 +2138,110 @@ class TeamFlowTests(unittest.TestCase):
                     task_id=str(requested["task_id"]),
                 )
 
+    def test_native_registration_role_wins_over_path_inference(self) -> None:
+        thread_id = "01a1cafe-5555-7666-8777-98889999aaaa"
+        sessions = self.base / "native-role-inference"
+        session = sessions / f"rollout-{thread_id}.jsonl"
+        session.parent.mkdir(parents=True)
+        session.write_text(
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "id": thread_id,
+                        "source": {
+                            "subagent": {
+                                "thread_spawn": {
+                                    "agent_path": "/root/reviewer-name"
+                                }
+                            }
+                        },
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        manager = ClusterManager(
+            self.settings,
+            team=self.team,
+            worktrees=self.worktrees,
+            runtime_mode="exec",
+            agent_command=["codex"],
+        )
+        with patch.dict(
+            os.environ,
+            {"CODEX_NATIVE_SESSIONS_ROOT": str(sessions)},
+            clear=False,
+        ):
+            registered = manager.register_native_agent(
+                self.repo,
+                thread_id,
+                "team_worker",
+                "native-role-inference",
+                actor="native-role-worker",
+            )
+        self.assertEqual(registered["effective_role"], "team_worker")
+        self.assertEqual(
+            registered["agent"]["identity_source"],
+            "registration",
+        )
+        self.assertEqual(
+            registered["agent"]["identity_confidence"],
+            "medium",
+        )
+
+    def test_native_explicit_role_conflict_fails_closed(self) -> None:
+        thread_id = "01a1cafe-6666-7777-8888-9999aaaabbbb"
+        sessions = self.base / "native-role-conflict"
+        session = sessions / f"rollout-{thread_id}.jsonl"
+        session.parent.mkdir(parents=True)
+        session.write_text(
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "id": thread_id,
+                        "agent_role": "team_explorer",
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        manager = ClusterManager(
+            self.settings,
+            team=self.team,
+            worktrees=self.worktrees,
+            runtime_mode="exec",
+            agent_command=["codex"],
+        )
+        with patch.dict(
+            os.environ,
+            {"CODEX_NATIVE_SESSIONS_ROOT": str(sessions)},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(
+                ClusterError,
+                "session role conflicts",
+            ):
+                manager.register_native_agent(
+                    self.repo,
+                    thread_id,
+                    "team_worker",
+                    "native-role-conflict",
+                    actor="native-role-worker",
+                )
+        project = self.team.project_for_repo(self.repo)
+        self.assertFalse(
+            any(
+                agent["thread_id"] == thread_id
+                for agent in manager.list_agents(
+                    str(project["project_id"])
+                )
+            )
+        )
+
     def test_dashboard_projects_missing_usage_fields_to_null(self) -> None:
         manager = ClusterManager(
             self.settings,

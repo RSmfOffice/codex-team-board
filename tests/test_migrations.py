@@ -484,44 +484,85 @@ class MigrationTests(unittest.TestCase):
             finally:
                 connection.close()
 
-            for _ in range(2):
-                upgraded = connect(path)
-                try:
-                    native = upgraded.execute(
-                        """
-                        SELECT identity_source, identity_confidence,
-                               assignment_source, assignment_confidence,
-                               task_candidates_json, native_usage_status
-                        FROM cluster_agents
-                        WHERE agent_id = 'A-NATIVE'
-                        """
-                    ).fetchone()
-                    self.assertEqual(native["identity_source"], "registry")
-                    self.assertEqual(
-                        native["identity_confidence"],
-                        "medium",
-                    )
-                    self.assertEqual(native["assignment_source"], "registry")
-                    self.assertEqual(
-                        native["assignment_confidence"],
-                        "medium",
-                    )
-                    self.assertEqual(
-                        native["task_candidates_json"],
-                        '["T1"]',
-                    )
-                    self.assertEqual(
-                        native["native_usage_status"],
-                        "partial",
-                    )
-                    self.assertEqual(
-                        upgraded.execute(
-                            "PRAGMA user_version"
-                        ).fetchone()[0],
-                        SCHEMA_VERSION,
-                    )
-                finally:
-                    upgraded.close()
+            upgraded = connect(path)
+            try:
+                native = upgraded.execute(
+                    """
+                    SELECT identity_source, identity_confidence,
+                           assignment_source, assignment_confidence,
+                           task_candidates_json, native_usage_status
+                    FROM cluster_agents
+                    WHERE agent_id = 'A-NATIVE'
+                    """
+                ).fetchone()
+                self.assertEqual(native["identity_source"], "registry")
+                self.assertEqual(
+                    native["identity_confidence"],
+                    "medium",
+                )
+                self.assertEqual(native["assignment_source"], "registry")
+                self.assertEqual(
+                    native["assignment_confidence"],
+                    "medium",
+                )
+                self.assertEqual(
+                    native["task_candidates_json"],
+                    '["T1"]',
+                )
+                self.assertEqual(
+                    native["native_usage_status"],
+                    "partial",
+                )
+                upgraded.execute(
+                    """
+                    UPDATE cluster_agents
+                    SET identity_source = 'agent_path_inference',
+                        identity_confidence = 'low',
+                        assignment_source = 'none',
+                        assignment_confidence = 'unknown',
+                        task_candidates_json = '[]',
+                        native_usage_status = 'unavailable'
+                    WHERE agent_id = 'A-NATIVE'
+                    """
+                )
+                upgraded.commit()
+            finally:
+                upgraded.close()
+
+            reopened = connect(path)
+            try:
+                native = reopened.execute(
+                    """
+                    SELECT identity_source, identity_confidence,
+                           assignment_source, assignment_confidence,
+                           task_candidates_json, native_usage_status
+                    FROM cluster_agents
+                    WHERE agent_id = 'A-NATIVE'
+                    """
+                ).fetchone()
+                self.assertEqual(
+                    native["identity_source"],
+                    "agent_path_inference",
+                )
+                self.assertEqual(native["identity_confidence"], "low")
+                self.assertEqual(native["assignment_source"], "none")
+                self.assertEqual(
+                    native["assignment_confidence"],
+                    "unknown",
+                )
+                self.assertEqual(native["task_candidates_json"], "[]")
+                self.assertEqual(
+                    native["native_usage_status"],
+                    "unavailable",
+                )
+                self.assertEqual(
+                    reopened.execute(
+                        "PRAGMA user_version"
+                    ).fetchone()[0],
+                    SCHEMA_VERSION,
+                )
+            finally:
+                reopened.close()
 
     def test_archived_goal_done_tasks_are_backfilled_once(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -294,11 +294,11 @@ def _collect_native_session_data(
             "",
         ),
         "usage": usage,
-        "lifecycle": lifecycle if lifecycle != "unknown" else "idle",
+        "lifecycle": lifecycle,
         "lifecycle_source": (
             lifecycle_source
             if lifecycle_source != "unknown"
-            else "session_metadata"
+            else "event_scan_no_signal"
         ),
     }
 

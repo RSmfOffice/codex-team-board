@@ -460,6 +460,11 @@ class NativeThreadTests(unittest.TestCase):
                 "explicit_session_metadata",
             )
             self.assertEqual(explicit["identity_confidence"], "high")
+            self.assertEqual(explicit["lifecycle"], "unknown")
+            self.assertEqual(
+                explicit["lifecycle_source"],
+                "event_scan_no_signal",
+            )
 
             missing_thread = "01a1cafe-1111-7222-8333-944455556671"
             missing_path = root / f"rollout-{missing_thread}.jsonl"

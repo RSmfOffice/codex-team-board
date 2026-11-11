@@ -1308,53 +1308,74 @@ class ClusterManager:
             )
         requested_role = str(role or "").strip().lower()
         session_role = str(inspection.get("agent_role") or "").strip().lower()
+        session_identity_source = str(
+            inspection.get("identity_source") or "missing"
+        ).strip().lower()
+        session_identity_confidence = str(
+            inspection.get("identity_confidence") or "unknown"
+        ).strip().lower()
         documented_roles = {
             "lead",
             "team_explorer",
             "team_worker",
             "team_reviewer",
         }
-        effective_role = (
-            session_role
-            if (
-                session_role in documented_roles
-                and inspection.get("identity_source")
-                == "explicit_session_metadata"
-            )
-            else requested_role
-            if requested_role in documented_roles
-            else session_role
-            if session_role in documented_roles
-            else "unknown"
-        )
-        resolved_identity_source = str(
-            identity_source
-            or inspection.get("identity_source")
-            or "missing"
-        )
-        resolved_identity_confidence = str(
-            identity_confidence
-            or inspection.get("identity_confidence")
-            or "unknown"
+        requested_role_is_documented = requested_role in documented_roles
+        session_role_is_documented = session_role in documented_roles
+        session_role_is_explicit = (
+            session_role_is_documented
+            and session_identity_source == "explicit_session_metadata"
         )
         if (
-            not session_role
-            and effective_role != "unknown"
-            and identity_source is None
+            session_role_is_explicit
+            and requested_role_is_documented
+            and requested_role != session_role
         ):
-            resolved_identity_source = "registration"
-            resolved_identity_confidence = "medium"
-        elif identity_source is None:
-            if (
-                session_role in documented_roles
-                and inspection.get("identity_source")
-                == "explicit_session_metadata"
+            raise ClusterError(
+                "native session role conflicts with the requested registration role"
+            )
+        if session_role_is_explicit:
+            effective_role = session_role
+            resolved_identity_source = "explicit_session_metadata"
+            resolved_identity_confidence = "high"
+        elif requested_role_is_documented:
+            effective_role = requested_role
+            if identity_source == "registry":
+                resolved_identity_source = "registry"
+                resolved_identity_confidence = (
+                    identity_confidence or "medium"
+                )
+            elif (
+                identity_source == "agent_path_inference"
+                and session_role == requested_role
             ):
-                resolved_identity_source = "explicit_session_metadata"
-                resolved_identity_confidence = "high"
-            elif requested_role in documented_roles:
+                resolved_identity_source = "agent_path_inference"
+                resolved_identity_confidence = (
+                    identity_confidence or "low"
+                )
+            else:
                 resolved_identity_source = "registration"
-                resolved_identity_confidence = "medium"
+                resolved_identity_confidence = (
+                    identity_confidence
+                    if identity_source == "registration"
+                    else "medium"
+                )
+        elif session_role_is_documented:
+            effective_role = session_role
+            resolved_identity_source = session_identity_source
+            resolved_identity_confidence = session_identity_confidence
+        else:
+            effective_role = "unknown"
+            resolved_identity_source = (
+                identity_source
+                if identity_source in {"registration", "registry"}
+                else "missing"
+            )
+            resolved_identity_confidence = (
+                identity_confidence or "unknown"
+                if identity_source in {"registration", "registry"}
+                else "unknown"
+            )
         candidates = sorted(
             {
                 str(value).strip().upper()
