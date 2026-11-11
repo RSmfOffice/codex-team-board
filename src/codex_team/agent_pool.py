@@ -686,6 +686,12 @@ class AgentPool:
         )
         model = self._normalize_model(model)
         model_provider = self._normalize_model(model_provider)
+        native_status = (
+            "loaded"
+            if not session_stale
+            and lifecycle in {"active", "idle", "unknown"}
+            else "stored"
+        )
         now = utc_now()
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -794,7 +800,12 @@ class AgentPool:
                         lifecycle = ?, lifecycle_source = ?,
                         assignment_source = ?, assignment_confidence = ?,
                         task_candidates_json = ?,
-                        task_assignment_ambiguous = ?, session_stale = ?
+                        task_assignment_ambiguous = ?, session_stale = ?,
+                        status = CASE
+                            WHEN status IN ('loaded', 'stored', 'idle')
+                            THEN ?
+                            ELSE status
+                        END
                     WHERE agent_id = ?
                     """,
                     (
@@ -829,6 +840,7 @@ class AgentPool:
                         candidates_json,
                         int(bool(task_assignment_ambiguous)),
                         int(bool(session_stale)),
+                        native_status,
                         existing["agent_id"],
                     ),
                 )
@@ -887,7 +899,7 @@ class AgentPool:
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, 'native', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    'native', 'loaded', ?, ?, ?, ?, ?, ?, ?, ?
+                    'native', ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -919,6 +931,7 @@ class AgentPool:
                     candidates_json,
                     int(bool(task_assignment_ambiguous)),
                     int(bool(session_stale)),
+                    native_status,
                     model,
                     model_provider,
                     current_goal_id,

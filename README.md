@@ -372,10 +372,13 @@ Goal 保持 paused。项目或任务归档与 claim 在同一个 `BEGIN IMMEDIAT
 
 - Active/Planning：暂停或取消。
 - Paused：恢复或取消；恢复会把目标改为 Active 并确保 `teamd` 已启动。
-- Completed/Failed：归档已完成或失败的目标；归档后可恢复。
+- Completed/Canceled/Failed：归档已完成、人工取消或失败的目标；归档后可恢复。
 
-取消在 Web API 中通过目标状态 `failed` 落板，具体原因保存在 `last_error`，不会
-删除目标、任务、事件或 Git worktree。
+取消使用兼容现有 schema 的终态落板：原始数据库状态保持 `failed`，
+`last_error` 记录 `canceled:` 原因并写入 goal 级 `goal_canceled` 事件；API 和
+WebUI 通过 `effective_status` 显示 `canceled`，同时保留 `raw_status=failed`。
+取消不会删除目标、任务、事件或 Git worktree。若失败或取消目标的全部关联任务
+后来都完成，`control` 阶段会写 `goal_status_reconciled` 并归并为 `completed`。
 
 ### 集群健康与 attention
 
@@ -389,6 +392,9 @@ goals_paused
 goals_failed
 ready_tasks
 running_tasks
+active_executions
+external_executions
+native_executions
 review_tasks
 blocked_tasks
 active_jobs
@@ -568,6 +574,9 @@ summary revision 未变化时不请求 `/api/board`；只有 revision 变化、�
 - 请求失败后按 2、4、8、16、30 秒退避，成功响应后恢复 2 秒间隔。
 - 只有 board 内容签名变化时才重绘；正常轮询中的 claim 年龄和
   `generated_at` 更新不会单独触发表格重绘。
+- 顶部同步状态以实际语义重绘为准：时间派生 ETag 进入新 bucket 但仍返回
+  304，或 board 内容签名未变化时，保持“已检查 · 无变化”；只有真实内容更新
+  才显示“已同步”。
 - Token/cache 缺失保持 `null` 并显示 `—`，真实零值显示 `0`；运行时动作区分
   `fresh`、`resume`、`fresh_exec` 和 `fallback_exec`，不再把所有非复用路径
   都显示成 `fresh exec`。
@@ -592,7 +601,7 @@ summary revision 未变化时不请求 `/api/board`；只有 revision 变化、�
   Agent 记录，避免归档项目继续出现在 AgentPool 选择范围中。
 - 已归档任务不能 claim；已归档项目不能创建任务、cluster goal 或 worktree，
   恢复后解除限制。
-- 只有 `completed`/`failed` 集群目标可以在没有活动 job 时归档；归档目标不能
+- 只有 `completed`/`canceled`/`failed` 集群目标可以在没有活动 job 时归档；归档目标不能
   直接改变状态，恢复后才能继续生命周期操作。
 - 归档目标会同时软归档该目标下尚未归档的 `done` 任务。恢复目标时只恢复由目标
   级联归档的任务，用户单独归档的任务保持归档。
@@ -750,6 +759,17 @@ settlement helper；completed、failed、interrupted、lost 都会写入 outcome
 settled_at。Dashboard 的 Agent 卡片通过 latest-job 和 attempt ledger 投影失败或
 中断任务的真实 usage，不再依赖成功 release 后的累计字段。
 
+任务处于 `running` 且有有效 claim、但不存在 `cluster_jobs` 时，Dashboard 仍将
+其计入 `active_executions`：Native Agent 显示 `native_claim`，主 Agent/人工
+调用显示 `external_claim`，scheduler 在 job 建立前显示
+`dispatch_reservation`。这三类执行不计入 managed Worker 容量，但不会再显示成
+“无 Agent 运行”。Native claim 会在同一事务内绑定
+`current_task_id/current_goal_id` 并刷新 Agent freshness。
+
+`recover` 阶段会释放最新 claim 没有关联 job、且超过 reservation grace 的
+`auto-team_*` 预留。外部/Native claim 以及已有 starting/running job 的 claim
+不会被自动释放。
+
 数据库初始化遇到 `database is locked/busy` 时进行指数退避重试；只读连接使用
 编码后的 `file:` URI，路径中的空格、`#` 等字符不会被误解析。日志脱敏同时覆盖
 JSON、`=` 赋值、命令行和未加引号的冒号格式凭据。
@@ -904,9 +924,17 @@ POST /api/agents/sync-native
 历史 managed `failed` Thread 不会被自动隐藏或删除，诊断面板继续完整保留。
 
 Native session 的 token 数据来自 `subagent_history_start_ordinal` 之后的
-`token_usage_record` 和 `token_count`。Dashboard 显示最近一次 input/cached/
-uncached/context 和累计 cache rate；session 尚无 usage 事件时显示 `—`，不会把
-数据库默认 `0` 误报成真实用量。显式记录的零值仍保持为 `0`。
+`token_usage_record` 和 `token_count`。Dashboard 分开显示：
+
+- 线程累计 input/cached/uncached/output；
+- 当前 context/window；
+- 最近一次请求的 cached/uncached 与单次 cache rate；
+- managed Agent 的 latest job 与跨 job ledger 累计值。
+
+百分比和对应 token 数字始终使用同一来源。session 尚无 usage 事件时显示 `—`，
+不会把数据库默认 `0` 误报成真实用量；显式记录的零值仍保持为 `0`。超过默认
+300 秒 stale 判定或 session 已结束的 Native Thread 显示为 `stored`，只有最近
+仍活跃的 session 才显示 `loaded`。
 已经在 `cluster_agents` 登记的 native Thread 即使超过自动发现时间窗，也仍会
 检查其 session 并刷新 usage。
 
@@ -1048,6 +1076,8 @@ Agent runtime 与模型配置：
 | `CODEX_TEAM_CLUSTER_MAX_WORKERS` | `3` | `1..86400` | 调度器再硬限制为最多 `8`；限制每个 goal 的活动 Worker |
 | `CODEX_TEAM_WORKER_TIMEOUT_SECONDS` | `7200`（2 小时） | `1..86400` | Worker job 从启动到强制超时的时间 |
 | `CODEX_TEAM_LEAD_TIMEOUT_SECONDS` | `2700`（45 分钟） | `1..86400` | Lead job 从启动到强制超时的时间 |
+| `CODEX_TEAM_WORKER_RESERVATION_LEASE_MINUTES` | `10` | `5..60` | Worker 启动前控制面 reservation 的初始 lease；Worker 自己 claim 后改为正常 Worker lease |
+| `CODEX_TEAM_WORKER_RESERVATION_GRACE_SECONDS` | `300` | `0..3600` | daemon 恢复时，无 job 的 auto-worker reservation 超过该宽限后自动释放 |
 | `CODEX_TEAM_HEARTBEAT_WARNING_SECONDS` | `300`（5 分钟） | `1..86400` | Worker 心跳超过该时长后进入 warning |
 | `CODEX_TEAM_HEARTBEAT_CRITICAL_SECONDS` | `900`（15 分钟） | `1..86400` | Worker 心跳超过该时长后进入 critical；有效值不会低于 warning |
 
@@ -1062,6 +1092,8 @@ $env:CODEX_TEAM_CLUSTER_MAX_JOBS = "24"
 $env:CODEX_TEAM_CLUSTER_MAX_WORKERS = "2"
 $env:CODEX_TEAM_WORKER_TIMEOUT_SECONDS = "7200"
 $env:CODEX_TEAM_LEAD_TIMEOUT_SECONDS = "2700"
+$env:CODEX_TEAM_WORKER_RESERVATION_LEASE_MINUTES = "10"
+$env:CODEX_TEAM_WORKER_RESERVATION_GRACE_SECONDS = "300"
 $env:CODEX_TEAM_HEARTBEAT_WARNING_SECONDS = "300"
 $env:CODEX_TEAM_HEARTBEAT_CRITICAL_SECONDS = "900"
 # 未设置时默认使用 app_server；如需回退：

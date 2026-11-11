@@ -35,6 +35,7 @@ ASSIGNMENT_SOURCES = frozenset(
         "unique_session_candidate",
         "registration",
         "registry",
+        "claim",
         "ambiguous",
         "none",
     }

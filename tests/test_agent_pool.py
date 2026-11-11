@@ -851,6 +851,35 @@ class AgentPoolTests(unittest.TestCase):
         self.assertEqual(native["runtime"], "native")
         self.assertEqual(native["prompt_status"], "delivered")
         self.assertEqual(native["current_task_id"], "T1")
+        self.assertEqual(native["status"], "stored")
+        fresh = self.pool.register_native_thread(
+            "P1",
+            "team_reviewer",
+            "native-review",
+            "native-thread",
+            "native-reviewer",
+            task_id="T1",
+            prompt_status="delivered",
+            lifecycle="active",
+            lifecycle_source="session_events",
+            session_stale=False,
+            last_seen_at=utc_now(),
+        )
+        self.assertEqual(fresh["status"], "loaded")
+        stale = self.pool.register_native_thread(
+            "P1",
+            "team_reviewer",
+            "native-review",
+            "native-thread",
+            "native-reviewer",
+            task_id="T1",
+            prompt_status="delivered",
+            lifecycle="idle",
+            lifecycle_source="session_events",
+            session_stale=True,
+            last_seen_at=utc_now(),
+        )
+        self.assertEqual(stale["status"], "stored")
         with closing(connect(self.db_path)) as connection:
             connection.execute(
                 """

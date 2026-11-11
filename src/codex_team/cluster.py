@@ -28,6 +28,7 @@ from .app_server import (
 from .cache_contract import agent_cache_profile, configured_surface
 from .config import Settings
 from .db import connect, connect_readonly, utc_now
+from .goal_status import effective_goal_status, goal_was_canceled
 from .native_threads import discover_native_sessions, inspect_native_session
 from .processes import (
     ProcessJob,
@@ -80,6 +81,8 @@ GOAL_STATUS_TRANSITIONS = {
 }
 WORKER_TIMEOUT_SECONDS = DEFAULT_WORKER_TIMEOUT_SECONDS
 LEAD_TIMEOUT_SECONDS = DEFAULT_LEAD_TIMEOUT_SECONDS
+DEFAULT_WORKER_RESERVATION_LEASE_MINUTES = 10
+DEFAULT_WORKER_RESERVATION_GRACE_SECONDS = 300
 FAIRNESS_DEFERRED_INTERVAL_SECONDS = 60
 WORKER_ACTIVITY_EVENT_TYPES = ("claimed", "heartbeat", "progress")
 RUNTIME_MODES = frozenset({"exec", "app_server"})
@@ -389,6 +392,26 @@ class ClusterManager:
             "CODEX_TEAM_LEAD_TIMEOUT_SECONDS",
             DEFAULT_LEAD_TIMEOUT_SECONDS,
         )
+        self.worker_reservation_lease_minutes = max(
+            5,
+            min(
+                env_int(
+                    "CODEX_TEAM_WORKER_RESERVATION_LEASE_MINUTES",
+                    DEFAULT_WORKER_RESERVATION_LEASE_MINUTES,
+                ),
+                60,
+            ),
+        )
+        self.worker_reservation_grace_seconds = max(
+            0,
+            min(
+                env_int(
+                    "CODEX_TEAM_WORKER_RESERVATION_GRACE_SECONDS",
+                    DEFAULT_WORKER_RESERVATION_GRACE_SECONDS,
+                ),
+                3600,
+            ),
+        )
         self.heartbeat_warning_seconds = env_int(
             "CODEX_TEAM_HEARTBEAT_WARNING_SECONDS",
             DEFAULT_HEARTBEAT_WARNING_SECONDS,
@@ -680,6 +703,14 @@ class ClusterManager:
                 ).fetchall()
             ]
             result["events"] = self._goal_events(connection, goal_id, limit=50)
+            raw_status = str(result["status"])
+            effective_status = effective_goal_status(
+                raw_status,
+                result.get("last_error"),
+            )
+            result["raw_status"] = raw_status
+            result["effective_status"] = effective_status
+            result["status"] = effective_status
             result["tasks"] = self.team.list_tasks(
                 result["root_path"],
                 goal_id=goal_id,
@@ -826,7 +857,18 @@ class ClusterManager:
         with self.team.connection(write=False) as connection:
             archive_filter = "" if include_archived else "AND g.archived_at IS NULL"
             if statuses:
-                placeholders = ",".join("?" for _ in statuses)
+                requested_statuses = set(statuses)
+                raw_statuses = {
+                    status
+                    for status in requested_statuses
+                    if status != "canceled"
+                }
+                if "canceled" in requested_statuses:
+                    raw_statuses.add("failed")
+                if not raw_statuses:
+                    return []
+                raw_status_values = sorted(raw_statuses)
+                placeholders = ",".join("?" for _ in raw_status_values)
                 rows = connection.execute(
                     f"""
                     SELECT g.*, p.name AS project_name, p.root_path
@@ -835,7 +877,7 @@ class ClusterManager:
                     {archive_filter}
                     ORDER BY g.updated_at DESC
                     """,
-                    statuses,
+                    raw_status_values,
                 ).fetchall()
             else:
                 rows = connection.execute(
@@ -847,7 +889,20 @@ class ClusterManager:
                     ORDER BY g.updated_at DESC
                     """
                 ).fetchall()
-            return [dict(row) for row in rows]
+            goals: list[dict[str, Any]] = []
+            for row in rows:
+                goal = dict(row)
+                raw_status = str(goal["status"])
+                effective_status = effective_goal_status(
+                    raw_status,
+                    goal.get("last_error"),
+                )
+                goal["raw_status"] = raw_status
+                goal["effective_status"] = effective_status
+                goal["status"] = effective_status
+                if not statuses or effective_status in statuses:
+                    goals.append(goal)
+            return goals
 
     def set_goal_status(self, goal_id: str, status: str, *, reason: str = "") -> dict[str, Any]:
         if status not in {"planning", "active", "paused", "completed", "failed"}:
@@ -924,6 +979,97 @@ class ClusterManager:
             )
         return self.get_goal(goal_id)
 
+    def _reconcile_delivered_terminal_goals(self) -> dict[str, Any]:
+        now = utc_now()
+        reconciled: list[str] = []
+        with self.team.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                SELECT g.goal_id, g.last_error,
+                       MAX(t.completed_at) AS last_task_completed_at,
+                       GROUP_CONCAT(t.task_id) AS task_ids
+                FROM cluster_goals g
+                JOIN projects p ON p.project_id = g.project_id
+                JOIN tasks t ON t.goal_id = g.goal_id
+                WHERE g.status = 'failed'
+                  AND g.archived_at IS NULL
+                  AND p.archived_at IS NULL
+                  AND t.status = 'done'
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM tasks pending
+                    WHERE pending.goal_id = g.goal_id
+                      AND pending.status != 'done'
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM cluster_jobs active
+                    WHERE active.goal_id = g.goal_id
+                      AND active.status IN ('starting', 'running')
+                  )
+                GROUP BY g.goal_id, g.last_error
+                ORDER BY g.goal_id
+                """
+            ).fetchall()
+            for row in rows:
+                goal_id = str(row["goal_id"])
+                completed_at = str(
+                    row["last_task_completed_at"] or now
+                )
+                updated = connection.execute(
+                    """
+                    UPDATE cluster_goals
+                    SET status = 'completed', updated_at = ?,
+                        completed_at = ?, last_error = ?
+                    WHERE goal_id = ? AND status = 'failed'
+                      AND archived_at IS NULL
+                    """,
+                    (
+                        now,
+                        completed_at,
+                        "reconciled: all linked tasks completed after "
+                        "terminal interruption",
+                        goal_id,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    continue
+                self._event(
+                    connection,
+                    goal_id,
+                    "goal_status_reconciled",
+                    "teamd",
+                    {
+                        "previous_status": "failed",
+                        "previous_effective_status": (
+                            "canceled"
+                            if goal_was_canceled(row["last_error"])
+                            else "failed"
+                        ),
+                        "previous_last_error": str(
+                            row["last_error"] or ""
+                        ),
+                        "status": "completed",
+                        "last_task_completed_at": completed_at,
+                        "task_ids": sorted(
+                            {
+                                value
+                                for value in str(
+                                    row["task_ids"] or ""
+                                ).split(",")
+                                if value
+                            }
+                        ),
+                    },
+                )
+                reconciled.append(goal_id)
+        return {
+            "count": len(rows),
+            "reconciled": len(reconciled),
+            "goal_ids": reconciled,
+        }
+
     def cancel_goal(self, goal_id: str, *, reason: str = "canceled by user") -> dict[str, Any]:
         active_jobs: list[dict[str, Any]] = []
         with self.team.connection() as connection:
@@ -986,7 +1132,13 @@ class ClusterManager:
                     last_error = ?
                 WHERE goal_id = ? AND status = ? AND archived_at IS NULL
                 """,
-                (now, now, reason, goal_id, previous_status),
+                (
+                    now,
+                    now,
+                    f"canceled: {reason}",
+                    goal_id,
+                    previous_status,
+                ),
             )
             if fenced.rowcount != 1:
                 raise ClusterError(
@@ -1049,6 +1201,19 @@ class ClusterManager:
             self._event(
                 connection,
                 goal_id,
+                "goal_canceled",
+                "teamd",
+                {
+                    "reason": reason,
+                    "previous_status": previous_status,
+                    "canceled_jobs": [
+                        str(job["job_id"]) for job in active_jobs
+                    ],
+                },
+            )
+            self._event(
+                connection,
+                goal_id,
                 "goal_status",
                 "teamd",
                 {
@@ -1100,7 +1265,8 @@ class ClusterManager:
             if archived:
                 if goal["status"] not in TERMINAL_GOAL_STATUSES:
                     raise ClusterError(
-                        "only completed or failed cluster goals can be archived"
+                        "only completed, canceled, or failed cluster goals "
+                        "can be archived"
                     )
                 active_job = connection.execute(
                     """
@@ -1803,6 +1969,19 @@ class ClusterManager:
                     for field in usage_fields
                     if field not in missing_usage_fields
                 )
+            item_session_stale = bool(item.get("session_stale"))
+            item_lifecycle = str(item.get("lifecycle") or "unknown")
+            expected_native_status = (
+                "loaded"
+                if not item_session_stale
+                and item_lifecycle in {"active", "idle", "unknown"}
+                else "stored"
+            )
+            native_status_changed = (
+                str(existing.get("status") or "")
+                in {"loaded", "stored", "idle"}
+                and str(existing.get("status")) != expected_native_status
+            )
             return any(
                 (
                     existing.get("last_seen_at")
@@ -1818,6 +1997,7 @@ class ClusterManager:
                     != bool(item.get("task_assignment_ambiguous")),
                     existing.get("task_candidates_json") != item_candidates,
                     existing_usage_status != effective_usage_status,
+                    native_status_changed,
                     int(existing.get("native_session_mtime_ns") or 0)
                     != int(
                         item.get("session_mtime_ns")
@@ -2621,8 +2801,33 @@ class ClusterManager:
                 for item in annotated
                 if item.get("status") in {"failed", "deferred"}
             )
+            try:
+                reservation_recovery = (
+                    self._recover_orphan_worker_reservations()
+                )
+            except Exception as exc:
+                reservation_recovery = {
+                    "count": 0,
+                    "released": 0,
+                    "deferred": 1,
+                    "errors": [],
+                }
+                recovery_errors.append(
+                    self._phase_error_record(
+                        "recover",
+                        exc,
+                        source="worker_reservation_recovery",
+                    )
+                )
+            recovery_errors.extend(
+                reservation_recovery.get("errors", [])
+            )
+            phase_data["worker_reservation_recovery"] = (
+                reservation_recovery
+            )
             return {
-                "count": len(annotated),
+                "count": len(annotated)
+                + int(reservation_recovery.get("count", 0)),
                 "completed": sum(
                     item.get("status") == "completed" for item in annotated
                 ),
@@ -2631,6 +2836,13 @@ class ClusterManager:
                 ),
                 "deferred": sum(
                     item.get("status") == "deferred" for item in annotated
+                )
+                + int(reservation_recovery.get("deferred", 0)),
+                "reservations": int(
+                    reservation_recovery.get("count", 0)
+                ),
+                "reservations_released": int(
+                    reservation_recovery.get("released", 0)
                 ),
                 "manual": len(recovery_errors),
                 "_errors": recovery_errors,
@@ -2638,6 +2850,19 @@ class ClusterManager:
 
         def control() -> Mapping[str, Any]:
             control_errors: list[dict[str, Any]] = []
+            try:
+                reconcile_counts = (
+                    self._reconcile_delivered_terminal_goals()
+                )
+            except Exception as exc:
+                reconcile_counts = {}
+                control_errors.append(
+                    self._phase_error_record(
+                        "control",
+                        exc,
+                        source="goal_terminal_reconciliation",
+                    )
+                )
             try:
                 reset_counts = self._apply_agent_reset_requests()
             except Exception as exc:
@@ -2675,7 +2900,11 @@ class ClusterManager:
             phase_data["control_errors"] = control_errors
             return {
                 "count": int(reset_counts.get("count", 0))
-                + int(archive_counts.get("count", 0)),
+                + int(archive_counts.get("count", 0))
+                + int(reconcile_counts.get("reconciled", 0)),
+                "reconciled_goals": int(
+                    reconcile_counts.get("reconciled", 0)
+                ),
                 "agent_resets": int(reset_counts.get("count", 0)),
                 "project_archives": int(
                     archive_counts.get("count", 0)
@@ -3761,10 +3990,7 @@ class ClusterManager:
         role_data = self.team.role_prompt(role, goal["root_path"])
         actor = self._worker_actor(role, task["task_id"], job_id)
         if reserve_claim:
-            lease_minutes = max(
-                5,
-                min((int(self.worker_timeout_seconds) + 59) // 60 + 5, 240),
-            )
+            lease_minutes = self.worker_reservation_lease_minutes
             try:
                 self.team.claim_task(
                     task["task_id"],
@@ -3912,6 +4138,91 @@ Do not return raw logs or a full transcript.
                 },
             )
             return True
+
+    def _recover_orphan_worker_reservations(self) -> dict[str, Any]:
+        now = datetime.now(UTC)
+        with self.team.connection(write=False) as connection:
+            rows = connection.execute(
+                """
+                SELECT t.task_id, t.goal_id, t.claimed_by,
+                       e.created_at AS reservation_at, e.job_id
+                FROM tasks t
+                JOIN cluster_goals g ON g.goal_id = t.goal_id
+                JOIN task_events e ON e.event_id = (
+                    SELECT e2.event_id
+                    FROM task_events e2
+                    WHERE e2.task_id = t.task_id
+                      AND e2.event_type = 'claimed'
+                      AND e2.actor = t.claimed_by
+                    ORDER BY e2.event_id DESC
+                    LIMIT 1
+                )
+                WHERE t.status = 'running'
+                  AND t.claimed_by LIKE 'auto-team_%'
+                  AND t.claim_token IS NOT NULL
+                  AND t.lease_until IS NOT NULL
+                  AND t.archived_at IS NULL
+                  AND g.status IN ('planning', 'active', 'paused')
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM cluster_jobs j
+                    WHERE j.task_id = t.task_id
+                      AND j.actor = t.claimed_by
+                      AND j.status IN ('starting', 'running')
+                  )
+                ORDER BY e.created_at, t.task_id
+                """
+            ).fetchall()
+        released = 0
+        deferred = 0
+        errors: list[dict[str, Any]] = []
+        for row in rows:
+            if row["job_id"]:
+                continue
+            try:
+                reserved_at = datetime.fromisoformat(
+                    str(row["reservation_at"]).replace("Z", "+00:00")
+                )
+                if reserved_at.tzinfo is None:
+                    reserved_at = reserved_at.replace(tzinfo=UTC)
+                age_seconds = max(
+                    0,
+                    int((now - reserved_at).total_seconds()),
+                )
+            except (TypeError, ValueError):
+                age_seconds = 0
+            if age_seconds < self.worker_reservation_grace_seconds:
+                continue
+            try:
+                if self._release_worker_reservation(
+                    str(row["task_id"]),
+                    str(row["goal_id"]),
+                    str(row["claimed_by"]),
+                    reason=(
+                        "orphan auto-worker reservation recovered after "
+                        f"{age_seconds}s without a job"
+                    ),
+                ):
+                    released += 1
+            except Exception as exc:
+                deferred += 1
+                errors.append(
+                    {
+                        **self._phase_error_record(
+                            "recover",
+                            exc,
+                            source="worker_reservation_recovery",
+                        ),
+                        "task_id": str(row["task_id"]),
+                        "goal_id": str(row["goal_id"]),
+                    }
+                )
+        return {
+            "count": len(rows),
+            "released": released,
+            "deferred": deferred,
+            "errors": errors,
+        }
 
     def _require_workflow_epoch(
         self,

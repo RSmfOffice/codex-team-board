@@ -27,6 +27,7 @@ from .db import (
     read_dashboard_revision,
     utc_now,
 )
+from .goal_status import effective_goal_status
 from .scheduling import (
     DEFAULT_GLOBAL_JOB_CAPACITY,
     DEFAULT_GOAL_WORKER_CAPACITY,
@@ -2076,6 +2077,15 @@ class TeamService:
                     """
                 ).fetchall()
             cluster_goals = [dict(row) for row in goal_rows]
+            for goal in cluster_goals:
+                raw_status = str(goal["status"])
+                effective_status = effective_goal_status(
+                    raw_status,
+                    goal.get("last_error"),
+                )
+                goal["raw_status"] = raw_status
+                goal["effective_status"] = effective_status
+                goal["status"] = effective_status
             cluster_jobs = [dict(row) for row in job_rows]
             for job in cluster_jobs:
                 self._project_unknown_usage(job)
@@ -2217,6 +2227,16 @@ class TeamService:
                     agent["session_stale"] = bool(
                         int(agent.get("session_stale") or 0)
                     )
+                    effective_agent_status = str(
+                        agent.get("status") or "unknown"
+                    )
+                    if (
+                        agent["session_stale"]
+                        and effective_agent_status
+                        in {"loaded", "idle"}
+                    ):
+                        effective_agent_status = "stored"
+                    agent["effective_status"] = effective_agent_status
                     usage_status = str(
                         agent.get("native_usage_status") or "unavailable"
                     )
@@ -2249,6 +2269,34 @@ class TeamService:
                                 for field in token_fields
                             )
                         )
+                else:
+                    agent["effective_status"] = agent.get(
+                        "status",
+                        "unknown",
+                    )
+                ledger_values = {
+                    "input": agent.get("ledger_total_input_tokens"),
+                    "cached": agent.get(
+                        "ledger_total_cached_input_tokens"
+                    ),
+                    "uncached": agent.get(
+                        "ledger_total_uncached_input_tokens"
+                    ),
+                    "output": agent.get("ledger_total_output_tokens"),
+                }
+                ledger_has_evidence = any(
+                    value is not None and int(value) > 0
+                    for value in ledger_values.values()
+                )
+                if ledger_has_evidence:
+                    agent["total_input_tokens"] = ledger_values["input"]
+                    agent["total_cached_input_tokens"] = (
+                        ledger_values["cached"]
+                    )
+                    agent["total_uncached_input_tokens"] = (
+                        ledger_values["uncached"]
+                    )
+                    agent["output_tokens"] = ledger_values["output"]
                 total_rate = self._cache_hit_rate(
                     agent.get("total_input_tokens"),
                     agent.get("total_cached_input_tokens"),
@@ -2273,14 +2321,47 @@ class TeamService:
                     latest_usage.get("cached_input_tokens"),
                     latest_usage.get("uncached_input_tokens"),
                 )
+                last_rate = self._cache_hit_rate(
+                    agent.get("last_input_tokens"),
+                    agent.get("last_cached_input_tokens"),
+                    agent.get("last_uncached_input_tokens"),
+                )
+                agent["cumulative_input_tokens"] = agent.get(
+                    "total_input_tokens"
+                )
+                agent["cumulative_cached_input_tokens"] = agent.get(
+                    "total_cached_input_tokens"
+                )
+                agent["cumulative_uncached_input_tokens"] = agent.get(
+                    "total_uncached_input_tokens"
+                )
+                agent["cumulative_output_tokens"] = agent.get(
+                    "output_tokens"
+                )
+                agent["cumulative_cache_hit_rate"] = total_rate
+                agent["last_cache_hit_rate"] = (
+                    last_rate if last_rate is not None else latest_rate
+                )
+                agent["cumulative_usage_source"] = (
+                    "native_session"
+                    if agent.get("runtime") == "native"
+                    and agent.get("usage_available")
+                    else "job_ledger"
+                    if ledger_has_evidence
+                    else "agent_total"
+                    if total_rate is not None
+                    else None
+                )
                 agent["cache_usage_source"] = (
                     "native_session"
                     if agent.get("runtime") == "native"
                     and agent.get("usage_available")
-                    else "agent_total"
-                    if total_rate is not None
                     else "latest_job"
                     if latest_rate is not None
+                    else "job_ledger"
+                    if ledger_has_evidence
+                    else "agent_total"
+                    if total_rate is not None
                     else None
                 )
                 agent["cache_hit_rate"] = (
@@ -2482,6 +2563,7 @@ class TeamService:
             active_jobs_by_task = {
                 job["task_id"]: {
                     "job_id": job["job_id"],
+                    "actor": job.get("actor"),
                     "kind": job["kind"],
                     "role": job["role"],
                     "status": job["status"],
@@ -2505,6 +2587,35 @@ class TeamService:
                 for job in active_jobs
                 if job.get("task_id")
             }
+            claimed_running_tasks = [
+                task
+                for task in tasks
+                if task["status"] == "running" and task.get("claimed_by")
+            ]
+            claimed_actors = sorted(
+                {
+                    str(task["claimed_by"])
+                    for task in claimed_running_tasks
+                }
+            )
+            native_claim_bindings: dict[str, dict[str, Any]] = {}
+            if claimed_actors:
+                placeholders = ",".join("?" for _ in claimed_actors)
+                native_rows = connection.execute(
+                    f"""
+                    SELECT agent_id, thread_id, actor, role, display_name
+                    FROM cluster_agents
+                    WHERE runtime = 'native' AND archived_at IS NULL
+                      AND actor IN ({placeholders})
+                    ORDER BY updated_at DESC, agent_id
+                    """,
+                    claimed_actors,
+                ).fetchall()
+                for row in native_rows:
+                    native_claim_bindings.setdefault(
+                        str(row["actor"]),
+                        dict(row),
+                    )
             active_jobs_by_goal: dict[str, list[dict[str, Any]]] = {}
             active_worker_jobs_by_goal: dict[str, list[dict[str, Any]]] = {}
             active_task_ids: list[str] = []
@@ -2517,6 +2628,10 @@ class TeamService:
                 task_id = job.get("task_id")
                 if task_id:
                     active_task_ids.append(task_id)
+            active_task_ids.extend(
+                str(task["task_id"]) for task in claimed_running_tasks
+            )
+            active_task_ids = list(dict.fromkeys(active_task_ids))
             latest_task_activity: dict[str, str] = {}
             if active_task_ids:
                 placeholders = ",".join("?" for _ in active_task_ids)
@@ -2583,6 +2698,56 @@ class TeamService:
                 )
             for task in tasks:
                 task["active_job"] = active_jobs_by_task.get(task["task_id"])
+                claim_activity_at = latest_task_activity.get(task["task_id"])
+                active_job = task["active_job"]
+                execution: dict[str, Any] | None = None
+                if active_job is not None:
+                    execution = {
+                        "source": "managed_job",
+                        "label": "Managed Job",
+                        "actor": active_job.get("actor"),
+                        "job_id": active_job.get("job_id"),
+                        "role": active_job.get("role"),
+                        "status": active_job.get("status"),
+                        "started_at": active_job.get("started_at"),
+                    }
+                elif task["status"] == "running" and task.get("claimed_by"):
+                    claimed_by = str(task["claimed_by"])
+                    native_binding = native_claim_bindings.get(claimed_by)
+                    if claimed_by.startswith("auto-"):
+                        source = "dispatch_reservation"
+                        label = "等待 Worker 启动"
+                    elif native_binding is not None:
+                        source = "native_claim"
+                        label = "Native Agent"
+                    else:
+                        source = "external_claim"
+                        label = "外部 Agent"
+                    execution = {
+                        "source": source,
+                        "label": label,
+                        "actor": claimed_by,
+                        "agent_id": (
+                            native_binding.get("agent_id")
+                            if native_binding is not None
+                            else None
+                        ),
+                        "thread_id": (
+                            native_binding.get("thread_id")
+                            if native_binding is not None
+                            else None
+                        ),
+                        "display_name": (
+                            native_binding.get("display_name")
+                            if native_binding is not None
+                            else claimed_by
+                        ),
+                        "started_at": claim_activity_at or task.get("updated_at"),
+                        "lease_until": task.get("lease_until"),
+                        "lease_expired": bool(task.get("lease_expired")),
+                    }
+                task["execution"] = execution
+                task["active_execution"] = execution is not None
                 wait_seconds = 0
                 if task["status"] == "ready" and not task["blocked_by"]:
                     try:
@@ -2682,6 +2847,8 @@ class TeamService:
                     goal["next_action"] = "none"
                     goal["attention_task_count"] = 0
                     goal["active_job_count"] = 0
+                    goal["active_execution_count"] = 0
+                    goal["external_execution_count"] = 0
                     goal["heartbeat_age_seconds"] = 0
                     goal["heartbeat_state"] = "idle"
                     goal["queue_reason"] = "none"
@@ -2689,6 +2856,8 @@ class TeamService:
                     continue
                 if is_stalled_goal:
                     goal["health"] = "stalled"
+                elif goal_status == "canceled":
+                    goal["health"] = "canceled"
                 elif (
                     goal_status == "failed"
                     or has_blocked
@@ -2729,10 +2898,24 @@ class TeamService:
                     goal["next_action"] = "wait_for_lead"
                 elif goal_status == "completed":
                     goal["next_action"] = "none"
+                elif goal_status == "canceled":
+                    goal["next_action"] = "none"
                 else:
                     goal["next_action"] = "monitor_goal"
                 goal_jobs = active_jobs_by_goal.get(goal["goal_id"], [])
                 goal["active_job_count"] = len(goal_jobs)
+                goal_tasks = tasks_by_goal.get(goal["goal_id"], [])
+                external_executions = [
+                    task
+                    for task in goal_tasks
+                    if task.get("active_execution")
+                    and task.get("execution", {}).get("source")
+                    != "managed_job"
+                ]
+                goal["active_execution_count"] = (
+                    len(goal_jobs) + len(external_executions)
+                )
+                goal["external_execution_count"] = len(external_executions)
                 goal_heartbeat_age = max(
                     (
                         worker_heartbeat_ages[str(job["job_id"])]
@@ -2747,7 +2930,6 @@ class TeamService:
                     if goal_jobs
                     else "idle"
                 )
-                goal_tasks = tasks_by_goal.get(goal["goal_id"], [])
                 review_tasks = [
                     task for task in goal_tasks if task["status"] == "review"
                 ]
@@ -2890,6 +3072,27 @@ class TeamService:
                 "review_tasks": counts.get("review", 0),
                 "blocked_tasks": counts.get("blocked", 0),
                 "active_jobs": len(active_jobs),
+                "active_executions": len(active_jobs)
+                + sum(
+                    task.get("active_execution")
+                    and (task.get("execution") or {}).get("source")
+                    != "managed_job"
+                    for task in tasks
+                    if not is_historical_task(task)
+                ),
+                "external_executions": sum(
+                    task.get("active_execution")
+                    and (task.get("execution") or {}).get("source")
+                    in {"external_claim", "native_claim", "dispatch_reservation"}
+                    for task in tasks
+                    if not is_historical_task(task)
+                ),
+                "native_executions": sum(
+                    (task.get("execution") or {}).get("source")
+                    == "native_claim"
+                    for task in tasks
+                    if not is_historical_task(task)
+                ),
                 "active_workers": len(worker_heartbeat_ages),
                 "active_leads": sum(
                     job.get("kind") == "lead" for job in active_jobs
@@ -2984,7 +3187,7 @@ class TeamService:
                 raise TeamError("project is archived; restore it before claiming tasks")
             native = connection.execute(
                 """
-                SELECT prompt_status, current_task_id
+                SELECT agent_id, prompt_status, current_task_id, status
                 FROM cluster_agents
                 WHERE project_id = ? AND actor = ? AND runtime = 'native'
                 ORDER BY updated_at DESC, agent_id
@@ -3056,6 +3259,43 @@ class TeamService:
             )
             if updated.rowcount != 1:
                 raise TeamError("task claim conflicted with another update; reload and retry")
+            if native is not None:
+                connection.execute(
+                    """
+                    UPDATE cluster_agents
+                    SET current_task_id = ?, current_goal_id = ?,
+                        status = CASE
+                            WHEN status IN ('loaded', 'stored', 'idle')
+                            THEN 'loaded'
+                            ELSE status
+                        END,
+                        assignment_source = 'claim',
+                        assignment_confidence = 'high',
+                        lifecycle = 'active',
+                        lifecycle_source = 'claim',
+                        last_seen_at = ?, session_stale = 0, updated_at = ?
+                    WHERE agent_id = ? AND archived_at IS NULL
+                    """,
+                    (
+                        task_id,
+                        task["goal_id"],
+                        now,
+                        now,
+                        native["agent_id"],
+                    ),
+                )
+                self.agent_pool._event(
+                    connection,
+                    str(native["agent_id"]),
+                    "native_task_bound",
+                    actor,
+                    {
+                        "task_id": task_id,
+                        "goal_id": task["goal_id"],
+                        "source": "claim",
+                    },
+                    created_at=now,
+                )
             self._event(
                 connection,
                 task_id,

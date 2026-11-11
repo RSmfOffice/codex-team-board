@@ -2,6 +2,23 @@
 
 本项目遵循语义化版本。
 
+## [Unreleased]
+
+### Fixed
+
+- Dashboard 将 `main`、Native 和人工 claim 纳入 `active_executions`，即使没有
+  `cluster_jobs` 也不再显示“无 Agent 运行”；Native claim 在同一事务内绑定
+  Agent、Goal 和 freshness。
+- Worker 启动前 reservation 使用独立 10 分钟 lease，并在 `recover` 阶段释放
+  超过 grace、没有 job 的 auto-worker 孤儿 claim；外部/Native claim 不受影响。
+- Goal 取消通过 `effective_status=canceled` 与 `raw_status=failed` 兼容展示，
+  不再计入 failed；失败/取消目标的所有关联任务后来全部完成时会自动归并为
+  completed，并保留 reconciliation 审计事件。
+- Agent Thread 分开显示线程累计、当前 context 和 latest/last 请求 usage，
+  cache rate 与 token 数字使用同一来源；stale Native Thread 不再显示为 loaded。
+- 顶部同步标识只在 board 语义内容真实变化时显示“已同步”；时间派生 ETag
+  bucket 更新或 board 304 保持“已检查 · 无变化”。
+
 ## [0.5.0] - 2026-11-10
 
 ### Added
