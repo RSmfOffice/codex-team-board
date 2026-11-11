@@ -49,6 +49,7 @@ class MigrationTests(unittest.TestCase):
                         "claim_token",
                         "commit_sha",
                         "merge_commit",
+                        "review_target_commit",
                         "target_branch",
                         "goal_id",
                         "workflow_epoch",

@@ -683,6 +683,98 @@ class TeamFlowTests(unittest.TestCase):
         self.assertEqual(current["status"], "review")
         self.assertEqual(current["commit_sha"], worker_commit)
 
+    def test_review_persists_target_snapshot_when_ref_moves_after_checks(self) -> None:
+        task, worktree, _, _ = self._create_write_task_in_review(
+            name="target snapshot",
+            worktree_name="target-snapshot-worktree",
+        )
+        git(
+            self.repo,
+            "merge",
+            "--no-ff",
+            str(worktree["branch"]),
+            "-m",
+            "merge target snapshot task",
+        )
+        merge_commit = git(self.repo, "rev-parse", "HEAD")
+        base_commit = str(worktree["base_commit"])
+
+        checks_finished = threading.Event()
+        continue_review = threading.Event()
+        original_connection = self.team.connection
+        delayed_write = {"entered": False}
+
+        @contextmanager
+        def pause_before_review_commit(
+            service: TeamService,
+            *,
+            write: bool = True,
+        ):
+            if write and not delayed_write["entered"]:
+                delayed_write["entered"] = True
+                checks_finished.set()
+                if not continue_review.wait(timeout=5):
+                    raise RuntimeError("timed out waiting to continue review")
+            with original_connection(write=write) as connection:
+                yield connection
+
+        self.team.connection = types.MethodType(
+            pause_before_review_commit,
+            self.team,
+        )
+        try:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                review = executor.submit(
+                    self.team.review_task,
+                    str(task["task_id"]),
+                    actor="lead",
+                    approve=True,
+                    notes="verified against the target snapshot",
+                    merge_commit=merge_commit,
+                )
+                self.assertTrue(checks_finished.wait(timeout=5))
+
+                git(self.repo, "update-ref", "refs/heads/main", base_commit)
+                continue_review.set()
+                done = review.result(timeout=5)
+        finally:
+            continue_review.set()
+            self.team.connection = original_connection
+
+        self.assertEqual(done["status"], "done")
+        self.assertEqual(done["merge_commit"], merge_commit)
+        self.assertEqual(done["review_target_commit"], merge_commit)
+        self.assertEqual(git(self.repo, "rev-parse", "refs/heads/main"), base_commit)
+        merge_still_on_target = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.repo),
+                "merge-base",
+                "--is-ancestor",
+                merge_commit,
+                "refs/heads/main",
+            ],
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(merge_still_on_target.returncode, 0)
+
+        reviewed = next(
+            event
+            for event in self.team.get_task_events(str(task["task_id"]))["events"]
+            if event["event_type"] == "reviewed"
+        )
+        self.assertEqual(reviewed["data"]["target_branch"], "main")
+        self.assertEqual(reviewed["data"]["target_commit"], merge_commit)
+        self.assertEqual(reviewed["data"]["merge_commit"], merge_commit)
+        dashboard_task = next(
+            item
+            for item in self.team.dashboard_snapshot()["tasks"]
+            if item["task_id"] == task["task_id"]
+        )
+        self.assertEqual(dashboard_task["review_target_commit"], merge_commit)
+
     def test_review_rejects_archived_task_and_project(self) -> None:
         task = self.team.create_task(
             self.repo,
@@ -974,6 +1066,7 @@ class TeamFlowTests(unittest.TestCase):
         self.assertIsNone(self.team.get_task(task["task_id"])["worktree_path"])
         recovered = self.worktrees.recover_pending()
         self.assertEqual(recovered[0]["status"], "completed")
+        self.assertEqual(self.worktrees.recover_pending(), [])
         current = self.team.get_task(task["task_id"])
         self.assertTrue(Path(current["worktree_path"]).is_dir())
         with self.team.connection(write=False) as connection:
@@ -984,7 +1077,15 @@ class TeamFlowTests(unittest.TestCase):
                 """,
                 (task["task_id"],),
             ).fetchone()
+            created_events = connection.execute(
+                """
+                SELECT COUNT(*) FROM task_events
+                WHERE task_id = ? AND event_type = 'worktree_created'
+                """,
+                (task["task_id"],),
+            ).fetchone()[0]
         self.assertEqual(operation["status"], "completed")
+        self.assertEqual(created_events, 1)
 
     def test_concurrent_worktree_creation_has_one_intent_winner(self) -> None:
         task = self.team.create_task(
@@ -1023,6 +1124,123 @@ class TeamFlowTests(unittest.TestCase):
         self.assertEqual(statuses.count("completed"), 1)
         self.assertNotIn("pending", statuses)
         self.assertNotIn("running", statuses)
+
+    def test_concurrent_tasks_serialize_real_git_worktree_creation(self) -> None:
+        first_task = self.team.create_task(
+            self.repo,
+            title="First serialized worktree",
+            description="Create a real isolated worktree.",
+            acceptance="The first task owns its branch and path.",
+            kind="write",
+            owner_role="team_worker",
+        )
+        second_task = self.team.create_task(
+            self.repo,
+            title="Second serialized worktree",
+            description="Wait for repository-level provisioning.",
+            acceptance="The second task owns its own branch and path.",
+            kind="write",
+            owner_role="team_worker",
+        )
+        first_at_add = threading.Event()
+        second_started = threading.Event()
+        second_git_seen = threading.Event()
+        release_first = threading.Event()
+        state_lock = threading.Lock()
+        first_thread_id: dict[str, int] = {}
+        original_git = WorktreeManager._git
+
+        def observed_git(
+            cwd: Path,
+            *args: str,
+        ) -> subprocess.CompletedProcess[str]:
+            is_first_add = False
+            if args[:2] == ("worktree", "add"):
+                with state_lock:
+                    if "id" not in first_thread_id:
+                        first_thread_id["id"] = threading.get_ident()
+                is_first_add = threading.get_ident() == first_thread_id["id"]
+            if is_first_add:
+                first_at_add.set()
+                if not release_first.wait(timeout=5):
+                    raise RuntimeError("timed out waiting to release first worktree")
+            elif first_at_add.is_set():
+                with state_lock:
+                    is_other_worker = (
+                        threading.get_ident()
+                        != first_thread_id.get("id")
+                    )
+                if is_other_worker:
+                    second_git_seen.set()
+            return original_git(cwd, *args)
+
+        def create_task_worktree(task: dict[str, object], suffix: str) -> object:
+            try:
+                return self.worktrees.create(
+                    str(task["task_id"]),
+                    repo=self.repo,
+                    worktree_path=self.base / f"serialized-{suffix}",
+                )
+            except TeamError as exc:
+                return exc
+
+        with patch.object(
+            WorktreeManager,
+            "_git",
+            staticmethod(observed_git),
+        ):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                first = executor.submit(
+                    create_task_worktree,
+                    first_task,
+                    "first",
+                )
+                self.assertTrue(first_at_add.wait(timeout=5))
+
+                def create_second() -> object:
+                    second_started.set()
+                    return create_task_worktree(second_task, "second")
+
+                second = executor.submit(create_second)
+                self.assertTrue(second_started.wait(timeout=5))
+                try:
+                    self.assertFalse(second_git_seen.wait(timeout=0.3))
+                finally:
+                    release_first.set()
+                first_result = first.result(timeout=5)
+                second_result = second.result(timeout=5)
+
+        self.assertIsInstance(first_result, dict)
+        self.assertIsInstance(second_result, dict)
+        first_saved = self.team.get_task(str(first_task["task_id"]))
+        second_saved = self.team.get_task(str(second_task["task_id"]))
+        self.assertIn(str(first_task["task_id"]).lower(), first_saved["branch"])
+        self.assertIn(str(second_task["task_id"]).lower(), second_saved["branch"])
+        self.assertNotEqual(first_saved["branch"], second_saved["branch"])
+        self.assertNotEqual(
+            first_saved["worktree_path"],
+            second_saved["worktree_path"],
+        )
+        self.assertEqual(
+            Path(
+                git(
+                    Path(first_saved["worktree_path"]),
+                    "rev-parse",
+                    "--show-toplevel",
+                )
+            ).resolve(),
+            Path(first_saved["worktree_path"]).resolve(),
+        )
+        self.assertEqual(
+            Path(
+                git(
+                    Path(second_saved["worktree_path"]),
+                    "rev-parse",
+                    "--show-toplevel",
+                )
+            ).resolve(),
+            Path(second_saved["worktree_path"]).resolve(),
+        )
 
     def test_worktree_intent_without_git_result_is_marked_failed(self) -> None:
         task = self.team.create_task(

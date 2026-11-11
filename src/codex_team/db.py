@@ -6,7 +6,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     blocker TEXT NOT NULL DEFAULT '',
     review_notes TEXT NOT NULL DEFAULT '',
     merge_commit TEXT NOT NULL DEFAULT '',
+    review_target_commit TEXT NOT NULL DEFAULT '',
     version INTEGER NOT NULL DEFAULT 1,
     continuity_mode TEXT NOT NULL DEFAULT 'auto',
     created_at TEXT NOT NULL,
@@ -349,6 +350,7 @@ TASK_MIGRATION_COLUMNS = {
     "blocker": "TEXT NOT NULL DEFAULT ''",
     "review_notes": "TEXT NOT NULL DEFAULT ''",
     "merge_commit": "TEXT NOT NULL DEFAULT ''",
+    "review_target_commit": "TEXT NOT NULL DEFAULT ''",
     "version": "INTEGER NOT NULL DEFAULT 1",
     "completed_at": "TEXT",
     "archived_at": "TEXT",

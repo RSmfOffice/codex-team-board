@@ -1067,6 +1067,7 @@ function renderTaskDetail(task, events) {
       <dt>Worktree</dt><dd>${escapeHtml(task.worktree_path || "—")}</dd>
       <dt>租约</dt><dd>${escapeHtml(timeText(task.lease_until))}</dd>
       <dt>合并提交</dt><dd>${escapeHtml(task.merge_commit || "—")}</dd>
+      <dt>Review 目标快照</dt><dd>${escapeHtml(task.review_target_commit || "—")}</dd>
       <dt>Worker commit</dt><dd>${escapeHtml(task.commit_sha || "—")}</dd>
       <dt>创建时间</dt><dd>${escapeHtml(timeText(task.created_at))}</dd>
     </dl>

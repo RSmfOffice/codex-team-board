@@ -237,8 +237,10 @@ watchdog 和计划任务，确保它们始终连接同一个正式数据库。
 在此之前主 checkout 必须干净并位于命名分支。`team init` 生成的 `AGENTS.md`
 和 `.codex` 文件应先由用户提交，保证每个 worktree 都包含团队规范。
 worktree 创建会先写入 `external_operations` durable intent，再执行 Git 操作并
-回写 task。`teamd` 每个 tick 会恢复已存在但未完成数据库落板的 worktree；若
-Git 结果缺失、branch/target 不匹配或仓库已不可用，intent 会标记 failed 供审计。
+回写 task。create 与 recover 共享仓库级跨线程/进程锁，避免不同 Task 的
+branch、target 和 path 在 Git 拓扑操作中交叉。`teamd` 每个 tick 会恢复已存在
+但未完成数据库落板的 worktree；若 Git 结果缺失、branch/target 不匹配或仓库
+已不可用，intent 会标记 failed 供审计。
 
 Worker 认领：
 
@@ -318,8 +320,11 @@ Review 重点：
 - worktree 没有未提交文件；
 - task 记录的 Worker commit 已包含在 `merge_commit` 中；
 - `merge_commit` 能在主仓库解析；
-- `merge_commit` 已包含在创建任务时固定下来的目标分支中，不受当前 checkout
-  切换影响。
+- `merge_commit` 已包含在 Review 读取的目标分支 commit 快照中，不受当前
+  checkout 切换影响。
+- Review 会固定当时的 target branch commit，并把该快照、`merge_commit` 和
+  Worker commit 一起写入同一个 task version CAS 与 `reviewed` 事件。之后目标
+  分支再移动不会改写已有审批；审计时用 `review_target_commit` 对比后续 ref。
 - task/project 未归档，且 Review 期间 task version 没有变化。
 
 ## 可视化看板
