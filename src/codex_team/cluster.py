@@ -16,7 +16,15 @@ from typing import Any, Mapping
 from . import __version__
 from .agent_home import service_codex_home, sync_agent_codex_home
 from .agent_pool import AgentPool, AgentPoolError
-from .app_server import AppServerEvents, AppServerRuntime
+from .app_server import (
+    AppServerDisconnectedError,
+    AppServerEvents,
+    AppServerProtocolError,
+    AppServerRPCError,
+    AppServerRuntime,
+    AppServerStartupError,
+    AppServerTimeoutError,
+)
 from .cache_contract import agent_cache_profile, configured_surface
 from .config import Settings
 from .db import connect, connect_readonly, utc_now
@@ -90,6 +98,15 @@ TICK_PHASE_RETRY_BASE_SECONDS = 0.05
 TICK_PHASE_RETRY_MAX_SECONDS = 0.5
 TICK_CONTROL_BACKOFF_BASE_SECONDS = 5.0
 TICK_CONTROL_BACKOFF_MAX_SECONDS = 60.0
+APP_SERVER_DELIVERY_MAX_ATTEMPTS = 2
+TRANSIENT_APP_SERVER_ERRORS = (
+    AppServerDisconnectedError,
+    AppServerStartupError,
+    AppServerTimeoutError,
+    ConnectionError,
+    TimeoutError,
+    OSError,
+)
 LEAD_DEVELOPER_INSTRUCTIONS = """You are the managed Lead for an automated
 Codex work cluster. Do not spawn subagents; the deterministic teamd dispatcher
 launches Workers. You may use shell tools and the stable codexTeamBoard Core
@@ -278,6 +295,17 @@ class WorkflowEpochMismatch(ClusterError):
 
 class _AppServerJobStartError(ClusterError):
     """An App Server job could not start after its one runtime restart."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = False,
+        failure_class: str = "permanent",
+    ) -> None:
+        super().__init__(message)
+        self.retryable = bool(retryable)
+        self.failure_class = str(failure_class)
 
 
 class _AppServerGenerationDeltaError(ClusterError):
@@ -897,20 +925,44 @@ class ClusterManager:
         return self.get_goal(goal_id)
 
     def cancel_goal(self, goal_id: str, *, reason: str = "canceled by user") -> dict[str, Any]:
-        goal = self.get_goal(goal_id)
-        if goal["status"] in TERMINAL_GOAL_STATUSES:
-            raise ClusterError(f"cannot cancel terminal goal: {goal['status']}")
-        with self.team.connection(write=False) as connection:
+        active_jobs: list[dict[str, Any]] = []
+        with self.team.connection() as connection:
+            # Fence dispatch and settle the captured task/job set in one writer
+            # transaction. A concurrent archive/status/cancel therefore either
+            # observes the old state and rejects, or the fully canceled state.
+            connection.execute("BEGIN IMMEDIATE")
+            goal = connection.execute(
+                """
+                SELECT g.*, p.root_path
+                FROM cluster_goals g
+                JOIN projects p ON p.project_id = g.project_id
+                WHERE g.goal_id = ?
+                """,
+                (goal_id,),
+            ).fetchone()
+            if goal is None:
+                raise ClusterError(f"cluster goal not found: {goal_id}")
+            if goal["archived_at"] is not None:
+                raise ClusterError(
+                    "archived goal cannot be canceled; restore it first"
+                )
+            previous_status = str(goal["status"])
+            if previous_status in TERMINAL_GOAL_STATUSES:
+                raise ClusterError(
+                    f"cannot cancel terminal goal: {previous_status}"
+                )
+            if previous_status not in GOAL_STATUS_TRANSITIONS:
+                raise ClusterError(
+                    f"cannot cancel goal with unknown status: {previous_status}"
+                )
             active_jobs = [
                 dict(row)
                 for row in connection.execute(
                     """
-                    SELECT job_id, goal_id, pid, role, task_id, agent_id,
-                           thread_id, turn_id, runtime,
-                           process_creation_time, process_executable,
-                           process_instance_id
+                    SELECT *
                     FROM cluster_jobs
                     WHERE goal_id = ? AND status IN ('starting', 'running')
+                    ORDER BY started_at, job_id
                     """,
                     (goal_id,),
                 ).fetchall()
@@ -921,36 +973,72 @@ class ClusterManager:
                     """
                     SELECT task_id, status FROM tasks
                     WHERE goal_id = ? AND status NOT IN ('done', 'canceled')
+                    ORDER BY task_id
                     """,
                     (goal_id,),
                 ).fetchall()
             ]
-        for job in active_jobs:
-            if job.get("runtime") == "app_server":
-                self._interrupt_app_turn(job, reason)
-                continue
-            self._terminate_exec_job(job, exit_code=-9)
-        now = utc_now()
-        with self.team.connection() as connection:
+            now = utc_now()
+            fenced = connection.execute(
+                """
+                UPDATE cluster_goals
+                SET status = 'failed', updated_at = ?, completed_at = ?,
+                    last_error = ?
+                WHERE goal_id = ? AND status = ? AND archived_at IS NULL
+                """,
+                (now, now, reason, goal_id, previous_status),
+            )
+            if fenced.rowcount != 1:
+                raise ClusterError(
+                    "goal changed while cancellation was acquiring its fence"
+                )
             for job in active_jobs:
-                self._settle_job_row(
+                usage: Mapping[str, Any] | None = None
+                usage_source: str | None = None
+                if job.get("runtime") == "app_server":
+                    with self._app_state_lock:
+                        state = dict(self.app_turns.get(job["job_id"], {}))
+                    usage = self._app_job_usage(job, state)
+                    if _usage_has_evidence(usage):
+                        usage_source = (
+                            "cluster_agents.last_usage+runtime_raw_turn"
+                        )
+                settled = self._settle_job_row(
                     connection,
                     job["job_id"],
                     status="interrupted",
                     error=reason,
                     exit_code=-9,
+                    usage=usage,
+                    usage_source=usage_source,
+                    telemetry_complete=(
+                        _usage_is_telemetry_complete(usage)
+                        if usage is not None and _usage_has_evidence(usage)
+                        else False
+                    ),
+                    usage_missing_fields=(
+                        _usage_missing_fields_json(usage)
+                        if usage is not None
+                        else None
+                    ),
                 )
+                if not settled:
+                    raise ClusterError(
+                        f"active job changed before cancellation: {job['job_id']}"
+                    )
             for task in tasks:
-                connection.execute(
+                updated = connection.execute(
                     """
                     UPDATE tasks
                     SET status = 'blocked', blocker = ?, claimed_by = NULL,
                         claim_token = NULL, lease_until = NULL,
                         updated_at = ?, version = version + 1
-                    WHERE task_id = ?
+                    WHERE task_id = ? AND status NOT IN ('done', 'canceled')
                     """,
                     (f"goal canceled: {reason}", now, task["task_id"]),
                 )
+                if updated.rowcount != 1:
+                    continue
                 self.team._event(
                     connection,
                     task["task_id"],
@@ -958,6 +1046,28 @@ class ClusterManager:
                     "teamd",
                     {"goal_id": goal_id, "reason": reason},
                 )
+            self._event(
+                connection,
+                goal_id,
+                "goal_status",
+                "teamd",
+                {
+                    "status": "failed",
+                    "reason": reason,
+                    "previous_status": previous_status,
+                    "canceled_jobs": [
+                        str(job["job_id"]) for job in active_jobs
+                    ],
+                    "blocked_tasks": [
+                        str(task["task_id"]) for task in tasks
+                    ],
+                },
+            )
+        for job in active_jobs:
+            if job.get("runtime") == "app_server":
+                self._interrupt_app_turn(job, reason)
+                continue
+            self._terminate_exec_job(job, exit_code=-9)
         for job in active_jobs:
             if job.get("runtime") != "app_server":
                 continue
@@ -970,7 +1080,7 @@ class ClusterManager:
                 agent_already_failed=False,
                 needs_reset=False,
             )
-        return self.set_goal_status(goal_id, "failed", reason=reason)
+        return self.get_goal(goal_id)
 
     def set_goal_archived(
         self,
@@ -1288,8 +1398,44 @@ class ClusterManager:
         identity_source: str | None = None,
         identity_confidence: str | None = None,
     ) -> dict[str, Any]:
+        inspection = inspect_native_session(
+            thread_id,
+            task_id=task_id,
+        )
+        if not inspection.get("session_found"):
+            raise ClusterError(
+                "native session is missing; project ownership cannot be verified"
+            )
+        session_cwd = str(inspection.get("cwd") or "").strip()
+        if not session_cwd:
+            raise ClusterError(
+                "native session cwd is missing; project ownership cannot be verified"
+            )
         project = self.team.project_for_repo(repo)
         self.team.ensure_project_active(project)
+        active_projects = self.team.list_projects(include_archived=False)
+        matching_projects = [
+            candidate
+            for candidate in active_projects
+            if _path_is_within(
+                session_cwd,
+                str(candidate.get("root_path") or ""),
+            )
+        ]
+        matching_projects.sort(
+            key=lambda candidate: len(
+                str(Path(str(candidate["root_path"])).resolve())
+            ),
+            reverse=True,
+        )
+        if (
+            not matching_projects
+            or str(matching_projects[0]["project_id"])
+            != str(project["project_id"])
+        ):
+            raise ClusterError(
+                "native session cwd does not belong to the requested project"
+            )
         task: dict[str, Any] | None = None
         if task_id:
             task = self.team.get_task(task_id)
@@ -1297,10 +1443,6 @@ class ClusterManager:
                 raise ClusterError("task does not belong to this project")
             if task.get("archived_at"):
                 raise ClusterError("archived task cannot bind a native thread")
-        inspection = inspect_native_session(
-            thread_id,
-            task_id=task_id,
-        )
         inspection_assignment = str(
             inspection.get("assignment_task_id") or ""
         ).strip().upper()
@@ -1707,6 +1849,23 @@ class ClusterManager:
             existing: Mapping[str, Any] | None,
             project: Mapping[str, Any],
         ) -> dict[str, Any]:
+            explicit_assignment = str(
+                item.get("assignment_task_id") or ""
+            ).strip().upper()
+            explicit_task_row = tasks.get(explicit_assignment)
+            if (
+                explicit_assignment
+                and explicit_task_row is not None
+                and (
+                    explicit_task_row["project_id"]
+                    != str(project["project_id"])
+                    or explicit_task_row["archived"]
+                )
+            ):
+                raise ClusterError(
+                    "native session task assignment does not belong to "
+                    "the session project"
+                )
             candidates = sorted(
                 {
                     str(value).strip().upper()
@@ -1766,6 +1925,11 @@ class ClusterManager:
                 project,
             )
             if existing_task:
+                if explicit_task and explicit_task != existing_task:
+                    raise ClusterError(
+                        "native session task assignment conflicts with "
+                        "the registered same-task binding"
+                    )
                 task_id = existing_task
                 assignment_source = "registry"
                 assignment_confidence = "high"
@@ -1836,7 +2000,35 @@ class ClusterManager:
                 skipped_unknown_project.append(thread_id)
                 continue
             existing = registered_threads.get(thread_id)
-            state = normalized_native_state(item, existing, project)
+            if (
+                existing is not None
+                and str(existing.get("project_id"))
+                != str(project["project_id"])
+            ):
+                errors.append(
+                    {
+                        "thread_id": thread_id,
+                        "error": (
+                            "native session cwd belongs to a different "
+                            "project than the registered thread"
+                        ),
+                    }
+                )
+                continue
+            try:
+                state = normalized_native_state(
+                    item,
+                    existing,
+                    project,
+                )
+            except (ClusterError, TeamError, OSError) as exc:
+                errors.append(
+                    {
+                        "thread_id": thread_id,
+                        "error": str(exc),
+                    }
+                )
+                continue
             if (
                 existing is not None
                 and not native_state_needs_refresh(existing, state)
@@ -1907,7 +2099,36 @@ class ClusterManager:
                 thread_id,
                 task_id=existing.get("current_task_id"),
             )
-            state = normalized_native_state(inspection, existing, project)
+            inspected_project = matching_project(inspection.get("cwd"))
+            if (
+                inspected_project is None
+                or str(inspected_project["project_id"])
+                != str(project["project_id"])
+            ):
+                errors.append(
+                    {
+                        "thread_id": thread_id,
+                        "error": (
+                            "native session cwd cannot verify the "
+                            "registered project ownership"
+                        ),
+                    }
+                )
+                continue
+            try:
+                state = normalized_native_state(
+                    inspection,
+                    existing,
+                    project,
+                )
+            except (ClusterError, TeamError, OSError) as exc:
+                errors.append(
+                    {
+                        "thread_id": thread_id,
+                        "error": str(exc),
+                    }
+                )
+                continue
             if not native_state_needs_refresh(existing, state):
                 continue
             try:
@@ -3990,6 +4211,8 @@ Do not return raw logs or a full transcript.
                     role=role,
                     log_path=log_path,
                     runtime_error=str(exc),
+                    retryable=exc.retryable,
+                    failure_class=exc.failure_class,
                 )
                 return self._start_exec_job(
                     goal,
@@ -4233,6 +4456,8 @@ Do not return raw logs or a full transcript.
         role: str,
         log_path: Path,
         runtime_error: str,
+        retryable: bool = False,
+        failure_class: str = "permanent",
     ) -> None:
         runtime_error = self._redact_error(runtime_error)
         with self.team.connection() as connection:
@@ -4278,6 +4503,8 @@ Do not return raw logs or a full transcript.
                 "previous_agent_id": previous_agent_id,
                 "error": runtime_error,
                 "scope": "same_job",
+                "retryable": bool(retryable),
+                "failure_class": str(failure_class),
             }
             self._event(
                 connection,
@@ -4383,6 +4610,12 @@ Do not return raw logs or a full transcript.
         if not isinstance(health, Mapping):
             return False
         return bool(health.get("healthy", health.get("running", False)))
+
+    @staticmethod
+    def _app_server_error_is_transient(exc: BaseException) -> bool:
+        if isinstance(exc, (AppServerProtocolError, AppServerRPCError)):
+            return False
+        return isinstance(exc, TRANSIENT_APP_SERVER_ERRORS)
 
     def _runtime_health(self, runtime: Any) -> Mapping[str, Any]:
         try:
@@ -4671,7 +4904,51 @@ Do not return raw logs or a full transcript.
                 f"{self._redact_error(str(first_error))}",
                 runtime,
             )
-            if self._health_is_healthy(self._runtime_health(runtime)):
+            healthy = self._health_is_healthy(self._runtime_health(runtime))
+            if (
+                self._app_server_error_is_transient(first_error)
+                and healthy
+            ):
+                last_failure: BaseException = first_error
+                for _ in range(1, APP_SERVER_DELIVERY_MAX_ATTEMPTS):
+                    try:
+                        return guarded_start()
+                    except _AppServerGenerationDeltaError as retry_error:
+                        raise _AppServerJobStartError(
+                            self._app_server_failure(
+                                f"{first_failure}; thread/start transient "
+                                f"retry observed a runtime generation "
+                                f"change: "
+                                f"{self._redact_error(str(retry_error))}",
+                                runtime,
+                            ),
+                            retryable=True,
+                            failure_class="transient",
+                        ) from retry_error
+                    except Exception as retry_error:
+                        last_failure = retry_error
+                        if not self._app_server_error_is_transient(
+                            retry_error
+                        ):
+                            raise _AppServerJobStartError(
+                                self._app_server_failure(
+                                    f"{first_failure}; thread/start retry "
+                                    f"failed permanently: "
+                                    f"{self._redact_error(str(retry_error))}",
+                                    runtime,
+                                ),
+                                failure_class="permanent",
+                            ) from retry_error
+                raise _AppServerJobStartError(
+                    self._app_server_failure(
+                        f"{first_failure}; thread/start transient retry "
+                        f"failed: {self._redact_error(str(last_failure))}",
+                        runtime,
+                    ),
+                    retryable=True,
+                    failure_class="transient",
+                ) from last_failure
+            if healthy:
                 raise _AppServerJobStartError(
                     f"{first_failure}; process remained healthy, so the shared "
                     "App Server was not restarted"
@@ -4797,6 +5074,51 @@ Do not return raw logs or a full transcript.
                 f"{self._redact_error(str(first_error))}",
                 runtime,
             )
+            if (
+                self._app_server_error_is_transient(first_error)
+                and self._health_is_healthy(self._runtime_health(runtime))
+            ):
+                last_failure: BaseException = first_error
+                for _ in range(1, APP_SERVER_DELIVERY_MAX_ATTEMPTS):
+                    try:
+                        return guarded_start()
+                    except _AppServerGenerationDeltaError as retry_error:
+                        return self._resume_thread_and_retry_app_turn(
+                            runtime,
+                            thread_id,
+                            turn_input,
+                            cwd=cwd,
+                            sandbox_mode=sandbox_mode,
+                            job_id=job_id,
+                            first_failure=(
+                                f"{first_failure}; transient retry observed "
+                                f"a runtime generation change: "
+                                f"{self._redact_error(str(retry_error))}"
+                            ),
+                        )
+                    except Exception as retry_error:
+                        last_failure = retry_error
+                        if not self._app_server_error_is_transient(
+                            retry_error
+                        ):
+                            raise _AppServerJobStartError(
+                                self._app_server_failure(
+                                    f"{first_failure}; turn/start retry "
+                                    f"failed permanently: "
+                                    f"{self._redact_error(str(retry_error))}",
+                                    runtime,
+                                ),
+                                failure_class="permanent",
+                            ) from retry_error
+                raise _AppServerJobStartError(
+                    self._app_server_failure(
+                        f"{first_failure}; turn/start transient retry "
+                        f"failed: {self._redact_error(str(last_failure))}",
+                        runtime,
+                    ),
+                    retryable=True,
+                    failure_class="transient",
+                ) from last_failure
             if self._health_is_healthy(self._runtime_health(runtime)):
                 raise _AppServerJobStartError(
                     f"{first_failure}; process remained healthy, so the shared "
@@ -5423,40 +5745,69 @@ Do not return raw logs or a full transcript.
                 ORDER BY j.started_at
                 """
             ).fetchall()
+        errors: list[dict[str, Any]] = []
+        processed = 0
         for row in rows:
             job = dict(row)
-            if job.get("runtime") == "app_server":
-                self._reconcile_app_server_job(job)
-                continue
-            process = self.processes.get(job["job_id"])
-            if self._job_timed_out(job):
-                terminated = self._terminate_exec_job(job, exit_code=-9)
-                if (
-                    process is None
-                    and persisted_process_is_running(job)
-                    and not terminated
-                ):
-                    continue
-                self._finish_job(job, -9, forced_error="job timeout")
-                continue
-            exit_code = process.poll() if process is not None else None
-            if process is not None and exit_code is None:
-                continue
-            if process is None:
-                if persisted_process_is_running(job):
-                    if not self._terminate_exec_job(job, exit_code=-9):
-                        continue
-                self._finish_job(
-                    job,
-                    exit_code,
-                    forced_error=(
-                        "exec job process is not owned by this daemon instance"
-                    ),
-                    forced_status="lost",
+            try:
+                self._reconcile_job(job)
+                processed += 1
+            except Exception as exc:
+                errors.append(
+                    {
+                        "source": "job_settlement",
+                        "error_code": "job_settlement_failed",
+                        "job_id": str(job.get("job_id") or ""),
+                        "goal_id": str(job.get("goal_id") or ""),
+                        "task_id": str(job.get("task_id") or ""),
+                        "kind": str(job.get("kind") or ""),
+                        "runtime": str(job.get("runtime") or ""),
+                        "error_type": type(exc).__name__,
+                        "redacted_error": self._redact_error(str(exc)),
+                    }
                 )
-            else:
-                self._finish_job(job, exit_code)
-        return {"count": len(rows)}
+        result: dict[str, Any] = {
+            "count": len(rows),
+            "processed": processed,
+            "deferred": len(errors),
+            "errors": errors,
+        }
+        if errors:
+            result["_errors"] = errors
+        return result
+
+    def _reconcile_job(self, job: dict[str, Any]) -> None:
+        if job.get("runtime") == "app_server":
+            self._reconcile_app_server_job(job)
+            return
+        process = self.processes.get(job["job_id"])
+        if self._job_timed_out(job):
+            terminated = self._terminate_exec_job(job, exit_code=-9)
+            if (
+                process is None
+                and persisted_process_is_running(job)
+                and not terminated
+            ):
+                return
+            self._finish_job(job, -9, forced_error="job timeout")
+            return
+        exit_code = process.poll() if process is not None else None
+        if process is not None and exit_code is None:
+            return
+        if process is None:
+            if persisted_process_is_running(job):
+                if not self._terminate_exec_job(job, exit_code=-9):
+                    return
+            self._finish_job(
+                job,
+                exit_code,
+                forced_error=(
+                    "exec job process is not owned by this daemon instance"
+                ),
+                forced_status="lost",
+            )
+            return
+        self._finish_job(job, exit_code)
 
     def _reconcile_app_server_job(self, job: dict[str, Any]) -> None:
         with self._app_state_lock:
@@ -6947,6 +7298,18 @@ def _default_codex_command() -> list[str]:
         known = Path.home() / "AppData/Local/Programs/OpenAI/Codex/bin/codex.exe"
         executable = str(known) if known.is_file() else "codex"
     return [str(executable)]
+
+
+def _path_is_within(path: str | Path, root: str | Path) -> bool:
+    try:
+        resolved_path = Path(path).expanduser().resolve()
+        resolved_root = Path(root).expanduser().resolve()
+    except (OSError, RuntimeError):
+        return False
+    return (
+        resolved_path == resolved_root
+        or resolved_root in resolved_path.parents
+    )
 
 
 def _redact_sensitive_log(text: str) -> str:

@@ -250,6 +250,7 @@ class NativeThreadTests(unittest.TestCase):
                             {
                                 "type": "session_meta",
                                 "payload": {
+                                    "cwd": "D:\\project",
                                     "source": {
                                         "subagent": {
                                             "thread_spawn": {
@@ -297,6 +298,7 @@ class NativeThreadTests(unittest.TestCase):
             self.assertEqual(result["agent_path"], "/root/reviewer")
             self.assertEqual(result["agent_nickname"], "Socrates")
             self.assertEqual(result["agent_role"], "team_reviewer")
+            self.assertEqual(result["cwd"], "D:\\project")
             self.assertEqual(len(result["prompt_hash"]), 64)
 
     def test_missing_session_and_missing_task_are_explicit(self) -> None:
@@ -309,6 +311,7 @@ class NativeThreadTests(unittest.TestCase):
                 root=root,
             )
             self.assertFalse(missing["session_found"])
+            self.assertIsNone(missing["cwd"])
             self.assertEqual(missing["prompt_status"], "missing")
 
             path = root / f"rollout-{thread_id}.jsonl"

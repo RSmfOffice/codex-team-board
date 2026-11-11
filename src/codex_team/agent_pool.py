@@ -738,21 +738,28 @@ class AgentPool:
                     raise AgentPoolError(
                         f"thread {thread_id} is already registered as managed"
                     )
-                identity = (
-                    existing["project_id"],
-                    existing["role"],
-                    existing["workstream_key"],
-                )
-                requested = (project_id, role, workstream_key)
-                if identity != requested and not (
-                    existing["role"] == "unknown"
-                    and role in self.ROLES
-                ) and not (
-                    role == "unknown"
-                    and existing["role"] in self.ROLES
+                if existing["project_id"] != project_id:
+                    raise AgentPoolError(
+                        "native thread project ownership is immutable"
+                    )
+                if existing["workstream_key"] != workstream_key:
+                    raise AgentPoolError(
+                        "native thread workstream identity is immutable"
+                    )
+                if not (
+                    existing["role"] == role
+                    or (
+                        existing["role"] == "unknown"
+                        and role in self.ROLES
+                    )
+                    or (
+                        role == "unknown"
+                        and existing["role"] in self.ROLES
+                    )
                 ):
                     raise AgentPoolError(
-                        f"thread {thread_id} is registered with different native metadata"
+                        f"thread {thread_id} is registered with a different "
+                        "native role"
                     )
                 effective_role = (
                     existing["role"] if role == "unknown" else role

@@ -851,6 +851,16 @@ class AgentPoolTests(unittest.TestCase):
         self.assertEqual(native["runtime"], "native")
         self.assertEqual(native["prompt_status"], "delivered")
         self.assertEqual(native["current_task_id"], "T1")
+        with closing(connect(self.db_path)) as connection:
+            connection.execute(
+                """
+                UPDATE cluster_agents
+                SET current_job_id = 'J1'
+                WHERE agent_id = ?
+                """,
+                (native["agent_id"],),
+            )
+            connection.commit()
         self.assertIsNone(
             self.pool.select_agent(
                 "P1",
@@ -879,6 +889,20 @@ class AgentPoolTests(unittest.TestCase):
         )
         self.assertEqual(refreshed["agent_id"], native["agent_id"])
         self.assertEqual(refreshed["prompt_status"], "missing")
+        self.assertEqual(refreshed["project_id"], "P1")
+        self.assertEqual(refreshed["current_task_id"], "T1")
+        self.assertEqual(refreshed["current_job_id"], "J1")
+        with self.assertRaisesRegex(
+            AgentPoolError,
+            "project ownership is immutable",
+        ):
+            self.pool.register_native_thread(
+                "P2",
+                "team_reviewer",
+                "native-review",
+                "native-thread",
+                "native-reviewer",
+            )
 
         now = utc_now()
         with closing(connect(self.db_path)) as connection:
