@@ -138,6 +138,14 @@ def _stable_developer_instructions(
 
 This identity is stable for the Agent thread. The current goal, assignment,
 board state, and task-specific instructions arrive in the turn input.
+
+## Mutation Idempotency
+
+For every `team_write` call, pass a non-empty top-level `request_id` next to
+`operation` and `arguments`. Derive it from the current job or goal, operation,
+and a stable logical step. Retry the exact same payload with the exact same
+`request_id`; use a new id for a distinct mutation. A mutation without
+`request_id` remains compatible but is explicitly non-idempotent.
 """
 
 
@@ -2550,6 +2558,9 @@ class ClusterManager:
 Use the stable codexTeamBoard Core tools. Do not spawn subagents or another team.
 First call `team_write(operation="team_claim_task", arguments={{...}})` for the
 current task using the Actor name below.
+For every mutation, include a top-level `request_id` such as
+`{job_id}:<operation>:<stable-step>`; retries of the same payload must reuse
+that exact id, while distinct mutations must use different ids.
 Work only on this task. Keep the claim token private. For jobs that may exceed
 four minutes, call `team_write(operation="team_heartbeat", arguments={{...}})`
 at least every three minutes. If your context approaches its limit, commit safe
@@ -2621,7 +2632,10 @@ Do not return raw logs or a full transcript.
         with self.team.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             task = connection.execute(
-                "SELECT status, claimed_by FROM tasks WHERE task_id = ?",
+                """
+                SELECT status, claimed_by, claim_token, version
+                FROM tasks WHERE task_id = ?
+                """,
                 (task_id,),
             ).fetchone()
             if (
@@ -2647,9 +2661,16 @@ Do not return raw logs or a full transcript.
                 SET status = 'ready', claimed_by = NULL, claim_token = NULL,
                     lease_until = NULL, blocker = '', updated_at = ?,
                     version = version + 1
-                WHERE task_id = ? AND status = 'running' AND claimed_by = ?
+                WHERE task_id = ? AND status = 'running' AND version = ?
+                  AND claimed_by = ? AND claim_token IS ?
                 """,
-                (now, task_id, actor),
+                (
+                    now,
+                    task_id,
+                    int(task["version"]),
+                    actor,
+                    task["claim_token"],
+                ),
             )
             if updated.rowcount == 0:
                 return False
@@ -5734,11 +5755,20 @@ Do not return raw logs or a full transcript.
         attempt: int = 0,
         expected_actor: str | None = None,
     ) -> bool:
-        task = self.team.get_task(task_id)
-        if task["status"] in TERMINAL_TASK_STATUSES or task["status"] == "review":
-            return False
-        if task["status"] == "ready":
-            with self.team.connection() as connection:
+        with self.team.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            task = connection.execute(
+                """
+                SELECT status, claimed_by, claim_token, version
+                FROM tasks WHERE task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if task is None:
+                return False
+            if task["status"] in TERMINAL_TASK_STATUSES or task["status"] == "review":
+                return False
+            if task["status"] == "ready":
                 self._event(
                     connection,
                     goal_id,
@@ -5752,30 +5782,29 @@ Do not return raw logs or a full transcript.
                         "already_ready": True,
                     },
                 )
-            return True
-        if task["status"] != "running":
-            return False
-        if expected_actor and task.get("claimed_by") != expected_actor:
-            return False
-        with self.team.connection() as connection:
-            where_claim = (
-                " AND claimed_by = ?"
-                if expected_actor
-                else ""
-            )
-            parameters: list[Any] = [reason, utc_now(), task_id]
-            if expected_actor:
-                parameters.append(expected_actor)
+                return True
+            if task["status"] != "running":
+                return False
+            if expected_actor and task["claimed_by"] != expected_actor:
+                return False
+            owner = expected_actor or task["claimed_by"]
             updated = connection.execute(
                 """
                 UPDATE tasks
                 SET status = 'ready', claimed_by = NULL, claim_token = NULL,
                     lease_until = NULL, blocker = ?, updated_at = ?,
                     version = version + 1
-                WHERE task_id = ? AND status = 'running'
-                """
-                + where_claim,
-                parameters,
+                WHERE task_id = ? AND status = 'running' AND version = ?
+                  AND claimed_by IS ? AND claim_token IS ?
+                """,
+                (
+                    reason,
+                    utc_now(),
+                    task_id,
+                    int(task["version"]),
+                    owner,
+                    task["claim_token"],
+                ),
             )
             if updated.rowcount == 0:
                 return False

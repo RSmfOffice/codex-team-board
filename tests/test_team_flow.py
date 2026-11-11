@@ -19,7 +19,7 @@ from codex_team.cli import build_parser
 from codex_team.cluster import ClusterManager
 from codex_team.dashboard import build_server
 from codex_team.db import SCHEMA_VERSION, utc_now
-from codex_team.mcp import TeamMcpServer, _tool_definitions
+from codex_team.mcp import TeamMcpServer, _process, _tool_definitions
 from codex_team.service import TeamError, TeamService
 from codex_team.worktrees import WorktreeManager
 
@@ -3182,6 +3182,414 @@ class TeamFlowTests(unittest.TestCase):
             {"task_id": task["task_id"]},
         )
         self.assertEqual(fetched["commit_sha"], commit_sha)
+
+    def test_mcp_request_id_replays_result_and_rejects_reuse_conflicts(self) -> None:
+        mcp = TeamMcpServer(self.settings)
+        payload = {
+            "repo_root": str(self.repo),
+            "title": "Idempotent task creation",
+            "description": "A retry must not create a second task.",
+            "acceptance": "The original result is returned.",
+            "kind": "read",
+            "owner_role": "team_explorer",
+        }
+
+        def create(message_id: str) -> dict[str, object]:
+            response = _process(
+                mcp,
+                {
+                    "id": message_id,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "team_write",
+                        "arguments": {
+                            "operation": "team_create_task",
+                            "arguments": payload,
+                            "request_id": "create-task-stable",
+                        },
+                    },
+                },
+            )
+            self.assertIsNotNone(response)
+            result = response["result"]
+            self.assertFalse(result["isError"])
+            return result["structuredContent"]
+
+        with patch.dict(
+            os.environ,
+            {
+                "CODEX_TEAM_MCP_ACCESS": "full",
+                "CODEX_TEAM_MCP_SURFACE": "core",
+            },
+            clear=False,
+        ):
+            first = create("first-create")
+            second = create("retry-create")
+            fetched = mcp.call_tool(
+                "team_get_task",
+                {"task_id": first["task_id"]},
+            )
+            with self.assertRaisesRegex(TeamError, "different payload"):
+                mcp.call_tool(
+                    "team_create_task",
+                    {**payload, "title": "Different payload"},
+                    request_id="create-task-stable",
+                )
+            with self.assertRaisesRegex(TeamError, "different operation"):
+                mcp.call_tool(
+                    "team_claim_task",
+                    payload,
+                    request_id="create-task-stable",
+                )
+
+        self.assertEqual(first, second)
+        self.assertEqual(fetched["task_id"], first["task_id"])
+        with self.team.connection(write=False) as connection:
+            task_count = connection.execute(
+                "SELECT COUNT(*) FROM tasks WHERE title = ?",
+                ("Idempotent task creation",),
+            ).fetchone()[0]
+            event_count = connection.execute(
+                """
+                SELECT COUNT(*) FROM task_events
+                WHERE task_id = ? AND event_type = 'created'
+                """,
+                (first["task_id"],),
+            ).fetchone()[0]
+        self.assertEqual(task_count, 1)
+        self.assertEqual(event_count, 1)
+
+    def test_mcp_request_id_concurrent_retry_executes_once(self) -> None:
+        payload = {
+            "repo_root": str(self.repo),
+            "title": "Concurrent idempotent creation",
+            "description": "Only one caller may execute the mutation.",
+            "acceptance": "Both callers receive the original result.",
+            "kind": "read",
+            "owner_role": "team_explorer",
+        }
+        servers = [TeamMcpServer(self.settings), TeamMcpServer(self.settings)]
+        barrier = threading.Barrier(2)
+
+        def create(server: TeamMcpServer) -> dict[str, object]:
+            barrier.wait(timeout=5)
+            return server.call_tool(
+                "team_create_task",
+                payload,
+                request_id="create-concurrent-stable",
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(create, servers))
+
+        self.assertEqual(results[0], results[1])
+        with self.team.connection(write=False) as connection:
+            task_count = connection.execute(
+                "SELECT COUNT(*) FROM tasks WHERE title = ?",
+                ("Concurrent idempotent creation",),
+            ).fetchone()[0]
+            event_count = connection.execute(
+                """
+                SELECT COUNT(*) FROM task_events
+                WHERE task_id = ? AND event_type = 'created'
+                """,
+                (results[0]["task_id"],),
+            ).fetchone()[0]
+        self.assertEqual(task_count, 1)
+        self.assertEqual(event_count, 1)
+
+    def test_mcp_request_id_replays_message_without_duplicate_event(self) -> None:
+        mcp = TeamMcpServer(self.settings)
+        task = self.team.create_task(
+            self.repo,
+            title="Idempotent message",
+            description="Repeated delivery must not duplicate audit records.",
+            acceptance="One message and one event exist.",
+            kind="read",
+            owner_role="team_explorer",
+        )
+        arguments = {
+            "repo_root": str(self.repo),
+            "sender": "lead",
+            "recipient": "worker",
+            "body": "one durable message",
+            "task_id": task["task_id"],
+        }
+        first = mcp.call_tool(
+            "team_add_message",
+            arguments,
+            request_id="message-stable",
+        )
+        second = mcp.call_tool(
+            "team_add_message",
+            arguments,
+            request_id="message-stable",
+        )
+
+        self.assertEqual(second, first)
+        messages = self.team.list_messages(
+            self.repo,
+            task_id=task["task_id"],
+        )
+        events = self.team.get_task_events(task["task_id"])["events"]
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(
+            [event["event_type"] for event in events].count("message"),
+            1,
+        )
+
+    def test_concurrent_block_and_submit_have_one_state_winner(self) -> None:
+        task = self.team.create_task(
+            self.repo,
+            title="Block submit race",
+            description="Only one transition may own the running claim.",
+            acceptance="The final state is blocked or review, never both.",
+            kind="read",
+            owner_role="team_explorer",
+        )
+        claimed = self.team.claim_task(task["task_id"], actor="race-worker")
+        token = str(claimed["claim_token"])
+        barrier = threading.Barrier(2)
+
+        def block() -> object:
+            barrier.wait(timeout=5)
+            try:
+                return self.team.block_task(
+                    task["task_id"],
+                    actor="race-worker",
+                    reason="blocked concurrently",
+                    claim_token=token,
+                )
+            except TeamError as exc:
+                return exc
+
+        def submit() -> object:
+            barrier.wait(timeout=5)
+            try:
+                return self.team.submit_task(
+                    task["task_id"],
+                    actor="race-worker",
+                    claim_token=token,
+                    result="submitted concurrently",
+                    tests="race fixture",
+                )
+            except TeamError as exc:
+                return exc
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = [
+                executor.submit(block),
+                executor.submit(submit),
+            ]
+            results = [future.result(timeout=10) for future in outcomes]
+
+        self.assertEqual(
+            sum(isinstance(result, dict) for result in results),
+            1,
+        )
+        self.assertEqual(
+            sum(isinstance(result, TeamError) for result in results),
+            1,
+        )
+        current = self.team.get_task(task["task_id"])
+        self.assertIn(current["status"], {"blocked", "review"})
+        event_types = [
+            event["event_type"]
+            for event in self.team.get_task_events(task["task_id"])["events"]
+        ]
+        self.assertEqual(
+            sum(event in {"blocked", "submitted"} for event in event_types),
+            1,
+        )
+
+    def test_concurrent_heartbeat_and_block_cannot_restore_running_state(self) -> None:
+        task = self.team.create_task(
+            self.repo,
+            title="Heartbeat block race",
+            description="A heartbeat must not overwrite a blocked state.",
+            acceptance="The final state is blocked.",
+            kind="read",
+            owner_role="team_explorer",
+        )
+        claimed = self.team.claim_task(task["task_id"], actor="lease-worker")
+        token = str(claimed["claim_token"])
+        barrier = threading.Barrier(2)
+
+        def heartbeat() -> object:
+            barrier.wait(timeout=5)
+            try:
+                return self.team.heartbeat(
+                    task["task_id"],
+                    actor="lease-worker",
+                    claim_token=token,
+                )
+            except TeamError as exc:
+                return exc
+
+        def block() -> object:
+            barrier.wait(timeout=5)
+            try:
+                return self.team.block_task(
+                    task["task_id"],
+                    actor="lease-worker",
+                    reason="block wins the terminal state",
+                    claim_token=token,
+                )
+            except TeamError as exc:
+                return exc
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            heartbeat_future = executor.submit(heartbeat)
+            block_future = executor.submit(block)
+            heartbeat_result = heartbeat_future.result(timeout=10)
+            block_result = block_future.result(timeout=10)
+
+        self.assertIsInstance(block_result, dict)
+        self.assertTrue(
+            isinstance(heartbeat_result, dict)
+            or isinstance(heartbeat_result, TeamError)
+        )
+        self.assertEqual(self.team.get_task(task["task_id"])["status"], "blocked")
+
+    def test_concurrent_recovery_and_submit_have_one_state_winner(self) -> None:
+        manager = ClusterManager(
+            self.settings,
+            team=self.team,
+            worktrees=self.worktrees,
+        )
+        goal = manager.create_goal(
+            self.repo,
+            objective="Recover or submit once",
+            autonomy="auto",
+        )
+        task = self.team.create_task(
+            self.repo,
+            title="Recovery submit race",
+            description="Recovery must not overwrite a submitted task.",
+            acceptance="Exactly one transition wins.",
+            kind="read",
+            owner_role="team_explorer",
+            goal_id=goal["goal_id"],
+        )
+        claimed = self.team.claim_task(task["task_id"], actor="recovery-worker")
+        token = str(claimed["claim_token"])
+        barrier = threading.Barrier(2)
+
+        def recover() -> bool:
+            barrier.wait(timeout=5)
+            return manager._recover_task(
+                task["task_id"],
+                goal["goal_id"],
+                reason="simulated worker recovery",
+                expected_actor="recovery-worker",
+            )
+
+        def submit() -> object:
+            barrier.wait(timeout=5)
+            try:
+                return self.team.submit_task(
+                    task["task_id"],
+                    actor="recovery-worker",
+                    claim_token=token,
+                    result="submitted before recovery",
+                    tests="race fixture",
+                )
+            except TeamError as exc:
+                return exc
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            recovery_future = executor.submit(recover)
+            submit_future = executor.submit(submit)
+            recovery_result = recovery_future.result(timeout=10)
+            submit_result = submit_future.result(timeout=10)
+
+        self.assertEqual(
+            int(recovery_result) + int(isinstance(submit_result, dict)),
+            1,
+        )
+        current = self.team.get_task(task["task_id"])
+        self.assertIn(current["status"], {"ready", "review"})
+        with self.team.connection(write=False) as connection:
+            recovered_event_count = connection.execute(
+                """
+                SELECT COUNT(*) FROM cluster_events
+                WHERE goal_id = ? AND event_type = 'worker_recovered'
+                """,
+                (goal["goal_id"],),
+            ).fetchone()[0]
+        self.assertEqual(recovered_event_count, int(recovery_result))
+
+    def test_reservation_release_and_submit_have_one_state_winner(self) -> None:
+        manager = ClusterManager(
+            self.settings,
+            team=self.team,
+            worktrees=self.worktrees,
+        )
+        goal = manager.create_goal(
+            self.repo,
+            objective="Release or submit once",
+            autonomy="auto",
+        )
+        task = self.team.create_task(
+            self.repo,
+            title="Reservation submit race",
+            description="Reservation cleanup must not overwrite submission.",
+            acceptance="Exactly one transition wins.",
+            kind="read",
+            owner_role="team_explorer",
+            goal_id=goal["goal_id"],
+        )
+        claimed = self.team.claim_task(
+            task["task_id"],
+            actor="reserved-worker",
+        )
+        token = str(claimed["claim_token"])
+        barrier = threading.Barrier(2)
+
+        def release() -> bool:
+            barrier.wait(timeout=5)
+            return manager._release_worker_reservation(
+                task["task_id"],
+                goal["goal_id"],
+                "reserved-worker",
+                reason="simulated startup failure",
+            )
+
+        def submit() -> object:
+            barrier.wait(timeout=5)
+            try:
+                return self.team.submit_task(
+                    task["task_id"],
+                    actor="reserved-worker",
+                    claim_token=token,
+                    result="submitted before reservation release",
+                    tests="race fixture",
+                )
+            except TeamError as exc:
+                return exc
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            release_future = executor.submit(release)
+            submit_future = executor.submit(submit)
+            release_result = release_future.result(timeout=10)
+            submit_result = submit_future.result(timeout=10)
+
+        self.assertEqual(
+            int(release_result) + int(isinstance(submit_result, dict)),
+            1,
+        )
+        current = self.team.get_task(task["task_id"])
+        self.assertIn(current["status"], {"ready", "review"})
+        with self.team.connection(write=False) as connection:
+            release_event_count = connection.execute(
+                """
+                SELECT COUNT(*) FROM cluster_events
+                WHERE goal_id = ?
+                  AND event_type = 'worker_reservation_released'
+                """,
+                (goal["goal_id"],),
+            ).fetchone()[0]
+        self.assertEqual(release_event_count, int(release_result))
 
     def test_concurrent_claim_has_one_winner_and_expired_lease_can_move(self) -> None:
         task = self.team.create_task(

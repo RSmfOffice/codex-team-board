@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -13,11 +14,14 @@ from .cache_contract import (
     MUTATING_TOOLS,
     OPERATIONS,
     READ_OPERATIONS,
+    canonical_json,
     core_tool_definitions,
     operation_help,
+    sha256_text,
 )
 from .config import Settings
 from .cluster import ClusterManager, daemon_status as cluster_daemon_status, ensure_daemon
+from .db import utc_now
 from .prompt_contract import (
     CORE_INSTRUCTIONS,
     INSTRUCTIONS,
@@ -833,9 +837,189 @@ class TeamMcpServer:
             "instructions": _instructions_for_surface(),
         }
 
-    def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+    def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        request_id: str | None = None,
+    ) -> Any:
         if _surface_mode() == "core" and name in CORE_TOOL_NAMES:
+            envelope_request_id = arguments.get("request_id")
+            if (
+                request_id is not None
+                and envelope_request_id is not None
+                and request_id != envelope_request_id
+            ):
+                raise TeamError("conflicting request_id values")
+            if request_id is None:
+                request_id = envelope_request_id
             name, arguments = _unwrap_core_call(name, arguments)
+        normalized_request_id = self._normalize_request_id(request_id)
+        if name in MUTATING_TOOLS and normalized_request_id is not None:
+            return self._call_idempotent(
+                name,
+                arguments,
+                normalized_request_id,
+            )
+        return self._call_tool_once(name, arguments)
+
+    @staticmethod
+    def _normalize_request_id(request_id: object) -> str | None:
+        if request_id is None:
+            return None
+        if not isinstance(request_id, str):
+            raise TeamError("request_id must be a string")
+        normalized = request_id.strip()
+        if not normalized:
+            raise TeamError("request_id must not be empty")
+        if len(normalized) > 256:
+            raise TeamError("request_id must not exceed 256 characters")
+        return normalized
+
+    def _call_idempotent(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        request_id: str,
+    ) -> Any:
+        payload_hash = sha256_text(canonical_json(arguments))
+        deadline = time.monotonic() + 60
+        while True:
+            owns_request = False
+            with self.team.connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                receipt = connection.execute(
+                    """
+                    SELECT operation, payload_hash, status, result_json, error
+                    FROM request_receipts WHERE request_id = ?
+                    """,
+                    (request_id,),
+                ).fetchone()
+                if receipt is None:
+                    now = utc_now()
+                    connection.execute(
+                        """
+                        INSERT INTO request_receipts(
+                            request_id, operation, payload_hash, status,
+                            result_json, error, created_at, updated_at
+                        ) VALUES (?, ?, ?, 'pending', NULL, '', ?, ?)
+                        """,
+                        (request_id, name, payload_hash, now, now),
+                    )
+                    owns_request = True
+                else:
+                    if str(receipt["operation"]) != name:
+                        raise TeamError(
+                            "request_id was already used for a different operation"
+                        )
+                    if str(receipt["payload_hash"]) != payload_hash:
+                        raise TeamError(
+                            "request_id was already used with a different payload"
+                        )
+                    if receipt["status"] == "completed":
+                        try:
+                            return json.loads(str(receipt["result_json"]))
+                        except (TypeError, ValueError) as exc:
+                            raise TeamError(
+                                "stored request result is not valid JSON"
+                            ) from exc
+                    if receipt["status"] == "failed":
+                        raise TeamError(
+                            "request_id previously failed: "
+                            + str(receipt["error"] or "unknown error")
+                        )
+            if owns_request:
+                break
+            if time.monotonic() >= deadline:
+                raise TeamError(
+                    "request_id is still pending or was interrupted; "
+                    "refusing to execute it a second time"
+                )
+            time.sleep(0.05)
+
+        try:
+            result = self._call_tool_once(name, arguments)
+        except Exception as exc:
+            try:
+                self._finish_request_receipt(
+                    request_id,
+                    name,
+                    payload_hash,
+                    error=str(exc)[:4000],
+                )
+            except Exception:
+                LOGGER.exception(
+                    "failed to persist failed request receipt: %s",
+                    name,
+                )
+            raise
+        self._finish_request_receipt(
+            request_id,
+            name,
+            payload_hash,
+            result=result,
+        )
+        return result
+
+    def _finish_request_receipt(
+        self,
+        request_id: str,
+        name: str,
+        payload_hash: str,
+        *,
+        result: Any = None,
+        error: str | None = None,
+    ) -> None:
+        status = "failed" if error is not None else "completed"
+        result_json = (
+            None
+            if error is not None
+            else json.dumps(
+                result,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        with self.team.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            receipt = connection.execute(
+                """
+                SELECT operation, payload_hash, status
+                FROM request_receipts WHERE request_id = ?
+                """,
+                (request_id,),
+            ).fetchone()
+            if (
+                receipt is None
+                or str(receipt["operation"]) != name
+                or str(receipt["payload_hash"]) != payload_hash
+            ):
+                raise TeamError("request receipt changed while the mutation ran")
+            if receipt["status"] != "pending":
+                raise TeamError("request receipt is no longer pending")
+            updated = connection.execute(
+                """
+                UPDATE request_receipts
+                SET status = ?, result_json = ?, error = ?, updated_at = ?
+                WHERE request_id = ? AND operation = ? AND payload_hash = ?
+                  AND status = 'pending'
+                """,
+                (
+                    status,
+                    result_json,
+                    error or "",
+                    utc_now(),
+                    request_id,
+                    name,
+                    payload_hash,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise TeamError("request receipt conflicted with another update")
+
+    def _call_tool_once(self, name: str, arguments: dict[str, Any]) -> Any:
         if name == "help":
             return operation_help(
                 _tool_definitions(),
@@ -1174,14 +1358,30 @@ def _process(server: TeamMcpServer, message: dict[str, Any]) -> dict[str, Any] |
             arguments = params.get("arguments") or {}
             if not isinstance(arguments, dict):
                 raise TeamError("tool arguments must be an object")
+            request_id = (
+                arguments.get("request_id")
+                if _surface_mode() == "core" and name in CORE_TOOL_NAMES
+                else None
+            )
             normalized_name, normalized_arguments = _normalize_tool_call(
                 name,
                 arguments,
             )
             _validate_tool_arguments(normalized_name, normalized_arguments)
             _guard_tool_call(normalized_name, normalized_arguments)
+            if request_id is None:
+                value = server.call_tool(
+                    normalized_name,
+                    normalized_arguments,
+                )
+            else:
+                value = server.call_tool(
+                    normalized_name,
+                    normalized_arguments,
+                    request_id=request_id,
+                )
             result = _tool_result(
-                server.call_tool(normalized_name, normalized_arguments)
+                value
             )
         elif method in {"resources/list", "prompts/list"}:
             result = {"resources": []} if method == "resources/list" else {"prompts": []}
