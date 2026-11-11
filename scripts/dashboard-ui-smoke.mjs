@@ -154,6 +154,8 @@ const boardCss = between(css, ".board {", ".lane {");
 expectText(boardCss, "repeat(5, minmax(0, 1fr))", "board layout");
 
 expectPattern(app, /function\s+buildBoardSignature\s*\(/, "app.js");
+expectPattern(app, /function\s+timeDerivedBucket\s*\(/, "app.js");
+expectText(app, "CACHE_TIME_BUCKET_SECONDS", "app.js time bucket");
 expectPattern(app, /function\s+schedulePoll\s*\(/, "app.js");
 expectPattern(app, /async\s+function\s+pollBoard\s*\(/, "app.js");
 expectPattern(app, /function\s+handleVisibilityChange\s*\(/, "app.js");
@@ -182,6 +184,11 @@ expectText(
 );
 expectText(pollBoardSource, "boardRequired", "pollBoard revision gate");
 expectText(pollBoardSource, "/api/board", "pollBoard conditional board fetch");
+expectText(
+  pollBoardSource,
+  "if (!boardResponse.notModified)",
+  "pollBoard redraws only for a fresh board",
+);
 expectText(
   pollBoardSource,
   "requestRevisableJson",
@@ -621,6 +628,19 @@ assert.equal(
   hooks.buildBoardSignature(secondBoard),
   "generated time and age-only changes must not force a redraw",
 );
+const agedBoard = JSON.parse(JSON.stringify(firstBoard));
+agedBoard.generated_at = "2026-11-07T10:01:00Z";
+agedBoard.tasks[0].claim_wait_seconds = 122;
+agedBoard.cluster_summary.oldest_heartbeat_age_seconds = 1020;
+agedBoard.cluster_goals[0].heartbeat_age_seconds = 380;
+agedBoard.cluster_goals[0].estimated_wait_seconds = 180;
+agedBoard.cluster_goals[1].heartbeat_age_seconds = 1020;
+agedBoard.cluster_goals[1].estimated_wait_seconds = 360;
+assert.notEqual(
+  hooks.buildBoardSignature(firstBoard),
+  hooks.buildBoardSignature(agedBoard),
+  "derived age crossing a display bucket must trigger a redraw",
+);
 const thresholdBoard = JSON.parse(JSON.stringify(secondBoard));
 thresholdBoard.tasks[0].claim_wait_state = "critical";
 assert.notEqual(
@@ -807,6 +827,16 @@ assert.equal(
   clusterHtmlBefore,
   "skipped render must leave the cluster DOM unchanged",
 );
+assert.equal(
+  hooks.renderBoard(agedBoard),
+  true,
+  "new bounded derived ages must refresh the rendered clock fields",
+);
+const agedClusterHtml = fakeElements.get("cluster-overview").innerHTML;
+const agedSummaryHtml = fakeElements.get("cluster-summary").innerHTML;
+assert.match(agedSummaryHtml, /最老 17 分钟/);
+assert.match(agedClusterHtml, /warning · 6 分钟/);
+assert.match(agedClusterHtml, /critical · 17 分钟/);
 
 const meaningfulBoard = JSON.parse(JSON.stringify(secondBoard));
 meaningfulBoard.cluster_summary.attention_count = 0;
@@ -907,6 +937,10 @@ assert.deepEqual(
 assert.equal(hooks.waitDurationText(0), "0 秒");
 assert.equal(hooks.waitDurationText(125), "2 分钟");
 assert.equal(hooks.waitDurationText(undefined), "—");
+assert.equal(hooks.timeDerivedBucket(0), 0);
+assert.equal(hooks.timeDerivedBucket(29), 0);
+assert.equal(hooks.timeDerivedBucket(30), 1);
+assert.equal(hooks.timeDerivedBucket(null), null);
 assert.equal(hooks.summaryNumber({ value: null }, ["value"], 7), 7);
 assert.equal(hooks.summaryNumber({ value: 0 }, ["value"], 7), 0);
 assert.equal(hooks.tokenText(0), "0");

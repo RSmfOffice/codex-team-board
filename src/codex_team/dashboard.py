@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import hashlib
 import ipaddress
+import re
 import threading
 import webbrowser
+from datetime import UTC, datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -29,6 +31,37 @@ STATIC_FILES = {
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
     "/style.css": ("style.css", "text/css; charset=utf-8"),
 }
+CACHE_TIME_BUCKET_SECONDS = 30
+TIME_DERIVED_FIELDS = {
+    "claim_wait_seconds",
+    "estimated_wait_seconds",
+    "heartbeat_age_seconds",
+    "oldest_claim_wait_seconds",
+    "oldest_heartbeat_age_seconds",
+}
+TIME_DERIVED_STATE_FIELDS = {
+    "attention_count",
+    "claim_wait_state",
+    "fairness_wait_count",
+    "health",
+    "heartbeat_overdue",
+    "heartbeat_state",
+    "queue_reason",
+    "queued_goals",
+}
+TIME_DERIVED_ID_FIELDS = {
+    "agent_id",
+    "goal_id",
+    "job_id",
+    "task_id",
+}
+TIME_DERIVED_CONTAINERS = {
+    "cluster_goals",
+    "cluster_summary",
+    "items",
+    "tasks",
+}
+_ETAG_TOKEN = re.compile(r'\*|(?:W/)?"(?:[^"\\]|\\.)*"')
 
 
 def _query_flag(query: dict[str, list[str]], key: str) -> bool:
@@ -58,20 +91,83 @@ def _query_int(
 
 
 def _etag_matches(header: str, etag: str) -> bool:
-    candidates = [
-        item.strip()
-        for item in str(header or "").split(",")
-        if item.strip()
-    ]
-    if "*" in candidates:
-        return True
-    target = etag[2:].strip() if etag.startswith("W/") else etag
-    for candidate in candidates:
-        if candidate.startswith("W/"):
-            candidate = candidate[2:].strip()
-        if candidate == target:
+    def normalized(value: str) -> str:
+        value = value.strip()
+        return value[2:].strip() if value.startswith("W/") else value
+
+    target = normalized(etag)
+    for candidate in _ETAG_TOKEN.findall(str(header or "")):
+        if candidate == "*" or normalized(candidate) == target:
             return True
     return False
+
+
+def _time_bucket(value: object) -> int | None:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return int(parsed.timestamp() // CACHE_TIME_BUCKET_SECONDS)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _has_time_derived_fields(value: object) -> bool:
+    if isinstance(value, dict):
+        return any(
+            key in TIME_DERIVED_FIELDS
+            or _has_time_derived_fields(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_has_time_derived_fields(item) for item in value)
+    return False
+
+
+def _time_derived_context(value: object) -> object:
+    if isinstance(value, list):
+        return [_time_derived_context(item) for item in value]
+    if not isinstance(value, dict):
+        return None
+    context: dict[str, object] = {}
+    for key in TIME_DERIVED_ID_FIELDS:
+        if value.get(key) is not None:
+            context[key] = str(value[key])
+    for key in TIME_DERIVED_STATE_FIELDS:
+        if key in value:
+            context[key] = value[key]
+    for key in TIME_DERIVED_CONTAINERS:
+        if key in value:
+            context[key] = _time_derived_context(value[key])
+    return context
+
+
+def _validator_context(
+    context: dict[str, object],
+    value: object,
+    *,
+    time_aware: bool,
+) -> dict[str, object]:
+    result = dict(context)
+    if time_aware:
+        result["derived"] = _time_derived_context(value)
+    return result
+
+
+def _etag_for_revision(revision: str, context: object) -> str:
+    return f'W/"{_contextual_revision(str(revision), context)}"'
+
+
+def _etag_for_content(value: object, context: object) -> str:
+    digest = hashlib.sha256(
+        json.dumps(
+            {"context": context, "value": value},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+    return f'W/"v2:content-{digest}"'
 
 
 def _contextual_revision(base: str, context: object) -> str:
@@ -315,12 +411,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
             data = self.team_service.dashboard_summary(
                 include_archived=include_archived,
             )
-            self._send_json(
+            revision = str(data["revision"])
+            context = {
+                "scope": "projects",
+                "include_archived": include_archived,
+            }
+            data["revision"] = _contextual_revision(revision, context)
+            self._send_revisable_json(
                 {
                     "projects": data["projects"],
                     "revision": data["revision"],
                     "generated_at": data["generated_at"],
-                }
+                },
+                etag=_etag_for_revision(revision, context),
             )
             return
         if parsed.path == "/api/summary":
@@ -333,15 +436,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
             )
             runtime = self._cluster_runtime()
             data["cluster_runtime"] = runtime
-            data["revision"] = _contextual_revision(
-                data["revision"],
-                _dashboard_context(
-                    project_id,
-                    include_archived,
-                    runtime,
+            revision = str(data["revision"])
+            context = _dashboard_context(
+                project_id,
+                include_archived,
+                runtime,
+            )
+            time_aware = _has_time_derived_fields(data)
+            if time_aware:
+                context["time_bucket"] = _time_bucket(data["generated_at"])
+            data["revision"] = _contextual_revision(revision, context)
+            self._send_revisable_json(
+                data,
+                etag=_etag_for_revision(
+                    revision,
+                    _validator_context(
+                        context,
+                        data,
+                        time_aware=time_aware,
+                    ),
                 ),
             )
-            self._send_revisable_json(data)
             return
         if parsed.path == "/api/board":
             query = parse_qs(parsed.query)
@@ -353,15 +468,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
             )
             runtime = self._cluster_runtime()
             data["cluster_runtime"] = runtime
-            data["revision"] = _contextual_revision(
-                data["revision"],
-                _dashboard_context(
-                    project_id,
-                    include_archived,
-                    runtime,
+            revision = str(data["revision"])
+            context = _dashboard_context(
+                project_id,
+                include_archived,
+                runtime,
+            )
+            time_aware = _has_time_derived_fields(data)
+            if time_aware:
+                context["time_bucket"] = _time_bucket(data["generated_at"])
+            data["revision"] = _contextual_revision(revision, context)
+            self._send_revisable_json(
+                data,
+                etag=_etag_for_revision(
+                    revision,
+                    _validator_context(
+                        context,
+                        data,
+                        time_aware=time_aware,
+                    ),
                 ),
             )
-            self._send_revisable_json(data)
             return
         partitions = {
             "/api/tasks": "tasks",
@@ -384,7 +511,32 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     cursor=cursor,
                 )
                 data["partition"] = partitions[parsed.path]
-                self._send_json(data)
+                revision = str(data["revision"])
+                context: dict[str, object] = {
+                    "scope": "partition",
+                    "partition": partitions[parsed.path],
+                    "project_id": project_id or "",
+                    "include_archived": include_archived,
+                    "limit": int(limit or 100),
+                    "cursor": cursor or "",
+                }
+                time_aware = _has_time_derived_fields(data)
+                if time_aware:
+                    context["time_bucket"] = _time_bucket(
+                        data["generated_at"]
+                    )
+                data["revision"] = _contextual_revision(revision, context)
+                self._send_revisable_json(
+                    data,
+                    etag=_etag_for_revision(
+                        revision,
+                        _validator_context(
+                            context,
+                            data,
+                            time_aware=time_aware,
+                        ),
+                    ),
+                )
             except (TeamError, ValueError) as exc:
                 self._send_json(
                     {"error": str(exc)},
@@ -408,7 +560,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     limit=int(limit or 100),
                     before_event_id=before_event_id,
                 )
-                self._send_json(data)
+                revision = str(data["revision"])
+                context = {
+                    "scope": "events",
+                    "project_id": project_id or "",
+                    "include_archived": include_archived,
+                    "limit": int(limit or 100),
+                    "cursor": before_event_id,
+                }
+                data["revision"] = _contextual_revision(revision, context)
+                self._send_revisable_json(
+                    data,
+                    etag=_etag_for_revision(revision, context),
+                )
             except ValueError as exc:
                 self._send_json(
                     {"error": str(exc)},
@@ -440,7 +604,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     limit=int(limit or 100),
                     before_event_id=before_event_id,
                 )
-                self._send_json(data)
+                context = {
+                    "scope": "task-events",
+                    "task_id": task_id,
+                    "limit": int(limit or 100),
+                    "cursor": before_event_id,
+                }
+                self._send_revisable_json(
+                    data,
+                    etag=_etag_for_content(data, context),
+                )
             except TeamError as exc:
                 status = (
                     HTTPStatus.NOT_FOUND
@@ -808,8 +981,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(content)
 
-    def _send_revisable_json(self, value: dict[str, object]) -> None:
-        etag = f'W/"{value["revision"]}"'
+    def _send_revisable_json(
+        self,
+        value: dict[str, object],
+        *,
+        etag: str | None = None,
+    ) -> None:
+        etag = etag or f'W/"{value["revision"]}"'
         if _etag_matches(str(self.headers.get("If-None-Match") or ""), etag):
             self.send_response(HTTPStatus.NOT_MODIFIED)
             self.send_header("ETag", etag)
