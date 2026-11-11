@@ -266,6 +266,20 @@ try {
       document.body.scrollWidth
     ),
     metricText: document.getElementById("cluster-summary")?.innerText || "",
+    runtimeMetric: (() => {
+      const card = document.querySelector('[data-metric="runtime"]');
+      const copy = card?.querySelector(".metric-copy small");
+      if (!card || !copy) return null;
+      const cardRect = card.getBoundingClientRect();
+      const copyRect = copy.getBoundingClientRect();
+      return {
+        cardWidth: cardRect.width,
+        copyWidth: copyRect.width,
+        copyHeight: copyRect.height,
+        lineRects: copy.getClientRects().length,
+        text: copy.textContent?.trim() || "",
+      };
+    })(),
     topProject: document.getElementById("project-select")?.value || "",
     clusterProject:
       document.getElementById("cluster-project-select")?.value || "",
@@ -295,6 +309,14 @@ try {
       && initial.metricText.includes("LEADS"),
     "lead metric is visible",
     initial.metricText,
+  );
+  check(
+    initial.runtimeMetric
+      && initial.runtimeMetric.cardWidth >= 120
+      && initial.runtimeMetric.copyWidth >= 40
+      && initial.runtimeMetric.lineRects <= 4,
+    "runtime metric remains readable at 1120px",
+    initial.runtimeMetric,
   );
   check(
     initial.scrollWidth <= initial.innerWidth,

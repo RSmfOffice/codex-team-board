@@ -526,6 +526,8 @@ def inspect_native_session(
             "session_path": None,
             "session_candidate_count": candidate_count,
             "session_selection_source": selection_source,
+            "session_mtime_ns": 0,
+            "session_size": 0,
             "parent_thread_id": None,
             "agent_path": None,
             "agent_nickname": None,
@@ -601,9 +603,14 @@ def inspect_native_session(
         else ""
     )
     try:
-        modified_epoch = path.stat().st_mtime
+        file_stat = path.stat()
+        modified_epoch = file_stat.st_mtime
+        session_mtime_ns = file_stat.st_mtime_ns
+        session_size = file_stat.st_size
     except OSError:
         modified_epoch = 0
+        session_mtime_ns = 0
+        session_size = 0
     session_stale = (
         not bool(metadata)
         or modified_epoch <= 0
@@ -627,6 +634,8 @@ def inspect_native_session(
         "session_path": str(path),
         "session_candidate_count": candidate_count,
         "session_selection_source": selection_source,
+        "session_mtime_ns": session_mtime_ns,
+        "session_size": session_size,
         "parent_thread_id": identity["parent_thread_id"],
         "agent_path": identity["agent_path"],
         "agent_nickname": identity["agent_nickname"],
@@ -799,6 +808,10 @@ def _discover_session_file(
     path: Path,
     modified: float,
 ) -> dict[str, Any] | None:
+    try:
+        file_stat = path.stat()
+    except OSError:
+        return None
     metadata = _read_session_metadata(path)
     if not isinstance(metadata, Mapping):
         return None
@@ -869,6 +882,8 @@ def _discover_session_file(
     return {
         "thread_id": thread_id,
         "session_path": str(path),
+        "session_mtime_ns": file_stat.st_mtime_ns,
+        "session_size": file_stat.st_size,
         "cwd": _optional_text(metadata.get("cwd")),
         "parent_thread_id": identity["parent_thread_id"],
         "agent_path": identity["agent_path"],

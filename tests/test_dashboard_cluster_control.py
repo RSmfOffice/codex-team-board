@@ -284,6 +284,171 @@ class DashboardClusterControlTests(unittest.TestCase):
         self.assertEqual(tick["retry"]["used"], 1)
         self.assertTrue(tick["health"]["degraded"])
 
+    def test_tick_only_changes_do_not_break_conditional_304(self) -> None:
+        def daemon_state(
+            tick_id: str,
+            tick_at: str,
+            duration_ms: float,
+            *,
+            degraded: bool = False,
+        ) -> dict[str, object]:
+            failed_phases = ["settle"] if degraded else []
+            error_code = "settle_phase_failure" if degraded else ""
+            phase = {
+                "name": "settle",
+                "ok": not degraded,
+                "degraded": degraded,
+                "attempts": 1,
+                "duration_ms": duration_ms,
+                "error_code": error_code,
+                "redacted_error": "database unavailable" if degraded else "",
+                "retry_suppressed": False,
+            }
+            health = {
+                "ok": not degraded,
+                "degraded": degraded,
+                "failed_phases": failed_phases,
+                "degraded_phases": failed_phases,
+                "skipped_phases": ["dispatch"] if degraded else [],
+                "errors": (
+                    [
+                        {
+                            "phase": "settle",
+                            "source": "settle",
+                            "error_code": error_code,
+                            "redacted_error": "database unavailable",
+                        }
+                    ]
+                    if degraded
+                    else []
+                ),
+            }
+            return {
+                "running": True,
+                "config_mismatch": False,
+                "expected_identity": {
+                    "runtime": "app_server",
+                    "version": "0.5.0",
+                },
+                "state": {
+                    "ok": not degraded,
+                    "tick_id": tick_id,
+                    "tick_at": tick_at,
+                    "degraded": degraded,
+                    "failed_phase": (
+                        "settle" if degraded else None
+                    ),
+                    "failed_phases": failed_phases,
+                    "degraded_phases": failed_phases,
+                    "skipped_phases": (
+                        ["dispatch"] if degraded else []
+                    ),
+                    "error_code": error_code,
+                    "error": (
+                        "database unavailable" if degraded else ""
+                    ),
+                    "phases": [phase],
+                    "retry": {
+                        "limit": 4,
+                        "used": 0,
+                        "exhausted": False,
+                    },
+                    "health": health,
+                },
+            }
+
+        def conditional_status(
+            path: str,
+            etag: str,
+        ) -> tuple[int, str, dict[str, object]]:
+            request = urllib.request.Request(
+                self.base_url + path,
+                headers={"If-None-Match": etag},
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    return (
+                        response.status,
+                        response.headers.get("ETag", ""),
+                        json.loads(response.read().decode("utf-8")),
+                    )
+            except urllib.error.HTTPError as exc:
+                try:
+                    return (
+                        exc.code,
+                        exc.headers.get("ETag", ""),
+                        {},
+                    )
+                finally:
+                    exc.close()
+
+        def response_etag(path: str) -> str:
+            with urllib.request.urlopen(
+                self.base_url + path,
+                timeout=5,
+            ) as response:
+                return response.headers.get("ETag", "")
+
+        first = daemon_state(
+            "TICK-A",
+            "2026-11-11T07:00:00Z",
+            1.0,
+        )
+        second = daemon_state(
+            "TICK-B",
+            "2026-11-11T07:00:05Z",
+            9.0,
+        )
+        semantic = daemon_state(
+            "TICK-C",
+            "2026-11-11T07:00:10Z",
+            2.0,
+            degraded=True,
+        )
+        with patch(
+            "codex_team.dashboard.daemon_status",
+            return_value=first,
+        ):
+            summary = self.get("/api/summary")
+            board = self.get("/api/board")
+            summary_etag = response_etag("/api/summary")
+            board_etag = response_etag("/api/board")
+        with patch(
+            "codex_team.dashboard.daemon_status",
+            return_value=second,
+        ):
+            self.assertEqual(
+                conditional_status("/api/summary", summary_etag)[0],
+                304,
+            )
+            self.assertEqual(
+                conditional_status("/api/board", board_etag)[0],
+                304,
+            )
+            tick_only_summary = self.get("/api/summary")
+            self.assertEqual(
+                tick_only_summary["revision"],
+                summary["revision"],
+            )
+            self.assertEqual(
+                tick_only_summary["cluster_runtime"]["tick"]["tick_id"],
+                "TICK-B",
+            )
+            self.assertEqual(board["revision"], summary["revision"])
+
+        with patch(
+            "codex_team.dashboard.daemon_status",
+            return_value=semantic,
+        ):
+            status, changed_etag, _ = conditional_status(
+                "/api/summary",
+                summary_etag,
+            )
+            self.assertEqual(status, 200)
+            self.assertNotEqual(changed_etag, summary_etag)
+            changed = self.get("/api/summary")
+            self.assertTrue(changed["cluster_runtime"]["tick"]["degraded"])
+
     def test_degraded_tick_round_trips_from_manager_to_dashboard(
         self,
     ) -> None:
@@ -647,6 +812,107 @@ class DashboardClusterControlTests(unittest.TestCase):
         self.assertIsNone(unknown_usage_agent["last_cached_input_tokens"])
         self.assertIsNone(unknown_usage_agent["last_uncached_input_tokens"])
         self.assertIsNone(unknown_usage_agent["context_tokens"])
+
+    def test_sync_native_refreshes_usage_on_same_second_mtime_change(
+        self,
+    ) -> None:
+        sessions_root = self.base / "same-second-native-sessions"
+        sessions_root.mkdir()
+        thread_id = "01a1cafe-8787-7222-8333-944455556666"
+        session_path = sessions_root / f"rollout-{thread_id}.jsonl"
+
+        def write_usage(input_tokens: int) -> None:
+            session_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "session_meta",
+                                "payload": {
+                                    "id": thread_id,
+                                    "cwd": str(self.repo),
+                                    "source": {
+                                        "subagent": {
+                                            "thread_spawn": {
+                                                "parent_thread_id": "parent-same-second",
+                                                "agent_role": "team_explorer",
+                                            }
+                                        }
+                                    },
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "event_msg",
+                                "payload": {
+                                    "type": "token_count",
+                                    "info": {
+                                        "total_token_usage": {
+                                            "input_tokens": input_tokens,
+                                            "cached_input_tokens": int(
+                                                input_tokens * 0.8
+                                            ),
+                                            "output_tokens": 50,
+                                        },
+                                        "last_token_usage": {
+                                            "input_tokens": input_tokens,
+                                            "cached_input_tokens": int(
+                                                input_tokens * 0.8
+                                            ),
+                                            "output_tokens": 50,
+                                        },
+                                        "model_context_window": 996147,
+                                    },
+                                },
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+        same_second = (
+            time.time_ns() // 1_000_000_000
+        ) * 1_000_000_000 + 500_000_000
+        write_usage(100)
+        os.utime(session_path, ns=(same_second, same_second))
+        with patch.dict(
+            os.environ,
+            {"CODEX_NATIVE_SESSIONS_ROOT": str(sessions_root)},
+        ):
+            status, first = self.post(
+                "/api/agents/sync-native",
+                {"limit": 100},
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(first["registered_count"], 1)
+            first_agent = next(
+                agent
+                for agent in self.get("/api/board")["cluster_agents"]
+                if agent["thread_id"] == thread_id
+            )
+            self.assertEqual(first_agent["last_input_tokens"], 100)
+
+            write_usage(200)
+            os.utime(
+                session_path,
+                ns=(same_second, same_second + 1_000),
+            )
+            status, second = self.post(
+                "/api/agents/sync-native",
+                {"limit": 100},
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(second["refreshed_count"], 1)
+            refreshed_agent = next(
+                agent
+                for agent in self.get("/api/board")["cluster_agents"]
+                if agent["thread_id"] == thread_id
+            )
+            self.assertEqual(refreshed_agent["last_input_tokens"], 200)
+            self.assertEqual(refreshed_agent["last_cached_input_tokens"], 160)
 
     def test_sync_refreshes_registered_native_outside_window(self) -> None:
         sessions_root = self.base / "old-native-sessions"

@@ -277,6 +277,8 @@ class MigrationTests(unittest.TestCase):
                         "prompt_hash",
                         "prompt_status",
                         "native_session_path",
+                        "native_session_mtime_ns",
+                        "native_session_size",
                         "last_seen_at",
                         "identity_source",
                         "identity_confidence",
@@ -289,6 +291,7 @@ class MigrationTests(unittest.TestCase):
                         "session_stale",
                         "native_usage_status",
                         "native_usage_missing_fields",
+                        "output_tokens",
                     }.issubset(agent_columns)
                 )
                 goal_columns = {

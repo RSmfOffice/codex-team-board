@@ -149,6 +149,11 @@ class AgentPool:
             "session_stale",
         ):
             agent[field] = bool(int(agent.get(field) or 0))
+        for field in (
+            "native_session_mtime_ns",
+            "native_session_size",
+        ):
+            agent[field] = int(agent.get(field) or 0)
         return agent
 
     @staticmethod
@@ -329,6 +334,7 @@ class AgentPool:
                 total_cached_input_tokens = ?,
                 total_uncached_input_tokens = ?,
                 context_tokens = ?,
+                output_tokens = ?,
                 model_context_window = COALESCE(?, model_context_window),
                 turn_count = ?,
                 last_turn_id = COALESCE(?, last_turn_id),
@@ -344,6 +350,7 @@ class AgentPool:
                 count("total_cached_input_tokens"),
                 count("total_uncached_input_tokens"),
                 count("context_tokens"),
+                count("output_tokens"),
                 model_context_window,
                 count("turn_count"),
                 last_turn_id,
@@ -595,6 +602,8 @@ class AgentPool:
         prompt_hash: str = "",
         prompt_status: str = "unknown",
         native_session_path: str | None = None,
+        native_session_mtime_ns: int = 0,
+        native_session_size: int = 0,
         last_seen_at: str | None = None,
         usage: Mapping[str, Any] | None = None,
         identity_source: str = "unknown",
@@ -768,6 +777,8 @@ class AgentPool:
                         actor = ?, prompt_hash = ?,
                         prompt_status = ?,
                         native_session_path = COALESCE(?, native_session_path),
+                        native_session_mtime_ns = ?,
+                        native_session_size = ?,
                         last_seen_at = COALESCE(?, last_seen_at),
                         last_used_at = COALESCE(?, last_used_at),
                         updated_at = ?,
@@ -796,6 +807,8 @@ class AgentPool:
                         prompt_hash,
                         prompt_status,
                         native_session_path,
+                        int(native_session_mtime_ns or 0),
+                        int(native_session_size or 0),
                         last_seen_at,
                         last_seen_at,
                         now,
@@ -826,6 +839,10 @@ class AgentPool:
                         "task_id": task_id,
                         "prompt_status": prompt_status,
                         "session_path": native_session_path,
+                        "session_mtime_ns": int(
+                            native_session_mtime_ns or 0
+                        ),
+                        "session_size": int(native_session_size or 0),
                         "identity_source": identity_source,
                         "identity_confidence": identity_confidence,
                         "lifecycle": lifecycle,
@@ -851,7 +868,8 @@ class AgentPool:
                     agent_id, project_id, role, workstream_key, display_name,
                     thread_id, runtime, parent_thread_id, agent_path,
                     agent_nickname, actor, prompt_hash, prompt_status,
-                    native_session_path, last_seen_at, identity_source,
+                    native_session_path, native_session_mtime_ns,
+                    native_session_size, last_seen_at, identity_source,
                     identity_confidence, lifecycle, lifecycle_source,
                     assignment_source, assignment_confidence,
                     task_candidates_json, task_assignment_ambiguous,
@@ -859,7 +877,7 @@ class AgentPool:
                     model, model_provider, current_goal_id, current_task_id,
                     last_loaded_at, last_used_at, created_at, updated_at
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, 'native', ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, 'native', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     'native', 'loaded', ?, ?, ?, ?, ?, ?, ?, ?
                 )
@@ -881,6 +899,8 @@ class AgentPool:
                     prompt_hash,
                     prompt_status,
                     native_session_path,
+                    int(native_session_mtime_ns or 0),
+                    int(native_session_size or 0),
                     last_seen_at or now,
                     identity_source,
                     identity_confidence,
@@ -922,6 +942,10 @@ class AgentPool:
                     "agent_nickname": agent_nickname,
                     "prompt_status": prompt_status,
                     "session_path": native_session_path,
+                    "session_mtime_ns": int(
+                        native_session_mtime_ns or 0
+                    ),
+                    "session_size": int(native_session_size or 0),
                     "identity_source": identity_source,
                     "identity_confidence": identity_confidence,
                     "lifecycle": lifecycle,

@@ -192,7 +192,7 @@ input[type="text"]:focus {
 
 .cluster-summary {
   display: grid;
-  grid-template-columns: repeat(8, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
   gap: 6px;
   margin-top: 10px;
 }
@@ -227,7 +227,8 @@ input[type="text"]:focus {
   color: #6f839b;
   font-size: 8px;
   letter-spacing: 0;
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
+  word-break: normal;
 }
 .cluster-metric.attention {
   border-color: rgba(244, 191, 101, 0.45);

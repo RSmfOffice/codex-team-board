@@ -874,9 +874,10 @@ class ClusterSchedulerTests(unittest.TestCase):
                     ],
                 }
                 result = manager.tick()
+                second_result = manager.tick()
 
-        self.assertTrue(mocks["reset"].called)
-        self.assertTrue(mocks["archive"].called)
+        self.assertEqual(mocks["reset"].call_count, 3)
+        self.assertEqual(mocks["archive"].call_count, 3)
         self.assertEqual(result["failed_phases"], ["control"])
         self.assertEqual(len(result["errors"]), 2)
         errors = json.dumps(result["errors"], ensure_ascii=False)
@@ -884,7 +885,16 @@ class ClusterSchedulerTests(unittest.TestCase):
         self.assertIn("archive denied", errors)
         self.assertNotIn("dispatch", result["skipped_phases"])
         self.assertTrue(safe_prepare.called)
-        mocks["dispatch"].assert_called_once_with([safe_goal])
+        self.assertEqual(mocks["dispatch"].call_count, 2)
+        mocks["dispatch"].assert_called_with([safe_goal])
+        second_control = next(
+            phase
+            for phase in second_result["phases"]
+            if phase["name"] == "control"
+        )
+        self.assertEqual(second_control["attempts"], 1)
+        self.assertTrue(second_control["retry_suppressed"])
+        self.assertEqual(second_result["retry_used"], 0)
 
     def test_tick_worktree_uncertain_recovery_requires_manual_action(
         self,
