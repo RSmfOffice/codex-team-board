@@ -14,6 +14,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
+from codex_team.cache_contract import canonical_json, sha256_text
 from codex_team.config import Settings
 from codex_team.cli import build_parser
 from codex_team.cluster import ClusterError, ClusterManager
@@ -833,6 +834,76 @@ class TeamFlowTests(unittest.TestCase):
                 notes="must reject archived project",
             )
 
+    def test_review_requires_trusted_managed_authority(self) -> None:
+        def submit_read_task(title: str) -> dict[str, object]:
+            task = self.team.create_task(
+                self.repo,
+                title=title,
+                description="Authority is bound by the local MCP process.",
+                acceptance="Only trusted Lead or human callers may review.",
+                kind="read",
+                owner_role="team_explorer",
+            )
+            claimed = self.team.claim_task(
+                str(task["task_id"]),
+                actor=f"{title}-worker",
+            )
+            self.team.submit_task(
+                str(task["task_id"]),
+                actor=f"{title}-worker",
+                claim_token=str(claimed["claim_token"]),
+                result="ready for review",
+                tests="authority fixture",
+            )
+            return task
+
+        worker_task = submit_read_task("Forged worker review")
+        with patch.dict(
+            os.environ,
+            {
+                "CODEX_TEAM_ROLE": "team_worker",
+                "CODEX_TEAM_ACTOR": "managed-worker",
+            },
+            clear=False,
+        ):
+            with self.assertRaisesRegex(TeamError, "managed role team_worker"):
+                self.team.review_task(
+                    str(worker_task["task_id"]),
+                    actor="lead",
+                    approve=True,
+                    notes="forged actor must not elevate",
+                )
+        self.assertEqual(
+            self.team.get_task(str(worker_task["task_id"]))["status"],
+            "review",
+        )
+
+        lead_task = submit_read_task("Managed lead review")
+        with patch.dict(
+            os.environ,
+            {
+                "CODEX_TEAM_ROLE": "lead",
+                "CODEX_TEAM_ACTOR": "",
+            },
+            clear=False,
+        ):
+            reviewed = self.team.review_task(
+                str(lead_task["task_id"]),
+                actor="lead",
+                approve=True,
+                notes="trusted managed lead",
+            )
+        self.assertEqual(reviewed["status"], "done")
+
+        human_task = submit_read_task("Direct human review")
+        human_reviewed = self.team.review_task(
+            str(human_task["task_id"]),
+            actor="human",
+            approve=True,
+            notes="direct local human path",
+        )
+        self.assertEqual(human_reviewed["status"], "done")
+
     def test_concurrent_review_has_one_terminal_winner(self) -> None:
         task = self.team.create_task(
             self.repo,
@@ -1501,6 +1572,160 @@ class TeamFlowTests(unittest.TestCase):
             ],
         )
 
+    def test_archive_is_idempotent_and_traces_trusted_actor(self) -> None:
+        task = self.team.create_task(
+            self.repo,
+            title="Archive idempotence",
+            description="Repeated archive requests must not rewrite history.",
+            acceptance="State, version, and events change only on transitions.",
+            kind="read",
+            owner_role="team_explorer",
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "CODEX_TEAM_ROLE": "team_worker",
+                "CODEX_TEAM_ACTOR": "managed-worker",
+            },
+            clear=False,
+        ):
+            with self.assertRaisesRegex(TeamError, "managed role team_worker"):
+                self.team.set_task_archived(
+                    str(task["task_id"]),
+                    True,
+                    actor="human",
+                )
+        self.assertIsNone(
+            self.team.get_task(str(task["task_id"]))["archived_at"]
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "CODEX_TEAM_ROLE": "lead",
+                "CODEX_TEAM_ACTOR": "",
+            },
+            clear=False,
+        ):
+            archived = self.team.set_task_archived(
+                str(task["task_id"]),
+                True,
+                actor="lead",
+            )
+        self.assertIsNotNone(archived["archived_at"])
+        version = archived["version"]
+        events_after_first = self.team.get_task_events(
+            str(task["task_id"])
+        )["events"]
+        archive_events = [
+            event
+            for event in events_after_first
+            if event["event_type"] == "archived"
+        ]
+        self.assertEqual(len(archive_events), 1)
+        self.assertEqual(archive_events[0]["actor"], "lead")
+
+        repeated = self.team.set_task_archived(
+            str(task["task_id"]),
+            True,
+            actor="lead",
+        )
+        self.assertEqual(repeated["version"], version)
+        self.assertEqual(
+            len(
+                [
+                    event
+                    for event in self.team.get_task_events(
+                        str(task["task_id"])
+                    )["events"]
+                    if event["event_type"] == "archived"
+                ]
+            ),
+            1,
+        )
+
+        restored = self.team.set_task_archived(
+            str(task["task_id"]),
+            False,
+            actor="lead",
+        )
+        self.assertIsNone(restored["archived_at"])
+        restored_version = restored["version"]
+        restored_again = self.team.set_task_archived(
+            str(task["task_id"]),
+            False,
+            actor="lead",
+        )
+        self.assertEqual(restored_again["version"], restored_version)
+        self.assertEqual(
+            len(
+                [
+                    event
+                    for event in self.team.get_task_events(
+                        str(task["task_id"])
+                    )["events"]
+                    if event["event_type"] == "restored"
+                ]
+            ),
+            1,
+        )
+
+    def test_archived_parents_block_manual_restore(self) -> None:
+        task = self.team.create_task(
+            self.repo,
+            title="Project archived task",
+            description="Manual restore must not bypass a parent archive.",
+            acceptance="The project must be restored first.",
+            kind="read",
+            owner_role="team_explorer",
+        )
+        project = self.team.get_project(str(task["project_id"]))
+        self.team.set_task_archived(str(task["task_id"]), True)
+        self.team.set_project_archived(str(project["project_id"]), True)
+        with self.assertRaisesRegex(TeamError, "project is archived"):
+            self.team.set_task_archived(
+                str(task["task_id"]),
+                False,
+            )
+        self.team.set_project_archived(str(project["project_id"]), False)
+        self.team.set_task_archived(str(task["task_id"]), False)
+
+        manager = ClusterManager(
+            self.settings,
+            team=self.team,
+            worktrees=self.worktrees,
+        )
+        goal = manager.create_goal(
+            self.repo,
+            objective="Goal archive restore guard",
+            autonomy="supervised",
+        )
+        goal_task = self.team.create_task(
+            self.repo,
+            title="Goal archived task",
+            description="The parent goal owns the archive state.",
+            acceptance="The goal must be restored first.",
+            kind="read",
+            owner_role="team_explorer",
+            goal_id=goal["goal_id"],
+        )
+        manager.set_goal_status(goal["goal_id"], "active")
+        manager.set_goal_status(goal["goal_id"], "completed")
+        manager.set_goal_archived(goal["goal_id"], True)
+        with self.assertRaisesRegex(TeamError, "restore the goal first"):
+            self.team.set_task_archived(
+                str(goal_task["task_id"]),
+                False,
+            )
+        restored_goal = manager.set_goal_archived(
+            goal["goal_id"],
+            False,
+        )
+        self.assertIsNone(restored_goal["archived_at"])
+        self.assertIsNone(
+            self.team.get_task(str(goal_task["task_id"]))["archived_at"]
+        )
+
     def test_task_archive_rejects_active_goal(self) -> None:
         manager = ClusterManager(
             self.settings,
@@ -1956,6 +2181,104 @@ class TeamFlowTests(unittest.TestCase):
         )
         self.assertEqual(dashboard_agent["runtime"], "native")
         self.assertEqual(dashboard_agent["prompt_status"], "delivered")
+
+    def test_native_heartbeat_refreshes_agent_freshness_atomically(self) -> None:
+        task = self.team.create_task(
+            self.repo,
+            title="Native heartbeat freshness",
+            description="Heartbeat must refresh the bound native agent.",
+            acceptance="Task lease and agent freshness commit together.",
+            kind="read",
+            owner_role="team_explorer",
+        )
+        project_id = str(task["project_id"])
+        agent_id = "A-NATIVE-HEARTBEAT"
+        now = utc_now()
+        with self.team.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO cluster_agents(
+                    agent_id, project_id, role, workstream_key, display_name,
+                    thread_id, runtime, actor, prompt_status, status,
+                    current_task_id, last_seen_at, session_stale,
+                    created_at, updated_at
+                ) VALUES (
+                    ?, ?, 'team_explorer', 'native-heartbeat',
+                    'Native heartbeat', 'native-heartbeat-thread', 'native',
+                    'native-heartbeat-actor', 'delivered', 'loaded', ?,
+                    '2000-01-01T00:00:00Z', 1, ?, ?
+                )
+                """,
+                (
+                    agent_id,
+                    project_id,
+                    task["task_id"],
+                    now,
+                    now,
+                ),
+            )
+        claimed = self.team.claim_task(
+            str(task["task_id"]),
+            actor="native-heartbeat-actor",
+        )
+        token = str(claimed["claim_token"])
+        with self.team.connection() as connection:
+            connection.execute(
+                """
+                UPDATE cluster_agents
+                SET last_seen_at = '2000-01-01T00:00:00Z',
+                    session_stale = 1
+                WHERE agent_id = ?
+                """,
+                (agent_id,),
+            )
+        heartbeat = self.team.heartbeat(
+            str(task["task_id"]),
+            actor="native-heartbeat-actor",
+            claim_token=token,
+        )
+        with self.team.connection(write=False) as connection:
+            agent = connection.execute(
+                """
+                SELECT last_seen_at, session_stale, updated_at
+                FROM cluster_agents WHERE agent_id = ?
+                """,
+                (agent_id,),
+            ).fetchone()
+        self.assertNotEqual(agent["last_seen_at"], "2000-01-01T00:00:00Z")
+        self.assertEqual(agent["session_stale"], 0)
+        self.assertGreaterEqual(
+            agent["updated_at"],
+            heartbeat["updated_at"],
+        )
+
+        task_before = self.team.get_task(str(task["task_id"]))
+        agent_before = dict(agent)
+        with patch.object(
+            TeamService,
+            "_event",
+            side_effect=RuntimeError("simulated event failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "event failure"):
+                self.team.heartbeat(
+                    str(task["task_id"]),
+                    actor="native-heartbeat-actor",
+                    claim_token=token,
+                )
+        task_after = self.team.get_task(str(task["task_id"]))
+        with self.team.connection(write=False) as connection:
+            agent_after = dict(
+                connection.execute(
+                    """
+                    SELECT last_seen_at, session_stale, updated_at
+                    FROM cluster_agents WHERE agent_id = ?
+                    """,
+                    (agent_id,),
+                ).fetchone()
+            )
+        self.assertEqual(task_after["version"], task_before["version"])
+        self.assertEqual(task_after["lease_until"], task_before["lease_until"])
+        self.assertEqual(agent_after, agent_before)
 
     def test_native_prompt_missing_blocks_claim_until_refresh(self) -> None:
         task = self.team.create_task(
@@ -3735,6 +4058,229 @@ class TeamFlowTests(unittest.TestCase):
             [event["event_type"] for event in events].count("message"),
             1,
         )
+
+    def test_mcp_transient_failure_does_not_poison_request_id(self) -> None:
+        mcp = TeamMcpServer(self.settings)
+        original_call = mcp._call_tool_once
+        attempts = {"count": 0}
+
+        def fail_once(name: str, arguments: dict[str, object]) -> object:
+            if name == "team_create_task" and attempts["count"] == 0:
+                attempts["count"] += 1
+                raise OSError("simulated delivery interruption")
+            return original_call(name, arguments)
+
+        mcp._call_tool_once = fail_once  # type: ignore[method-assign]
+        payload = {
+            "repo_root": str(self.repo),
+            "title": "Transient receipt retry",
+            "description": "A pre-effect transport failure is retryable.",
+            "acceptance": "Exactly one task is created.",
+            "kind": "read",
+            "owner_role": "team_explorer",
+        }
+        with self.assertRaisesRegex(OSError, "delivery interruption"):
+            mcp.call_tool(
+                "team_create_task",
+                payload,
+                request_id="transient-create-stable",
+            )
+        with self.team.connection(write=False) as connection:
+            failed_receipt = connection.execute(
+                """
+                SELECT status FROM request_receipts WHERE request_id = ?
+                """,
+                ("transient-create-stable",),
+            ).fetchone()
+        self.assertIsNone(failed_receipt)
+
+        created = mcp.call_tool(
+            "team_create_task",
+            payload,
+            request_id="transient-create-stable",
+        )
+        with self.team.connection(write=False) as connection:
+            task_count = connection.execute(
+                """
+                SELECT COUNT(*) FROM tasks WHERE title = ?
+                """,
+                ("Transient receipt retry",),
+            ).fetchone()[0]
+        self.assertEqual(task_count, 1)
+        self.assertEqual(created["title"], "Transient receipt retry")
+
+    def test_mcp_message_commit_recovers_without_duplicate_delivery(
+        self,
+    ) -> None:
+        mcp = TeamMcpServer(self.settings)
+
+        def crash_before_receipt_finish(*args: object, **kwargs: object) -> None:
+            raise OSError("simulated message receipt crash")
+
+        mcp._finish_request_receipt = (  # type: ignore[method-assign]
+            crash_before_receipt_finish
+        )
+        payload = {
+            "repo_root": str(self.repo),
+            "sender": "lead",
+            "recipient": "worker",
+            "body": "exactly one durable delivery",
+        }
+        with self.assertRaisesRegex(OSError, "message receipt crash"):
+            mcp.call_tool(
+                "team_add_message",
+                payload,
+                request_id="crash-safe-message",
+            )
+
+        retry_server = TeamMcpServer(self.settings)
+        recovered = retry_server.call_tool(
+            "team_add_message",
+            payload,
+            request_id="crash-safe-message",
+        )
+        replay = retry_server.call_tool(
+            "team_add_message",
+            payload,
+            request_id="crash-safe-message",
+        )
+        messages = self.team.list_messages(self.repo)
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(recovered, replay)
+        self.assertEqual(recovered["body"], payload["body"])
+
+    def test_mcp_pending_receipt_recovers_committed_result_after_crash(
+        self,
+    ) -> None:
+        mcp = TeamMcpServer(self.settings)
+
+        def crash_before_receipt_finish(*args: object, **kwargs: object) -> None:
+            raise OSError("simulated process death after commit")
+
+        mcp._finish_request_receipt = (  # type: ignore[method-assign]
+            crash_before_receipt_finish
+        )
+        payload = {
+            "repo_root": str(self.repo),
+            "title": "Crash-safe receipt",
+            "description": "The task commit precedes receipt completion.",
+            "acceptance": "Retry recovers the committed task.",
+            "kind": "read",
+            "owner_role": "team_explorer",
+        }
+        with self.assertRaisesRegex(OSError, "process death"):
+            mcp.call_tool(
+                "team_create_task",
+                payload,
+                request_id="crash-safe-create",
+            )
+        with self.team.connection(write=False) as connection:
+            receipt = connection.execute(
+                """
+                SELECT status FROM request_receipts WHERE request_id = ?
+                """,
+                ("crash-safe-create",),
+            ).fetchone()
+            effect = connection.execute(
+                """
+                SELECT status FROM external_operations
+                WHERE operation_id = ? AND operation_type = 'team_create_task'
+                """,
+                ("crash-safe-create",),
+            ).fetchone()
+        self.assertEqual(receipt["status"], "pending")
+        self.assertEqual(effect["status"], "completed")
+
+        retry_server = TeamMcpServer(self.settings)
+        recovered = retry_server.call_tool(
+            "team_create_task",
+            payload,
+            request_id="crash-safe-create",
+        )
+        with self.team.connection(write=False) as connection:
+            task_count = connection.execute(
+                """
+                SELECT COUNT(*) FROM tasks WHERE title = ?
+                """,
+                ("Crash-safe receipt",),
+            ).fetchone()[0]
+            completed = connection.execute(
+                """
+                SELECT status FROM request_receipts WHERE request_id = ?
+                """,
+                ("crash-safe-create",),
+            ).fetchone()
+        self.assertEqual(task_count, 1)
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(recovered["title"], "Crash-safe receipt")
+
+    def test_mcp_pending_receipt_with_dead_owner_is_reclaimed_once(
+        self,
+    ) -> None:
+        mcp = TeamMcpServer(self.settings)
+        payload = {
+            "repo_root": str(self.repo),
+            "title": "Dead owner recovery",
+            "description": "A crashed pre-effect owner is safely reclaimed.",
+            "acceptance": "The retry executes once and completes the receipt.",
+            "kind": "read",
+            "owner_role": "team_explorer",
+        }
+        payload_hash = sha256_text(canonical_json(payload))
+        now = utc_now()
+        owner = json.dumps(
+            {
+                "owner_token": "dead-owner",
+                "pid": 999_999_999,
+                "instance_id": "not-running",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        with self.team.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO request_receipts(
+                    request_id, operation, payload_hash, status,
+                    result_json, error, created_at, updated_at
+                ) VALUES (?, ?, ?, 'pending', NULL, ?, ?, ?)
+                """,
+                (
+                    "dead-owner-create",
+                    "team_create_task",
+                    payload_hash,
+                    owner,
+                    now,
+                    now,
+                ),
+            )
+
+        created = mcp.call_tool(
+            "team_create_task",
+            payload,
+            request_id="dead-owner-create",
+        )
+        retried = mcp.call_tool(
+            "team_create_task",
+            payload,
+            request_id="dead-owner-create",
+        )
+        self.assertEqual(created, retried)
+        with self.team.connection(write=False) as connection:
+            task_count = connection.execute(
+                """
+                SELECT COUNT(*) FROM tasks WHERE title = ?
+                """,
+                ("Dead owner recovery",),
+            ).fetchone()[0]
+            receipt = connection.execute(
+                """
+                SELECT status FROM request_receipts WHERE request_id = ?
+                """,
+                ("dead-owner-create",),
+            ).fetchone()
+        self.assertEqual(task_count, 1)
+        self.assertEqual(receipt["status"], "completed")
 
     def test_concurrent_block_and_submit_have_one_state_winner(self) -> None:
         task = self.team.create_task(
