@@ -15,7 +15,6 @@ if (-not $daemonStatus.log_path) {
 }
 $logsDir = Split-Path -Parent $daemonStatus.log_path
 $teamHome = Split-Path -Parent $logsDir
-[Environment]::SetEnvironmentVariable("CODEX_TEAM_HOME", $teamHome, "User")
 $env:CODEX_TEAM_HOME = $teamHome
 $arguments = (
     '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "' +
@@ -45,8 +44,16 @@ $task = New-ScheduledTask `
     -Description "Restarts the persistent Codex team cluster scheduler every five minutes if it is not running."
 $registration = "scheduled_task"
 $warning = ""
+$startedProcess = $null
+$registeredTask = $false
+$previousTaskXml = $null
+$previousTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+if ($null -ne $previousTask) {
+    $previousTaskXml = Export-ScheduledTask -TaskName $taskName
+}
 try {
     Register-ScheduledTask -TaskName $taskName -InputObject $task -Force | Out-Null
+    $registeredTask = $true
     Start-ScheduledTask -TaskName $taskName
 }
 catch {
@@ -54,6 +61,14 @@ catch {
     # user-level login watchdog that does not require administrator privileges.
     $registration = "user_startup_watchdog"
     $warning = $_.Exception.Message
+    if ($registeredTask) {
+        if ($previousTaskXml) {
+            Register-ScheduledTask -TaskName $taskName -Xml $previousTaskXml -Force | Out-Null
+        }
+        else {
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false | Out-Null
+        }
+    }
     $runKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
     $runCommand = (
         '"' + $powerShell + '" -NoProfile -WindowStyle Hidden ' +
@@ -69,7 +84,7 @@ catch {
         -Value $runCommand `
         -PropertyType String `
         -Force | Out-Null
-    Start-Process `
+    $startedProcess = Start-Process `
         -FilePath $powerShell `
         -ArgumentList @(
             "-NoProfile",
@@ -78,7 +93,15 @@ catch {
             "-File", $watchdogScript,
             "-TeamHome", $teamHome
         ) `
-        -WindowStyle Hidden
+        -WindowStyle Hidden `
+        -PassThru
+}
+$processCreationTime = $null
+if ($null -ne $startedProcess) {
+    try {
+        $processCreationTime = $startedProcess.StartTime.ToUniversalTime().ToString("o")
+    }
+    catch {}
 }
 @{
     ok = $true
@@ -88,4 +111,6 @@ catch {
     teamHome = $teamHome
     registration = $registration
     warning = $warning
+    processId = if ($null -ne $startedProcess) { $startedProcess.Id } else { $null }
+    processCreationTime = $processCreationTime
 } | ConvertTo-Json
