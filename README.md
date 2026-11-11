@@ -78,14 +78,22 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 
 安装器会：
 
-1. 注册 `codexTeamBoard` MCP，并显式传入稳定的 `CODEX_TEAM_HOME`。
-2. 安装全局角色、项目角色模板和团队协作 AGENTS 托管区块。
+1. 无副作用预检 Python、Codex MCP、角色模板、bootstrap、watchdog、Dashboard、
+   可选上下文插件安装器及目标端口。
+2. 在隔离的临时 `CODEX_HOME` 中 staging 角色、AGENTS 和 MCP，预检通过后才以
+   单次原子文件切换发布真实 Codex 配置；成功路径不会先删除线上 MCP。
 3. 安装 `teamd` watchdog，自动恢复 Lead/Worker 调度。
-4. 启动 `http://127.0.0.1:8765`。
+4. 启动 `http://127.0.0.1:8765`，并连续校验 version、schema、Team Home、
+   database 和 cluster runtime。
 5. 调用上下文插件安装器，写入 `team_board_root`、注册个人 marketplace、
    计划任务和插件。
 
-安装完成后完全退出并重新打开 Codex。
+任一步失败会回滚角色文件、用户环境变量、MCP/AGENTS 配置、计划任务/启动项、
+已启动的 Dashboard/watchdog 进程和已安装的 cluster daemon。安装完成后完全退出
+并重新打开 Codex；已运行会话不会热加载新的 MCP schema。
+
+需要机器读取时传入 `-ResultPath`，stdout 也会输出
+`CODEX_TEAM_INSTALL_STAGE=...` 和最终 `CODEX_TEAM_INSTALL_RESULT=...` JSON 行。
 
 ### 4. 验证联动
 
@@ -1168,6 +1176,10 @@ python -m unittest discover -s tests -v
 node scripts/dashboard-ui-smoke.mjs
 node scripts/dashboard-edge-smoke.mjs
 ```
+
+`tests/test_install_transaction.py` 使用临时 `CODEX_HOME`、真实 Codex CLI 和真实
+Python bootstrap，模拟 bootstrap、watchdog、Dashboard、context 各阶段失败，并
+验证 MCP 与关键配置恢复以及重复安装幂等。
 
 运行 `dashboard-edge-smoke.mjs` 前，需确保看板监听默认
 `http://127.0.0.1:8765`；可用 `CODEX_TEAM_DASHBOARD_URL` 覆盖地址。脚本通过
