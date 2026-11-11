@@ -1,6 +1,7 @@
 const POLL_INTERVAL_MS = 2000;
 const MAX_POLL_BACKOFF_MS = 30000;
 const NATIVE_AGENT_SYNC_INTERVAL_MS = 30000;
+const CACHE_TIME_BUCKET_SECONDS = 30;
 const lanes = ["ready", "running", "review", "blocked", "done"];
 const terminalGoalStatuses = new Set(["completed", "failed", "canceled"]);
 const attentionHealthStates = new Set([
@@ -98,6 +99,14 @@ function ageText(seconds) {
 function nonNegativeNumber(value, fallback = 0) {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function timeDerivedBucket(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0
+    ? Math.floor(parsed / CACHE_TIME_BUCKET_SECONDS)
+    : null;
 }
 
 function tokenText(value) {
@@ -1231,7 +1240,14 @@ function buildBoardSignature(data) {
   const normalized = JSON.parse(JSON.stringify(data ?? {}));
   delete normalized.generated_at;
   if (normalized.cluster_summary) {
-    delete normalized.cluster_summary.oldest_heartbeat_age_seconds;
+    for (const field of [
+      "oldest_claim_wait_seconds",
+      "oldest_heartbeat_age_seconds",
+    ]) {
+      normalized.cluster_summary[field] = timeDerivedBucket(
+        normalized.cluster_summary[field],
+      );
+    }
   }
   const runtimeTick = normalized.cluster_runtime?.tick;
   if (runtimeTick && typeof runtimeTick === "object") {
@@ -1244,11 +1260,15 @@ function buildBoardSignature(data) {
     };
   }
   for (const task of normalized.tasks || []) {
-    delete task.claim_wait_seconds;
+    task.claim_wait_seconds = timeDerivedBucket(task.claim_wait_seconds);
   }
   for (const goal of normalized.cluster_goals || []) {
-    delete goal.heartbeat_age_seconds;
-    delete goal.estimated_wait_seconds;
+    goal.heartbeat_age_seconds = timeDerivedBucket(
+      goal.heartbeat_age_seconds,
+    );
+    goal.estimated_wait_seconds = timeDerivedBucket(
+      goal.estimated_wait_seconds,
+    );
   }
   return JSON.stringify(normalized);
 }
@@ -1660,6 +1680,7 @@ if (typeof window !== "undefined") {
     renderAgentThreads,
     requestRevisableJson,
     summaryNumber,
+    timeDerivedBucket,
     tokenText,
     waitDurationText,
     workflowEpochText,

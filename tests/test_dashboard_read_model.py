@@ -8,7 +8,9 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 from codex_team.config import Settings
 from codex_team.dashboard import build_server
@@ -117,6 +119,247 @@ class DashboardReadModelTests(unittest.TestCase):
         after = self.ledger_value()
         self.assertGreater(after, before)
         return after
+
+    def test_cacheable_get_endpoints_validate_scope_and_errors(self) -> None:
+        task = self.create_read_task(1, title="Validator fixture")
+        claimed = self.team.claim_task(
+            task["task_id"],
+            actor="validator-fixture",
+        )
+        self.team.heartbeat(
+            task["task_id"],
+            actor="validator-fixture",
+            claim_token=claimed["claim_token"],
+        )
+        project_id = str(self.project["project_id"])
+        endpoints = [
+            "/api/projects",
+            "/api/summary",
+            "/api/board",
+            "/api/tasks",
+            "/api/goals",
+            "/api/agents",
+            "/api/attempts",
+            "/api/events",
+            f"/api/tasks/{task['task_id']}/events",
+        ]
+        etags: dict[str, str] = {}
+        for path in endpoints:
+            with self.subTest(path=path):
+                status, _, headers = self.request(path)
+                self.assertEqual(status, 200)
+                etag = headers.get("ETag", "")
+                self.assertTrue(etag.startswith('W/"'))
+                self.assertEqual(headers.get("Cache-Control"), "no-store")
+                etags[path] = etag
+
+                strong_etag = etag[2:] if etag.startswith("W/") else etag
+                status, body, conditional_headers = self.request(
+                    path,
+                    headers={
+                        "If-None-Match": f'"unrelated", {strong_etag}',
+                    },
+                )
+                self.assertEqual(status, 304)
+                self.assertEqual(body, b"")
+                self.assertEqual(conditional_headers.get("ETag"), etag)
+                self.assertEqual(
+                    conditional_headers.get("Cache-Control"),
+                    "no-store",
+                )
+                self.assertEqual(
+                    self.request(
+                        path,
+                        headers={"If-None-Match": "*"},
+                    )[0],
+                    304,
+                )
+
+        _, _, health_headers = self.request("/api/health")
+        self.assertNotIn("ETag", health_headers)
+        self.assertEqual(health_headers.get("Cache-Control"), "no-store")
+
+        status, _, error_headers = self.request(
+            "/api/tasks?limit=501",
+            headers={"If-None-Match": "*"},
+        )
+        self.assertEqual(status, 400)
+        self.assertNotIn("ETag", error_headers)
+        self.assertEqual(error_headers.get("Cache-Control"), "no-store")
+
+        scoped_paths = [
+            "/api/summary",
+            "/api/board",
+            "/api/tasks",
+            "/api/goals",
+            "/api/agents",
+            "/api/attempts",
+            "/api/events",
+            f"/api/tasks/{task['task_id']}/events",
+        ]
+        for path in scoped_paths:
+            with self.subTest(scope=path):
+                separator = "&" if "?" in path else "?"
+                if path.startswith("/api/tasks/") and path.endswith("/events"):
+                    alternate = f"{path}?limit=1"
+                else:
+                    alternate = (
+                        f"{path}{separator}project_id={project_id}"
+                    )
+                _, _, headers = self.request(alternate)
+                self.assertNotEqual(headers.get("ETag"), etags[path])
+
+        _, _, archived_headers = self.request(
+            f"/api/tasks?project_id={project_id}&include_archived=1"
+        )
+        self.assertNotEqual(
+            archived_headers.get("ETag"),
+            etags["/api/tasks"],
+        )
+        _, _, archived_projects = self.request(
+            "/api/projects?include_archived=1"
+        )
+        self.assertNotEqual(
+            archived_projects.get("ETag"),
+            etags["/api/projects"],
+        )
+        for left, right in (
+            ("/api/tasks?limit=1", "/api/tasks?limit=2"),
+            ("/api/events?limit=1", "/api/events?limit=2"),
+            (
+                f"/api/tasks/{task['task_id']}/events?limit=1",
+                f"/api/tasks/{task['task_id']}/events?limit=2",
+            ),
+        ):
+            with self.subTest(limit=(left, right)):
+                self.assertNotEqual(
+                    self.request(left)[2].get("ETag"),
+                    self.request(right)[2].get("ETag"),
+                )
+
+    def test_generated_clock_bucket_and_threshold_transitions(self) -> None:
+        task = self.create_read_task(1, title="Clock fixture")
+        anchor = datetime(2030, 1, 1, 0, 1, 0, tzinfo=UTC)
+        created_at = (anchor - timedelta(seconds=39)).isoformat().replace(
+            "+00:00",
+            "Z",
+        )
+        with self.team.connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET created_at = ? WHERE task_id = ?",
+                (created_at, task["task_id"]),
+            )
+
+        class FrozenDateTime(datetime):
+            current = anchor
+
+            @classmethod
+            def now(cls, tz=None):
+                if tz is None:
+                    return cls.current.replace(tzinfo=None)
+                return cls.current.astimezone(tz)
+
+        def at_offset(
+            seconds: int,
+        ) -> tuple[object, object]:
+            FrozenDateTime.current = anchor + timedelta(seconds=seconds)
+            return (
+                patch(
+                    "codex_team.service.datetime",
+                    FrozenDateTime,
+                ),
+                patch(
+                    "codex_team.service.utc_now",
+                    side_effect=lambda: FrozenDateTime.current.isoformat(
+                        timespec="seconds"
+                    ).replace("+00:00", "Z"),
+                ),
+            )
+
+        def request_at(
+            path: str,
+            seconds: int,
+            *,
+            etag: str = "",
+        ) -> tuple[int, bytes, dict[str, str]]:
+            datetime_patch, now_patch = at_offset(seconds)
+            with datetime_patch, now_patch:
+                return self.request(
+                    path,
+                    headers={"If-None-Match": etag} if etag else None,
+                )
+
+        status, _, headers = request_at("/api/projects", 10)
+        projects_etag = headers["ETag"]
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            request_at(
+                "/api/projects",
+                29,
+                etag=projects_etag,
+            )[0],
+            304,
+        )
+
+        status, body, headers = request_at("/api/board", 20)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["tasks"][0]["claim_wait_seconds"], 59)
+        self.assertEqual(
+            json.loads(body)["tasks"][0]["claim_wait_state"],
+            "normal",
+        )
+        board_etag = headers["ETag"]
+        self.assertEqual(
+            request_at("/api/board", 20, etag=board_etag)[0],
+            304,
+        )
+
+        status, body, changed_headers = request_at(
+            "/api/board",
+            21,
+            etag=board_etag,
+        )
+        self.assertEqual(status, 200)
+        task_payload = json.loads(body)["tasks"][0]
+        self.assertEqual(task_payload["claim_wait_seconds"], 60)
+        self.assertEqual(task_payload["claim_wait_state"], "warning")
+        self.assertNotEqual(changed_headers["ETag"], board_etag)
+        self.assertEqual(
+            request_at(
+                "/api/board",
+                21,
+                etag=changed_headers["ETag"],
+            )[0],
+            304,
+        )
+        self.assertEqual(
+            request_at(
+                "/api/board",
+                50,
+                etag=changed_headers["ETag"],
+            )[0],
+            200,
+        )
+
+        status, _, headers = request_at("/api/summary", 20)
+        summary_etag = headers["ETag"]
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            request_at(
+                "/api/summary",
+                29,
+                etag=summary_etag,
+            )[0],
+            304,
+        )
+        self.assertEqual(
+            request_at(
+                "/api/summary",
+                50,
+                etag=summary_etag,
+            )[0],
+            200,
+        )
 
     def test_revision_summary_and_conditional_board(self) -> None:
         task = self.create_read_task(1)
@@ -496,7 +739,9 @@ class DashboardReadModelTests(unittest.TestCase):
             self.team.dashboard_revision(),
         )
 
-    def test_summary_and_board_share_contextual_revision_and_etag(self) -> None:
+    def test_summary_and_board_share_revision_but_validate_derived_data(
+        self,
+    ) -> None:
         task = self.create_read_task(1, title="Contextual ETag fixture")
         project_id = str(self.project["project_id"])
         path = f"?project_id={project_id}"
@@ -511,7 +756,7 @@ class DashboardReadModelTests(unittest.TestCase):
         summary = json.loads(summary_body)
         board = json.loads(board_body)
         self.assertEqual(summary["revision"], board["revision"])
-        self.assertEqual(summary_headers["ETag"], board_headers["ETag"])
+        self.assertNotEqual(summary_headers["ETag"], board_headers["ETag"])
         self.assertEqual(
             self.request(
                 f"/api/summary{path}",
@@ -575,7 +820,8 @@ class DashboardReadModelTests(unittest.TestCase):
             )
         )
         self.assertEqual(changed_board_status, 200)
-        self.assertEqual(changed_board_headers["ETag"], changed_headers["ETag"])
+        self.assertNotEqual(changed_board_headers["ETag"], board_headers["ETag"])
+        self.assertNotEqual(changed_board_headers["ETag"], summary_headers["ETag"])
         self.assertEqual(
             json.loads(changed_board_body)["revision"],
             json.loads(changed_body)["revision"],
