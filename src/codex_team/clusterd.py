@@ -21,6 +21,7 @@ from .processes import (
     identity_record,
     process_identity_matches,
 )
+from .redaction import redact_sensitive_text
 
 
 def write_json_atomic(path: Path, value: object) -> None:
@@ -121,13 +122,35 @@ def run(interval: float = 5.0, once: bool = False) -> int:
                         "identity": identity,
                     }
                 except Exception as exc:
+                    error = redact_sensitive_text(str(exc))
                     state = {
                         "ok": False,
                         "tick_at": utc_now(),
+                        "failed_phase": "tick",
+                        "failed_phases": ["tick"],
+                        "degraded": True,
+                        "degraded_phases": ["tick"],
+                        "skipped_phases": [],
+                        "error_code": "daemon_tick_failure",
+                        "error": error,
+                        "health": {
+                            "ok": False,
+                            "degraded": True,
+                            "failed_phases": ["tick"],
+                            "degraded_phases": ["tick"],
+                            "skipped_phases": [],
+                            "errors": [
+                                {
+                                    "phase": "tick",
+                                    "source": "clusterd",
+                                    "error_code": "daemon_tick_failure",
+                                    "redacted_error": error,
+                                }
+                            ],
+                        },
                         "pid": os.getpid(),
                         "process_identity": process_identity,
                         "identity": identity,
-                        "error": str(exc),
                     }
                 write_json_atomic(state_path, state)
                 if once:

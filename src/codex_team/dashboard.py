@@ -142,6 +142,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _cluster_runtime(self) -> dict[str, object]:
         status = daemon_status(self.team_service.settings)
         state = status.get("state")
+        state = state if isinstance(state, dict) else {}
         state_identity = state.get("identity") if isinstance(state, dict) else None
         expected = status.get("expected_identity")
         identity = (
@@ -152,13 +153,107 @@ class DashboardHandler(BaseHTTPRequestHandler):
             else daemon_identity(self.team_service.settings)
         )
         runtime = str(identity.get("runtime") or "app_server")
-        return {
+        result: dict[str, object] = {
             "runtime": runtime,
             "thread_reuse": runtime == "app_server",
             "running": bool(status.get("running")),
             "config_mismatch": bool(status.get("config_mismatch")),
             "version": identity.get("version"),
         }
+        if state:
+            def nonnegative_int(value: object) -> int:
+                try:
+                    return max(0, int(value or 0))
+                except (TypeError, ValueError):
+                    return 0
+
+            def nonnegative_float(value: object) -> float:
+                try:
+                    return max(0.0, float(value or 0))
+                except (TypeError, ValueError):
+                    return 0.0
+
+            def string_list(value: object) -> list[str]:
+                if not isinstance(value, (list, tuple)):
+                    return []
+                return [str(item) for item in value if str(item)]
+
+            raw_phases = state.get("phases")
+            if not isinstance(raw_phases, (list, tuple)):
+                raw_phases = []
+            phases = [
+                {
+                    "name": str(phase.get("name") or ""),
+                    "ok": bool(phase.get("ok")),
+                    "degraded": bool(phase.get("degraded")),
+                    "attempts": nonnegative_int(phase.get("attempts")),
+                    "duration_ms": nonnegative_float(
+                        phase.get("duration_ms")
+                    ),
+                    "error_code": str(phase.get("error_code") or ""),
+                    "redacted_error": str(
+                        phase.get("redacted_error") or ""
+                    ),
+                    "retry_suppressed": bool(
+                        phase.get("retry_suppressed")
+                    ),
+                }
+                for phase in raw_phases
+                if isinstance(phase, dict)
+            ]
+            failed_phases = string_list(state.get("failed_phases"))
+            if not failed_phases and state.get("failed_phase"):
+                failed_phases = [str(state["failed_phase"])]
+            degraded_phases = (
+                string_list(state.get("degraded_phases"))
+                or failed_phases
+            )
+            skipped_phases = string_list(state.get("skipped_phases"))
+            retry = state.get("retry")
+            if not isinstance(retry, dict):
+                retry = {
+                    "limit": nonnegative_int(state.get("retry_budget")),
+                    "used": nonnegative_int(state.get("retry_used")),
+                    "exhausted": False,
+                }
+            else:
+                retry = {
+                    "limit": nonnegative_int(retry.get("limit")),
+                    "used": nonnegative_int(retry.get("used")),
+                    "exhausted": bool(retry.get("exhausted")),
+                }
+            health = state.get("health")
+            if not isinstance(health, dict):
+                health = {
+                    "ok": bool(state.get("ok")),
+                    "degraded": bool(degraded_phases),
+                    "failed_phases": failed_phases,
+                    "degraded_phases": degraded_phases,
+                    "skipped_phases": skipped_phases,
+                    "errors": state.get("errors") or [],
+                }
+            result["tick"] = {
+                "tick_id": str(state.get("tick_id") or ""),
+                "tick_at": str(state.get("tick_at") or ""),
+                "ok": bool(state.get("ok")),
+                "degraded": bool(
+                    state.get("degraded")
+                    or degraded_phases
+                    or failed_phases
+                ),
+                "failed_phase": (
+                    failed_phases[0] if failed_phases else None
+                ),
+                "failed_phases": failed_phases,
+                "degraded_phases": degraded_phases,
+                "skipped_phases": skipped_phases,
+                "error_code": str(state.get("error_code") or ""),
+                "redacted_error": str(state.get("error") or ""),
+                "phases": phases,
+                "retry": retry,
+                "health": health,
+            }
+        return result
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlsplit(self.path)

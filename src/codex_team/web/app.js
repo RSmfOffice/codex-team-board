@@ -671,6 +671,16 @@ function buildClusterMetrics(data = {}) {
     : runtimeName === "exec"
       ? "独立进程 · 不保留 Thread"
       : "运行配置未知";
+  const tick = runtime.tick && typeof runtime.tick === "object"
+    ? runtime.tick
+    : {};
+  const failedPhases = Array.isArray(tick.failed_phases)
+    ? tick.failed_phases.map(String).filter(Boolean)
+    : [];
+  const tickDegraded = Boolean(tick.degraded || failedPhases.length);
+  const tickDetail = tickDegraded
+    ? `降级 ${failedPhases.length ? failedPhases.join("/") : "tick"}${tick.error_code ? ` · ${tick.error_code}` : ""}`
+    : runtimeDetail;
   return [
     {
       key: "jobs",
@@ -692,10 +702,12 @@ function buildClusterMetrics(data = {}) {
       key: "runtime",
       label: "RUNTIME",
       value: runtimeName,
-      detail: runtime.config_mismatch
-        ? "配置与 daemon 不一致"
-        : runtimeDetail,
-      tone: runtime.config_mismatch ? "critical" : "",
+      detail: tickDegraded
+        ? tickDetail
+        : runtime.config_mismatch
+          ? "配置与 daemon 不一致"
+          : runtimeDetail,
+      tone: runtime.config_mismatch || tickDegraded ? "critical" : "",
     },
     {
       key: "heartbeat-overdue",

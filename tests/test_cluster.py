@@ -13,9 +13,10 @@ import time
 import unittest
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack, nullcontext
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from codex_team import __version__
 from codex_team.cluster import (
@@ -116,6 +117,64 @@ def _wait_for(predicate, timeout: float = 3.0) -> None:
             return
         time.sleep(0.01)
     raise AssertionError("condition was not met before timeout")
+
+
+def _patch_healthy_tick(
+    manager: ClusterManager,
+    stack: ExitStack,
+) -> dict[str, object]:
+    mocks = {
+        "settle": stack.enter_context(
+            patch.object(
+                manager,
+                "_reconcile_jobs",
+                return_value={"count": 0},
+            )
+        ),
+        "recover": stack.enter_context(
+            patch.object(
+                manager.worktrees,
+                "recover_pending",
+                return_value=[],
+            )
+        ),
+        "reset": stack.enter_context(
+            patch.object(
+                manager,
+                "_apply_agent_reset_requests",
+                return_value={"count": 0},
+            )
+        ),
+        "archive": stack.enter_context(
+            patch.object(
+                manager,
+                "_sync_project_agent_archive",
+                return_value={"count": 0},
+            )
+        ),
+        "prepare": stack.enter_context(
+            patch.object(manager, "list_goals", return_value=[])
+        ),
+        "dispatch": stack.enter_context(
+            patch.object(manager, "_schedule_goals", return_value=[])
+        ),
+        "worker_health": stack.enter_context(
+            patch.object(
+                manager,
+                "_check_worker_health",
+                return_value={"count": 0},
+            )
+        ),
+        "goal_health": stack.enter_context(
+            patch.object(
+                manager,
+                "_check_goal_stalls",
+                return_value={"count": 0},
+            )
+        ),
+    }
+    stack.enter_context(patch("codex_team.cluster.time.sleep"))
+    return mocks
 
 
 def _deliver_token_usage(
@@ -560,10 +619,16 @@ class ClusterSchedulerTests(unittest.TestCase):
                 list(TICK_PHASE_ORDER),
             )
             self.assertEqual(result["failed_phase"], None)
+            self.assertEqual(result["failed_phases"], [])
+            self.assertFalse(result["degraded"])
             self.assertEqual(result["skipped_phases"], [])
+            self.assertEqual(result["retry_used"], 0)
+            self.assertFalse(result["health"]["degraded"])
             self.assertTrue(
                 all(
                     phase["ok"]
+                    and phase["attempts"] == 1
+                    and not phase["degraded"]
                     and isinstance(phase["duration_ms"], float)
                     and isinstance(phase["counts"], dict)
                     for phase in result["phases"]
@@ -581,7 +646,7 @@ class ClusterSchedulerTests(unittest.TestCase):
             ):
                 self.assertTrue(mocked.called)
 
-    def test_tick_phase_failure_stops_and_publishes_redacted_error(self) -> None:
+    def test_tick_settle_failure_publishes_and_gates_dispatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             settings = _settings(Path(temporary))
             manager = ClusterManager(
@@ -590,45 +655,461 @@ class ClusterSchedulerTests(unittest.TestCase):
                 runtime_mode="exec",
                 agent_command=["codex"],
             )
-            with (
-                patch.object(
-                    manager,
-                    "_reconcile_jobs",
-                    side_effect=RuntimeError(
-                        "claim_token=top-secret-value"
-                    ),
-                ),
-                patch.object(
-                    manager.worktrees,
-                    "recover_pending",
-                    side_effect=AssertionError("recover should be skipped"),
-                ),
-                patch.object(
-                    manager,
-                    "_schedule_goals",
-                    side_effect=AssertionError("dispatch should be skipped"),
-                ),
-            ):
+            with ExitStack() as stack:
+                mocks = _patch_healthy_tick(manager, stack)
+                mocks["settle"].side_effect = RuntimeError(
+                    "claim_token=top-secret-value"
+                )
                 result = manager.tick()
 
         self.assertFalse(result["ok"])
+        self.assertTrue(result["degraded"])
         self.assertEqual(result["failed_phase"], "settle")
+        self.assertEqual(result["failed_phases"], ["settle"])
         self.assertEqual(
             [phase["name"] for phase in result["phases"]],
-            ["settle", "publish"],
-        )
-        self.assertEqual(
-            result["skipped_phases"],
             [
+                "settle",
                 "recover",
                 "control",
                 "prepare",
-                "dispatch",
                 "health",
+                "publish",
             ],
         )
+        self.assertEqual(result["skipped_phases"], ["dispatch"])
+        self.assertEqual(result["retry_used"], 1)
+        settle_phase = next(
+            phase
+            for phase in result["phases"]
+            if phase["name"] == "settle"
+        )
+        self.assertEqual(settle_phase["attempts"], 2)
+        self.assertEqual(
+            settle_phase["error_code"],
+            "settle_phase_failure",
+        )
+        self.assertEqual(mocks["settle"].call_count, 2)
+        for name in (
+            "recover",
+            "reset",
+            "archive",
+            "prepare",
+            "worker_health",
+            "goal_health",
+        ):
+            self.assertTrue(mocks[name].called)
+        self.assertFalse(mocks["dispatch"].called)
         self.assertNotIn("top-secret-value", result["error"])
         self.assertIn("[REDACTED]", result["error"])
+        self.assertTrue(result["health"]["degraded"])
+        self.assertEqual(result["health"]["failed_phases"], ["settle"])
+
+    def test_tick_business_phase_failures_keep_safe_phases_running(
+        self,
+    ) -> None:
+        for phase_name in ("recover", "control", "prepare", "dispatch"):
+            with (
+                self.subTest(phase=phase_name),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                settings = _settings(Path(temporary))
+                manager = ClusterManager(
+                    settings,
+                    team=TeamService(settings),
+                    runtime_mode="exec",
+                    agent_command=["codex"],
+                )
+                with ExitStack() as stack:
+                    mocks = _patch_healthy_tick(manager, stack)
+                    if phase_name == "recover":
+                        mocks["recover"].side_effect = RuntimeError(
+                            "recover failed"
+                        )
+                    elif phase_name == "control":
+                        mocks["archive"].side_effect = RuntimeError(
+                            "archive failed"
+                        )
+                    elif phase_name == "prepare":
+                        mocks["prepare"].side_effect = RuntimeError(
+                            "prepare failed"
+                        )
+                    else:
+                        mocks["dispatch"].side_effect = RuntimeError(
+                            "dispatch failed"
+                        )
+                    result = manager.tick()
+
+                phase_names = [
+                    phase["name"] for phase in result["phases"]
+                ]
+                self.assertIn("health", phase_names)
+                self.assertIn("publish", phase_names)
+                self.assertTrue(mocks["worker_health"].called)
+                self.assertTrue(mocks["goal_health"].called)
+                self.assertEqual(result["failed_phase"], phase_name)
+                self.assertTrue(result["degraded"])
+                self.assertEqual(
+                    result["health"]["failed_phases"],
+                    [phase_name],
+                )
+                if phase_name in {"control", "prepare"}:
+                    self.assertIn("dispatch", result["skipped_phases"])
+                    self.assertFalse(mocks["dispatch"].called)
+
+    def test_tick_retry_budget_and_stable_signature_do_not_hot_loop(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = _settings(Path(temporary))
+            manager = ClusterManager(
+                settings,
+                team=TeamService(settings),
+                runtime_mode="exec",
+                agent_command=["codex"],
+            )
+            with ExitStack() as stack:
+                mocks = _patch_healthy_tick(manager, stack)
+                mocks["settle"].side_effect = RuntimeError(
+                    "stable failure"
+                )
+                first = manager.tick()
+                second = manager.tick()
+
+        first_settle = next(
+            phase for phase in first["phases"] if phase["name"] == "settle"
+        )
+        second_settle = next(
+            phase for phase in second["phases"] if phase["name"] == "settle"
+        )
+        self.assertEqual(first_settle["attempts"], 2)
+        self.assertEqual(first["retry_used"], 1)
+        self.assertEqual(second_settle["attempts"], 1)
+        self.assertTrue(second_settle["retry_suppressed"])
+        self.assertEqual(second["retry_used"], 0)
+        self.assertEqual(mocks["settle"].call_count, 3)
+        self.assertEqual(first["retry"]["limit"], 4)
+        self.assertEqual(second["retry"]["limit"], 4)
+
+    def test_tick_retry_budget_caps_retries_across_phases(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = _settings(Path(temporary))
+            manager = ClusterManager(
+                settings,
+                team=TeamService(settings),
+                runtime_mode="exec",
+                agent_command=["codex"],
+            )
+            with ExitStack() as stack:
+                mocks = _patch_healthy_tick(manager, stack)
+                mocks["settle"].side_effect = RuntimeError(
+                    "settle failure"
+                )
+                mocks["recover"].side_effect = RuntimeError(
+                    "recover failure"
+                )
+                with patch("codex_team.cluster.TICK_RETRY_BUDGET", 1):
+                    result = manager.tick()
+
+        settle_phase = next(
+            phase for phase in result["phases"] if phase["name"] == "settle"
+        )
+        recover_phase = next(
+            phase for phase in result["phases"] if phase["name"] == "recover"
+        )
+        self.assertEqual(settle_phase["attempts"], 2)
+        self.assertEqual(recover_phase["attempts"], 1)
+        self.assertEqual(result["retry_used"], 1)
+        self.assertTrue(result["retry"]["exhausted"])
+        self.assertEqual(mocks["settle"].call_count, 2)
+        self.assertEqual(mocks["recover"].call_count, 1)
+        self.assertIn("health", [item["name"] for item in result["phases"]])
+        self.assertIn("publish", [item["name"] for item in result["phases"]])
+
+    def test_tick_control_keeps_reset_and_archive_errors_visible(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = _settings(Path(temporary))
+            manager = ClusterManager(
+                settings,
+                team=TeamService(settings),
+                runtime_mode="exec",
+                agent_command=["codex"],
+            )
+            with ExitStack() as stack:
+                mocks = _patch_healthy_tick(manager, stack)
+                mocks["reset"].side_effect = RuntimeError(
+                    "authorization=top-secret"
+                )
+                mocks["archive"].return_value = {
+                    "count": 1,
+                    "processed": 0,
+                    "failed": 1,
+                    "errors": [
+                        {
+                            "source": "agent_archive",
+                            "project_id": "P-ARCHIVE",
+                            "error_code": "agent_archive_failure",
+                            "redacted_error": "archive denied",
+                        }
+                    ],
+                }
+                result = manager.tick()
+
+        self.assertTrue(mocks["reset"].called)
+        self.assertTrue(mocks["archive"].called)
+        self.assertEqual(result["failed_phases"], ["control"])
+        self.assertEqual(len(result["errors"]), 2)
+        errors = json.dumps(result["errors"], ensure_ascii=False)
+        self.assertNotIn("top-secret", errors)
+        self.assertIn("archive denied", errors)
+        self.assertIn("dispatch", result["skipped_phases"])
+
+    def test_tick_worktree_uncertain_recovery_requires_manual_action(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = _settings(Path(temporary))
+            manager = ClusterManager(
+                settings,
+                team=TeamService(settings),
+                runtime_mode="exec",
+                agent_command=["codex"],
+            )
+            with ExitStack() as stack:
+                mocks = _patch_healthy_tick(manager, stack)
+                mocks["recover"].return_value = [
+                    {
+                        "operation_id": "OP-MANUAL",
+                        "status": "failed",
+                        "error": (
+                            "branch exists but worktree target is missing "
+                            "token=top-secret"
+                        ),
+                    },
+                    {
+                        "operation_id": "OP-DEFERRED",
+                        "status": "deferred",
+                        "error": "repository lock timeout",
+                    },
+                ]
+                result = manager.tick()
+
+        recovery = result["worktree_recovery"][0]
+        deferred = result["worktree_recovery"][1]
+        self.assertEqual(
+            recovery["error_code"],
+            "worktree_branch_without_directory",
+        )
+        self.assertTrue(recovery["requires_manual_action"])
+        self.assertIn("git worktree add", recovery["manual_action"])
+        self.assertNotIn("top-secret", recovery["redacted_error"])
+        self.assertEqual(
+            deferred["error_code"],
+            "repository_lock_timeout",
+        )
+        self.assertFalse(deferred["requires_manual_action"])
+        self.assertEqual(deferred["manual_action"], "")
+        self.assertEqual(result["failed_phases"], ["recover"])
+        self.assertTrue(mocks["dispatch"].called)
+        self.assertEqual(
+            len(result["health"]["worktree_manual_actions"]),
+            1,
+        )
+        self.assertEqual(
+            result["health"]["worktree_manual_actions"][0][
+                "operation_id"
+            ],
+            "OP-MANUAL",
+        )
+
+    def test_tick_blocks_uncertain_worktree_task_for_manual_resolution(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            repo = _repo(base, "uncertain-worktree")
+            (repo / "README.md").write_text(
+                "# worktree recovery\n",
+                encoding="utf-8",
+            )
+            git(repo, "add", "README.md")
+            git(repo, "commit", "-m", "initial")
+            team.init_project(repo)
+            task = team.create_task(
+                repo,
+                title="Recover missing worktree directory",
+                description="A branch exists without its worktree directory.",
+                acceptance="The task blocks for an explicit manual action.",
+                kind="write",
+                owner_role="team_worker",
+            )
+            branch = "codex/team/missing-worktree-directory"
+            git(repo, "branch", branch)
+            now = utc_now()
+            payload = {
+                "repo_root": str(repo.resolve()),
+                "worktree_path": str(
+                    (base / "missing-worktree-directory").resolve()
+                ),
+                "branch": branch,
+                "target_branch": "main",
+                "base_ref": "HEAD",
+                "base_commit": git(repo, "rev-parse", "HEAD"),
+            }
+            with team.connection() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO external_operations(
+                        operation_id, operation_type, status, goal_id, task_id,
+                        actor, payload_json, created_at, updated_at
+                    ) VALUES (
+                        'OP-UNCERTAIN', 'worktree_create', 'running', NULL, ?,
+                        'teamd', ?, ?, ?
+                    )
+                    """,
+                    (
+                        task["task_id"],
+                        json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                        now,
+                        now,
+                    ),
+                )
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime_mode="exec",
+                agent_command=["codex"],
+            )
+            result = manager.tick()
+            blocked = team.get_task(task["task_id"])
+
+        self.assertEqual(result["failed_phase"], "recover")
+        recovery = result["worktree_recovery"][0]
+        self.assertEqual(
+            recovery["error_code"],
+            "worktree_branch_without_directory",
+        )
+        self.assertTrue(recovery.get("task_blocked"))
+        self.assertEqual(recovery["task_status"], "blocked")
+        self.assertEqual(blocked["status"], "blocked")
+        self.assertIn(
+            "worktree recovery requires manual action",
+            blocked["blocker"],
+        )
+        self.assertIn("git worktree add", blocked["blocker"])
+
+    def test_tick_worktree_recovery_preserves_foreign_running_claim(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            repo = _repo(base, "foreign-worktree")
+            (repo / "README.md").write_text("# foreign claim\n", encoding="utf-8")
+            git(repo, "add", "README.md")
+            git(repo, "commit", "-m", "initial")
+            team.init_project(repo)
+            task = team.create_task(
+                repo,
+                title="Preserve foreign claim",
+                description="Recovery must not clear another actor's claim.",
+                acceptance="The running owner remains unchanged.",
+                kind="write",
+                owner_role="team_worker",
+            )
+            with team.connection() as connection:
+                connection.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'running', claimed_by = 'foreign-worker',
+                        claim_token = 'foreign-token',
+                        lease_until = '2099-01-01T00:00:00Z',
+                        version = version + 1
+                    WHERE task_id = ?
+                    """,
+                    (task["task_id"],),
+                )
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime_mode="exec",
+                agent_command=["codex"],
+            )
+            with ExitStack() as stack:
+                mocks = _patch_healthy_tick(manager, stack)
+                mocks["recover"].return_value = [
+                    {
+                        "operation_id": "OP-FOREIGN",
+                        "task_id": task["task_id"],
+                        "status": "failed",
+                        "error": (
+                            "branch exists but worktree target is missing"
+                        ),
+                    }
+                ]
+                result = manager.tick()
+            with team.connection(write=False) as connection:
+                current = connection.execute(
+                    """
+                    SELECT status, claimed_by, claim_token
+                    FROM tasks WHERE task_id = ?
+                    """,
+                    (task["task_id"],),
+                ).fetchone()
+
+        self.assertEqual(current["status"], "running")
+        self.assertEqual(current["claimed_by"], "foreign-worker")
+        self.assertEqual(current["claim_token"], "foreign-token")
+        self.assertIn(
+            "worktree_foreign_claim_preserved",
+            [
+                error["error_code"]
+                for error in result["errors"]
+            ],
+        )
+
+    def test_clusterd_publishes_redacted_unexpected_tick_failure(
+        self,
+    ) -> None:
+        from codex_team import clusterd
+
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = _settings(Path(temporary))
+            manager = MagicMock()
+            manager.tick.side_effect = RuntimeError(
+                "authorization=top-secret"
+            )
+            with (
+                patch.object(Settings, "load", return_value=settings),
+                patch.object(
+                    clusterd,
+                    "ClusterManager",
+                    return_value=manager,
+                ),
+                patch.object(
+                    clusterd,
+                    "acquire_lock",
+                    return_value=nullcontext(),
+                ),
+            ):
+                exit_code = clusterd.run(once=True)
+            _, state_path, _ = clusterd.daemon_paths(settings)
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(exit_code, 1)
+        self.assertFalse(state["ok"])
+        self.assertEqual(state["failed_phase"], "tick")
+        self.assertEqual(state["error_code"], "daemon_tick_failure")
+        self.assertTrue(state["degraded"])
+        self.assertNotIn("top-secret", state["error"])
+        self.assertIn("[REDACTED]", state["error"])
+        self.assertTrue(state["health"]["degraded"])
+        manager.close.assert_called_once_with()
 
     def test_concurrent_tick_calls_are_serialized(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
