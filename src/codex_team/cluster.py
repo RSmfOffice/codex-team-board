@@ -2387,13 +2387,11 @@ class ClusterManager:
 
         settle_ok = run_phase("settle", settle)
         run_phase("recover", recover)
-        control_ok = run_phase("control", control)
+        run_phase("control", control)
         run_phase("prepare", prepare)
         dispatch_blockers: list[str] = []
         if not settle_ok:
             dispatch_blockers.append("settle")
-        if not control_ok:
-            dispatch_blockers.append("control")
         if not phase_data.get("prepare_ready"):
             dispatch_blockers.append("prepare")
         run_phase(

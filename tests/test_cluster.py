@@ -753,9 +753,15 @@ class ClusterSchedulerTests(unittest.TestCase):
                     result["health"]["failed_phases"],
                     [phase_name],
                 )
-                if phase_name in {"control", "prepare"}:
+                if phase_name == "prepare":
                     self.assertIn("dispatch", result["skipped_phases"])
                     self.assertFalse(mocks["dispatch"].called)
+                else:
+                    self.assertNotIn(
+                        "dispatch",
+                        result["skipped_phases"],
+                    )
+                    self.assertTrue(mocks["dispatch"].called)
 
     def test_tick_retry_budget_and_stable_signature_do_not_hot_loop(
         self,
@@ -839,6 +845,18 @@ class ClusterSchedulerTests(unittest.TestCase):
             )
             with ExitStack() as stack:
                 mocks = _patch_healthy_tick(manager, stack)
+                safe_goal = {
+                    "goal_id": "G-SAFE",
+                    "status": "active",
+                }
+                mocks["prepare"].return_value = [safe_goal]
+                safe_prepare = stack.enter_context(
+                    patch.object(
+                        manager,
+                        "_prepare_goal",
+                        return_value=True,
+                    )
+                )
                 mocks["reset"].side_effect = RuntimeError(
                     "authorization=top-secret"
                 )
@@ -864,7 +882,9 @@ class ClusterSchedulerTests(unittest.TestCase):
         errors = json.dumps(result["errors"], ensure_ascii=False)
         self.assertNotIn("top-secret", errors)
         self.assertIn("archive denied", errors)
-        self.assertIn("dispatch", result["skipped_phases"])
+        self.assertNotIn("dispatch", result["skipped_phases"])
+        self.assertTrue(safe_prepare.called)
+        mocks["dispatch"].assert_called_once_with([safe_goal])
 
     def test_tick_worktree_uncertain_recovery_requires_manual_action(
         self,
