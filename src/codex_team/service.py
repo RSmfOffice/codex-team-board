@@ -3119,6 +3119,7 @@ class TeamService:
 
         resolved_merge = merge_commit.strip()
         worker_commit = ""
+        target_commit = ""
         if approve and task["kind"] == "write":
             with self.connection(write=False) as connection:
                 worktree = str(
@@ -3242,13 +3243,16 @@ class TeamService:
 
         expected_version = int(task["version"])
         new_status = "done" if approve else "ready"
+        stored_merge = resolved_merge if approve else ""
+        stored_target_commit = target_commit if approve else ""
         now = utc_now()
         completed_at = now if approve else None
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             current = connection.execute(
                 """
-                SELECT t.status, t.version, t.archived_at,
+                SELECT t.status, t.version, t.archived_at, t.commit_sha,
+                       t.target_branch,
                        p.archived_at AS project_archived_at
                 FROM tasks t JOIN projects p ON p.project_id = t.project_id
                 WHERE t.task_id = ?
@@ -3263,19 +3267,29 @@ class TeamService:
                 raise TeamError("task or project was archived during review")
             if int(current["version"]) != expected_version:
                 raise TeamError("task changed during review; reload and retry")
+            if approve and task["kind"] == "write" and (
+                str(current["commit_sha"] or "") != str(task["commit_sha"] or "")
+                or str(current["target_branch"] or "")
+                != str(task["target_branch"] or "")
+            ):
+                raise TeamError(
+                    "reviewed task snapshot changed during review; reload and retry"
+                )
             updated = connection.execute(
                 """
                 UPDATE tasks
-                SET status = ?, review_notes = ?, merge_commit = ?, claimed_by = NULL,
-                    claim_token = NULL, lease_until = NULL, completed_at = ?,
-                    updated_at = ?, version = version + 1
+                SET status = ?, review_notes = ?, merge_commit = ?,
+                    review_target_commit = ?, claimed_by = NULL, claim_token = NULL,
+                    lease_until = NULL, completed_at = ?, updated_at = ?,
+                    version = version + 1
                 WHERE task_id = ? AND status = 'review' AND version = ?
                   AND archived_at IS NULL
                 """,
                 (
                     new_status,
                     notes,
-                    resolved_merge,
+                    stored_merge,
+                    stored_target_commit,
                     completed_at,
                     now,
                     task_id,
@@ -3292,7 +3306,12 @@ class TeamService:
                 {
                     "approve": approve,
                     "notes": notes,
-                    "merge_commit": resolved_merge,
+                    "task_version": expected_version,
+                    "target_branch": str(task["target_branch"] or "")
+                    if approve and task["kind"] == "write"
+                    else "",
+                    "target_commit": target_commit,
+                    "merge_commit": stored_merge,
                     "worker_commit": worker_commit,
                 },
             )

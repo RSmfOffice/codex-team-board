@@ -61,6 +61,7 @@ expectText(app, "/api/board", "app.js");
 expectText(app, "/api/summary", "app.js");
 expectText(app, "/api/projects", "app.js");
 expectText(app, "/api/tasks/${encodeURIComponent(taskId)}/events", "app.js");
+expectText(app, "Review 目标快照", "app.js task detail");
 expectText(app, "data.cluster_summary", "app.js");
 expectText(app, "goal?.health", "app.js");
 expectText(app, "goal?.next_action", "app.js");

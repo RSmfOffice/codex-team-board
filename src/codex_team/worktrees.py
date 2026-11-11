@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .db import utc_now
+from .repo_lock import RepositoryLockTimeout, repository_lock
 from .service import TeamError, TeamService
 
 
@@ -50,6 +51,32 @@ class WorktreeManager:
         root = self.team._root(repo)
         if Path(task["root_path"]).resolve() != root:
             raise TeamError("task belongs to a different repository")
+        try:
+            with repository_lock(
+                root,
+                label=f"worktree creation for {task_id}",
+            ):
+                return self._create_locked(
+                    task,
+                    task_id=task_id,
+                    root=root,
+                    actor=actor,
+                    base_ref=base_ref,
+                    worktree_path=worktree_path,
+                )
+        except RepositoryLockTimeout as exc:
+            raise TeamError(str(exc)) from exc
+
+    def _create_locked(
+        self,
+        task: dict[str, Any],
+        *,
+        task_id: str,
+        root: Path,
+        actor: str,
+        base_ref: str,
+        worktree_path: str | Path | None,
+    ) -> dict[str, Any]:
         target_branch_result = self._git(root, "symbolic-ref", "--short", "HEAD")
         if target_branch_result.returncode != 0 or not target_branch_result.stdout.strip():
             raise TeamError("main checkout must be on a named branch when creating a worktree")
@@ -330,43 +357,15 @@ class WorktreeManager:
         for operation in rows:
             operation_id = str(operation["operation_id"])
             try:
-                payload = json.loads(operation["payload_json"])
-                root = Path(str(payload["repo_root"])).resolve()
-                target = Path(str(payload["worktree_path"])).resolve()
-                branch = str(payload["branch"])
-                if not root.is_dir():
-                    raise TeamError(f"repository root is missing: {root}")
-                if target.is_dir():
-                    top = self._git(target, "rev-parse", "--show-toplevel")
-                    current_branch = self._git(
-                        target,
-                        "symbolic-ref",
-                        "--short",
-                        "HEAD",
-                    )
-                    if (
-                        top.returncode != 0
-                        or Path(top.stdout.strip()).resolve() != target
-                        or current_branch.returncode != 0
-                        or current_branch.stdout.strip() != branch
-                    ):
-                        raise TeamError(
-                            "worktree target exists but branch/root do not match intent"
-                        )
-                    self._finalize_intent(operation_id)
-                else:
-                    branch_exists = self._git(
-                        root,
-                        "show-ref",
-                        "--verify",
-                        f"refs/heads/{branch}",
-                    )
-                    if branch_exists.returncode == 0:
-                        raise TeamError(
-                            "branch exists but worktree target is missing"
-                        )
-                    raise TeamError("worktree creation did not complete")
-                recovered.append({"operation_id": operation_id, "status": "completed"})
+                recovered.append(self._recover_operation(operation))
+            except RepositoryLockTimeout as exc:
+                recovered.append(
+                    {
+                        "operation_id": operation_id,
+                        "status": "deferred",
+                        "error": str(exc),
+                    }
+                )
             except Exception as exc:
                 error = str(exc)
                 try:
@@ -381,6 +380,50 @@ class WorktreeManager:
                     }
                 )
         return recovered
+
+    def _recover_operation(self, operation: dict[str, Any]) -> dict[str, Any]:
+        operation_id = str(operation["operation_id"])
+        payload = json.loads(operation["payload_json"])
+        root = Path(str(payload["repo_root"])).resolve()
+        target = Path(str(payload["worktree_path"])).resolve()
+        branch = str(payload["branch"])
+        if not root.is_dir():
+            raise TeamError(f"repository root is missing: {root}")
+        with repository_lock(
+            root,
+            label=f"worktree recovery for {operation_id}",
+        ):
+            if target.is_dir():
+                top = self._git(target, "rev-parse", "--show-toplevel")
+                current_branch = self._git(
+                    target,
+                    "symbolic-ref",
+                    "--short",
+                    "HEAD",
+                )
+                if (
+                    top.returncode != 0
+                    or Path(top.stdout.strip()).resolve() != target
+                    or current_branch.returncode != 0
+                    or current_branch.stdout.strip() != branch
+                ):
+                    raise TeamError(
+                        "worktree target exists but branch/root do not match intent"
+                    )
+                self._finalize_intent(operation_id)
+            else:
+                branch_exists = self._git(
+                    root,
+                    "show-ref",
+                    "--verify",
+                    f"refs/heads/{branch}",
+                )
+                if branch_exists.returncode == 0:
+                    raise TeamError(
+                        "branch exists but worktree target is missing"
+                    )
+                raise TeamError("worktree creation did not complete")
+        return {"operation_id": operation_id, "status": "completed"}
 
     def list(self, repo: str | Path) -> list[dict[str, Any]]:
         root = self.team._root(repo)
