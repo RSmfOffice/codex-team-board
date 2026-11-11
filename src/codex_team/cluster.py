@@ -1000,9 +1000,7 @@ class ClusterManager:
                         state = dict(self.app_turns.get(job["job_id"], {}))
                     usage = self._app_job_usage(job, state)
                     if _usage_has_evidence(usage):
-                        usage_source = (
-                            "cluster_agents.last_usage+runtime_raw_turn"
-                        )
+                        usage_source = "app_server.token_usage"
                 settled = self._settle_job_row(
                     connection,
                     job["job_id"],
@@ -1402,40 +1400,57 @@ class ClusterManager:
             thread_id,
             task_id=task_id,
         )
+        project = self.team.project_for_repo(repo)
+        self.team.ensure_project_active(project)
+        with self.team.connection(write=False) as connection:
+            existing = connection.execute(
+                """
+                SELECT project_id, runtime
+                FROM cluster_agents
+                WHERE thread_id = ?
+                """,
+                (thread_id,),
+            ).fetchone()
+        existing_native_same_project = bool(
+            existing is not None
+            and existing["runtime"] == "native"
+            and str(existing["project_id"]) == str(project["project_id"])
+        )
         if not inspection.get("session_found"):
-            raise ClusterError(
-                "native session is missing; project ownership cannot be verified"
-            )
+            if not existing_native_same_project:
+                raise ClusterError(
+                    "native session is missing; project ownership cannot "
+                    "be verified"
+                )
         session_cwd = str(inspection.get("cwd") or "").strip()
-        if not session_cwd:
+        if not session_cwd and not existing_native_same_project:
             raise ClusterError(
                 "native session cwd is missing; project ownership cannot be verified"
             )
-        project = self.team.project_for_repo(repo)
-        self.team.ensure_project_active(project)
-        active_projects = self.team.list_projects(include_archived=False)
-        matching_projects = [
-            candidate
-            for candidate in active_projects
-            if _path_is_within(
-                session_cwd,
-                str(candidate.get("root_path") or ""),
+        if session_cwd:
+            active_projects = self.team.list_projects(include_archived=False)
+            matching_projects = [
+                candidate
+                for candidate in active_projects
+                if _path_is_within(
+                    session_cwd,
+                    str(candidate.get("root_path") or ""),
+                )
+            ]
+            matching_projects.sort(
+                key=lambda candidate: len(
+                    str(Path(str(candidate["root_path"])).resolve())
+                ),
+                reverse=True,
             )
-        ]
-        matching_projects.sort(
-            key=lambda candidate: len(
-                str(Path(str(candidate["root_path"])).resolve())
-            ),
-            reverse=True,
-        )
-        if (
-            not matching_projects
-            or str(matching_projects[0]["project_id"])
-            != str(project["project_id"])
-        ):
-            raise ClusterError(
-                "native session cwd does not belong to the requested project"
-            )
+            if (
+                not matching_projects
+                or str(matching_projects[0]["project_id"])
+                != str(project["project_id"])
+            ):
+                raise ClusterError(
+                    "native session cwd does not belong to the requested project"
+                )
         task: dict[str, Any] | None = None
         if task_id:
             task = self.team.get_task(task_id)
@@ -5929,11 +5944,7 @@ Do not return raw logs or a full transcript.
             state = dict(self.app_turns.get(job["job_id"], {}))
         usage = self._app_job_usage(job, state)
         usage_has_evidence = _usage_has_evidence(usage)
-        usage_source = (
-            "cluster_agents.last_usage+runtime_raw_turn"
-            if usage_has_evidence
-            else None
-        )
+        usage_source = "app_server.token_usage" if usage_has_evidence else None
         telemetry_complete = (
             _usage_is_telemetry_complete(usage)
             if usage_has_evidence
