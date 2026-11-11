@@ -2686,15 +2686,30 @@ class TeamService:
             if task["kind"] == "write":
                 self._validate_write_worktree_assignment(connection, task)
             now = utc_now()
-            connection.execute(
+            expected_status = str(task["status"])
+            expected_version = int(task["version"])
+            updated = connection.execute(
                 """
                 UPDATE tasks
                 SET status = 'running', claimed_by = ?, claim_token = ?,
                     lease_until = ?, version = version + 1, updated_at = ?
-                WHERE task_id = ?
+                WHERE task_id = ? AND status = ? AND version = ?
+                  AND claimed_by IS ? AND claim_token IS ?
                 """,
-                (actor, claim_token, lease_until, now, task_id),
+                (
+                    actor,
+                    claim_token,
+                    lease_until,
+                    now,
+                    task_id,
+                    expected_status,
+                    expected_version,
+                    task["claimed_by"],
+                    task["claim_token"],
+                ),
             )
+            if updated.rowcount != 1:
+                raise TeamError("task claim conflicted with another update; reload and retry")
             self._event(
                 connection,
                 task_id,
@@ -2719,17 +2734,29 @@ class TeamService:
             datetime.now(UTC) + timedelta(minutes=max(5, min(lease_minutes, 240)))
         ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             task = self._authorized_task(connection, task_id, claim_token, actor)
             if task["status"] != "running":
                 raise TeamError("heartbeat requires a running task")
-            connection.execute(
+            expected_version = int(task["version"])
+            updated = connection.execute(
                 """
                 UPDATE tasks
                 SET lease_until = ?, updated_at = ?, version = version + 1
-                WHERE task_id = ?
+                WHERE task_id = ? AND status = 'running' AND version = ?
+                  AND claimed_by = ? AND claim_token = ?
                 """,
-                (lease_until, utc_now(), task_id),
+                (
+                    lease_until,
+                    utc_now(),
+                    task_id,
+                    expected_version,
+                    actor,
+                    claim_token,
+                ),
             )
+            if updated.rowcount != 1:
+                raise TeamError("heartbeat conflicted with another update; reload and retry")
             self._event(connection, task_id, "heartbeat", actor, {"lease_until": lease_until})
         result = self.get_task(task_id)
         result["claim_token"] = claim_token
@@ -2747,6 +2774,7 @@ class TeamService:
         commit_sha: str | None = None,
     ) -> dict[str, Any]:
         with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             task = self._authorized_task(connection, task_id, claim_token, actor)
             if task["status"] != "running":
                 raise TeamError("task is not running")
@@ -2759,13 +2787,29 @@ class TeamService:
                 fields.append("tests = ?")
                 parameters.append(tests)
             if commit_sha is not None:
+                if not isinstance(commit_sha, str):
+                    raise TeamError("commit_sha must be a string")
                 fields.append("commit_sha = ?")
                 parameters.append(commit_sha.strip())
+            expected_version = int(task["version"])
             parameters.append(task_id)
-            connection.execute(
-                f"UPDATE tasks SET {', '.join(fields)} WHERE task_id = ?",
+            parameters.extend(
+                (
+                    expected_version,
+                    actor,
+                    claim_token,
+                )
+            )
+            updated = connection.execute(
+                f"""
+                UPDATE tasks SET {', '.join(fields)}
+                WHERE task_id = ? AND status = 'running' AND version = ?
+                  AND claimed_by = ? AND claim_token = ?
+                """,
                 parameters,
             )
+            if updated.rowcount != 1:
+                raise TeamError("task progress conflicted with another update; reload and retry")
             self._event(
                 connection,
                 task_id,
@@ -2788,31 +2832,71 @@ class TeamService:
         reason: str,
         claim_token: str | None = None,
     ) -> dict[str, Any]:
+        actor = actor.strip()
+        reason = reason.strip()
+        if not actor:
+            raise TeamError("actor is required")
+        if not reason:
+            raise TeamError("block reason is required")
+        normalized_token = claim_token.strip() if claim_token is not None else ""
         with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             task = connection.execute(
                 "SELECT * FROM tasks WHERE task_id = ?",
                 (task_id,),
             ).fetchone()
             if task is None:
                 raise TeamError(f"task not found: {task_id}")
-            if claim_token:
-                self._authorized_task(connection, task_id, claim_token, actor)
+            if normalized_token:
+                task = self._authorized_task(
+                    connection,
+                    task_id,
+                    normalized_token,
+                    actor,
+                )
+            elif task["status"] == "running" and actor not in {
+                "lead",
+                "main",
+                "human",
+                "teamd",
+            }:
+                raise TeamError(
+                    "blocking a running task requires the active claim_token"
+                )
             if task["status"] in TERMINAL_STATUSES:
                 raise TeamError("cannot block terminal task")
-            connection.execute(
+            expected_status = str(task["status"])
+            expected_version = int(task["version"])
+            updated = connection.execute(
                 """
                 UPDATE tasks
-                SET status = 'blocked', blocker = ?, claim_token = NULL,
-                    lease_until = NULL, updated_at = ?, version = version + 1
-                WHERE task_id = ?
+                SET status = 'blocked', blocker = ?, claimed_by = NULL,
+                    claim_token = NULL, lease_until = NULL,
+                    updated_at = ?, version = version + 1
+                WHERE task_id = ? AND status = ? AND version = ?
+                  AND claimed_by IS ? AND claim_token IS ?
                 """,
-                (reason, utc_now(), task_id),
+                (
+                    reason,
+                    utc_now(),
+                    task_id,
+                    expected_status,
+                    expected_version,
+                    task["claimed_by"],
+                    task["claim_token"],
+                ),
             )
+            if updated.rowcount != 1:
+                raise TeamError("task block conflicted with another update; reload and retry")
             self._event(connection, task_id, "blocked", actor, {"reason": reason})
         return self.get_task(task_id)
 
     def unblock_task(self, task_id: str, *, actor: str) -> dict[str, Any]:
+        actor = actor.strip()
+        if not actor:
+            raise TeamError("actor is required")
         with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             task = connection.execute(
                 "SELECT * FROM tasks WHERE task_id = ?",
                 (task_id,),
@@ -2821,15 +2905,19 @@ class TeamService:
                 raise TeamError(f"task not found: {task_id}")
             if task["status"] != "blocked":
                 raise TeamError("task is not blocked")
-            connection.execute(
+            expected_version = int(task["version"])
+            updated = connection.execute(
                 """
                 UPDATE tasks
                 SET status = 'ready', blocker = '', claimed_by = NULL,
+                    claim_token = NULL, lease_until = NULL,
                     updated_at = ?, version = version + 1
-                WHERE task_id = ?
+                WHERE task_id = ? AND status = 'blocked' AND version = ?
                 """,
-                (utc_now(), task_id),
+                (utc_now(), task_id, expected_version),
             )
+            if updated.rowcount != 1:
+                raise TeamError("task unblock conflicted with another update; reload and retry")
             self._event(connection, task_id, "unblocked", actor, {})
         return self.get_task(task_id)
 
@@ -2868,16 +2956,27 @@ class TeamService:
                     f"cannot cancel task with active job: {active_job['job_id']}"
                 )
             now = utc_now()
-            connection.execute(
+            expected_status = str(task["status"])
+            expected_version = int(task["version"])
+            updated = connection.execute(
                 """
                 UPDATE tasks
                 SET status = 'canceled', blocker = ?, claimed_by = NULL,
                     claim_token = NULL, lease_until = NULL, completed_at = ?,
                     updated_at = ?, version = version + 1
-                WHERE task_id = ?
+                WHERE task_id = ? AND status = ? AND version = ?
                 """,
-                (f"canceled: {reason}", now, now, task_id),
+                (
+                    f"canceled: {reason}",
+                    now,
+                    now,
+                    task_id,
+                    expected_status,
+                    expected_version,
+                ),
             )
+            if updated.rowcount != 1:
+                raise TeamError("task cancel conflicted with another update; reload and retry")
             self._event(
                 connection,
                 task_id,
@@ -2897,56 +2996,80 @@ class TeamService:
         tests: str,
         commit_sha: str = "",
     ) -> dict[str, Any]:
-        with self.connection() as connection:
-            task = self._authorized_task(connection, task_id, claim_token, actor)
-            if task["status"] != "running":
+        resolved_commit = commit_sha.strip()
+        with self.connection(write=False) as connection:
+            preflight = self._authorized_task(
+                connection,
+                task_id,
+                claim_token,
+                actor,
+            )
+            if preflight["status"] != "running":
                 raise TeamError("only running tasks can be submitted")
-            resolved_commit = commit_sha.strip()
-            if task["kind"] == "write":
+            if preflight["kind"] == "write":
                 if not resolved_commit:
                     raise TeamError("write task submission requires commit_sha")
                 worktree = str(
                     self._validate_write_worktree_assignment(
                         connection,
-                        task,
+                        preflight,
                     )
                 )
-                status = subprocess.run(
-                    ["git", "-C", str(worktree), "status", "--porcelain"],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    check=False,
-                )
-                if status.returncode != 0:
-                    raise TeamError(status.stderr.strip() or "could not inspect worktree")
-                if status.stdout.strip():
-                    raise TeamError("worktree is dirty; commit changes before submission")
-                head = subprocess.run(
-                    ["git", "-C", str(worktree), "rev-parse", "HEAD"],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    check=False,
-                )
-                if head.returncode != 0:
-                    raise TeamError(head.stderr.strip() or "could not read worktree HEAD")
-                actual = head.stdout.strip().lower()
-                if len(resolved_commit) < 7 or not actual.startswith(resolved_commit.lower()):
-                    raise TeamError("commit_sha does not match the worktree HEAD")
-                resolved_commit = actual
-            connection.execute(
+        if preflight["kind"] == "write":
+            status = subprocess.run(
+                ["git", "-C", worktree, "status", "--porcelain"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            if status.returncode != 0:
+                raise TeamError(status.stderr.strip() or "could not inspect worktree")
+            if status.stdout.strip():
+                raise TeamError("worktree is dirty; commit changes before submission")
+            head = subprocess.run(
+                ["git", "-C", worktree, "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            if head.returncode != 0:
+                raise TeamError(head.stderr.strip() or "could not read worktree HEAD")
+            actual = head.stdout.strip().lower()
+            if len(resolved_commit) < 7 or not actual.startswith(resolved_commit.lower()):
+                raise TeamError("commit_sha does not match the worktree HEAD")
+            resolved_commit = actual
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            task = self._authorized_task(connection, task_id, claim_token, actor)
+            if task["status"] != "running":
+                raise TeamError("only running tasks can be submitted")
+            expected_version = int(task["version"])
+            updated = connection.execute(
                 """
                 UPDATE tasks
                 SET status = 'review', result = ?, tests = ?, commit_sha = ?,
                     claim_token = NULL,
                     lease_until = NULL, updated_at = ?, version = version + 1
-                WHERE task_id = ?
+                WHERE task_id = ? AND status = 'running' AND version = ?
+                  AND claimed_by = ? AND claim_token = ?
                 """,
-                (result, tests, resolved_commit, utc_now(), task_id),
+                (
+                    result,
+                    tests,
+                    resolved_commit,
+                    utc_now(),
+                    task_id,
+                    expected_version,
+                    actor,
+                    claim_token,
+                ),
             )
+            if updated.rowcount != 1:
+                raise TeamError("task submit conflicted with another update; reload and retry")
             self._event(
                 connection,
                 task_id,

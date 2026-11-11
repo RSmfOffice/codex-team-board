@@ -603,6 +603,13 @@ summary revision 未变化时不请求 `/api/board`；只有 revision 变化、�
 不会改变工具 schema。help 会返回每个 operation 的完整 `inputSchema`，包括类型、
 默认值、范围、枚举和字段说明。Core dispatcher 和 legacy surface 都会在执行
 业务前校验同一份 schema，不接受隐式布尔/整数转换。
+
+`team_write` 的 `request_id` 是非空幂等键。相同 id、operation 和规范化 payload
+重试时返回第一次成功写入的原结果；相同 id 携带不同 payload 或 operation 会被
+拒绝；并发相同 id 只执行一次。缺少 `request_id` 的旧调用继续兼容，但明确属于
+非幂等写入，客户端超时重试前应自行补上稳定唯一 id。receipt 仅用于内部持久化，
+不会加入稳定的 Core 工具 schema。
+
 `CODEX_TEAM_MCP_SURFACE=core|admin|legacy` 控制工具面，其中 `core` 是默认值，
 `admin`/`legacy` 暴露下列兼容细粒度工具，建议仅用于人工管理、迁移和故障回退。
 

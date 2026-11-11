@@ -222,6 +222,25 @@ class MigrationTests(unittest.TestCase):
                     """
                 ).fetchone()
                 self.assertIsNotNone(operation_table)
+                receipt_columns = {
+                    row["name"]
+                    for row in reopened.execute(
+                        "PRAGMA table_info(request_receipts)"
+                    ).fetchall()
+                }
+                self.assertEqual(
+                    {
+                        "request_id",
+                        "operation",
+                        "payload_hash",
+                        "status",
+                        "result_json",
+                        "error",
+                        "created_at",
+                        "updated_at",
+                    },
+                    receipt_columns,
+                )
                 event_columns = {
                     row["name"]
                     for row in reopened.execute(
