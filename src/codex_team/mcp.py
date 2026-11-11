@@ -3,8 +3,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import secrets
+import sqlite3
 import sys
+import threading
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -20,7 +24,12 @@ from .cache_contract import (
     sha256_text,
 )
 from .config import Settings
-from .cluster import ClusterManager, daemon_status as cluster_daemon_status, ensure_daemon
+from .cluster import (
+    ClusterError,
+    ClusterManager,
+    daemon_status as cluster_daemon_status,
+    ensure_daemon,
+)
 from .db import utc_now
 from .prompt_contract import (
     CORE_INSTRUCTIONS,
@@ -28,12 +37,21 @@ from .prompt_contract import (
     configured_access_mode,
     instructions_for_surface,
 )
-from .service import TeamError, TeamService
+from .processes import current_process_identity, process_identity
+from .service import (
+    TeamError,
+    TeamService,
+    request_mutation_scope,
+)
 from .validation import SchemaValidationError, validate_input_schema
 from .worktrees import WorktreeManager
 
 LOGGER = logging.getLogger("codex_team.mcp")
 PROTOCOL_VERSION = "2025-06-18"
+RECEIPT_WAIT_SECONDS = 60
+LEGACY_PENDING_TAKEOVER_SECONDS = 60
+_ACTIVE_RECEIPT_OWNERS: set[tuple[str, str]] = set()
+_ACTIVE_RECEIPT_OWNERS_LOCK = threading.RLock()
 
 
 def _access_mode() -> str:
@@ -475,6 +493,10 @@ def _tool_definitions() -> list[dict[str, Any]]:
                     "actor": {"type": "string"},
                     "reason": {"type": "string", "minLength": 1},
                     "claim_token": {"type": "string"},
+                    "authority_token": {
+                        "type": "string",
+                        "description": "Local privileged-operation token when no claim token is supplied.",
+                    },
                 },
                 "required": ["task_id", "actor", "reason"],
                 "additionalProperties": False,
@@ -485,7 +507,14 @@ def _tool_definitions() -> list[dict[str, Any]]:
             "description": "Return a blocked task to ready after the blocker is resolved.",
             "inputSchema": {
                 "type": "object",
-                "properties": {"task_id": task_id, "actor": {"type": "string"}},
+                "properties": {
+                    "task_id": task_id,
+                    "actor": {"type": "string"},
+                    "authority_token": {
+                        "type": "string",
+                        "description": "Local privileged-operation token.",
+                    },
+                },
                 "required": ["task_id", "actor"],
                 "additionalProperties": False,
             },
@@ -501,6 +530,10 @@ def _tool_definitions() -> list[dict[str, Any]]:
                     "task_id": task_id,
                     "actor": {"type": "string"},
                     "reason": {"type": "string", "minLength": 1},
+                    "authority_token": {
+                        "type": "string",
+                        "description": "Local privileged-operation token.",
+                    },
                 },
                 "required": ["task_id", "actor", "reason"],
                 "additionalProperties": False,
@@ -523,6 +556,10 @@ def _tool_definitions() -> list[dict[str, Any]]:
                     "merge_commit": {
                         "type": "string",
                         "description": "Required when approving a write task; record the commit merged into the main branch.",
+                    },
+                    "authority_token": {
+                        "type": "string",
+                        "description": "Local privileged-operation token.",
                     },
                 },
                 "required": ["task_id", "actor", "approve", "notes"],
@@ -670,6 +707,10 @@ def _tool_definitions() -> list[dict[str, Any]]:
                             "restore",
                         ],
                     },
+                    "authority_token": {
+                        "type": "string",
+                        "description": "Local privileged-operation token.",
+                    },
                 },
                 "required": ["goal_id", "action"],
                 "additionalProperties": False,
@@ -687,6 +728,10 @@ def _tool_definitions() -> list[dict[str, Any]]:
                     "goal_id": {"type": "string", "minLength": 1},
                     "workstream_key": {"type": "string"},
                     "continuity_reason": {"type": "string"},
+                    "authority_token": {
+                        "type": "string",
+                        "description": "Local privileged-operation token.",
+                    },
                 },
                 "required": ["goal_id"],
                 "additionalProperties": False,
@@ -707,6 +752,10 @@ def _tool_definitions() -> list[dict[str, Any]]:
                         "type": "string",
                         "minLength": 1,
                         "maxLength": 12000,
+                    },
+                    "authority_token": {
+                        "type": "string",
+                        "description": "Local privileged-operation token.",
                     },
                 },
                 "required": ["goal_id", "summary"],
@@ -731,6 +780,10 @@ def _tool_definitions() -> list[dict[str, Any]]:
                     "reason": {
                         "type": "string",
                         "minLength": 1,
+                    },
+                    "authority_token": {
+                        "type": "string",
+                        "description": "Local privileged-operation token.",
                     },
                 },
                 "required": ["goal_id", "actor", "reason"],
@@ -769,6 +822,10 @@ def _tool_definitions() -> list[dict[str, Any]]:
                     "reason": {
                         "type": "string",
                         "default": "manual reset requested through MCP",
+                    },
+                    "authority_token": {
+                        "type": "string",
+                        "description": "Local privileged-operation token.",
                     },
                 },
                 "required": ["agent_id"],
@@ -884,63 +941,185 @@ class TeamMcpServer:
         request_id: str,
     ) -> Any:
         payload_hash = sha256_text(canonical_json(arguments))
-        deadline = time.monotonic() + 60
+        deadline = time.monotonic() + RECEIPT_WAIT_SECONDS
+        owner_token = secrets.token_urlsafe(18)
+        owner_json = self._receipt_owner_json(owner_token)
+        owns_request = False
         while True:
-            owns_request = False
-            with self.team.connection() as connection:
-                connection.execute("BEGIN IMMEDIATE")
-                receipt = connection.execute(
-                    """
-                    SELECT operation, payload_hash, status, result_json, error
-                    FROM request_receipts WHERE request_id = ?
-                    """,
-                    (request_id,),
-                ).fetchone()
-                if receipt is None:
-                    now = utc_now()
-                    connection.execute(
+            recovered: Any | None = None
+            has_recovered_result = False
+            takeover_error: str | None = None
+            with _ACTIVE_RECEIPT_OWNERS_LOCK:
+                with self.team.connection() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    receipt = connection.execute(
                         """
-                        INSERT INTO request_receipts(
-                            request_id, operation, payload_hash, status,
-                            result_json, error, created_at, updated_at
-                        ) VALUES (?, ?, ?, 'pending', NULL, '', ?, ?)
+                        SELECT operation, payload_hash, status, result_json,
+                               error, updated_at
+                        FROM request_receipts WHERE request_id = ?
                         """,
-                        (request_id, name, payload_hash, now, now),
-                    )
-                    owns_request = True
-                else:
-                    if str(receipt["operation"]) != name:
-                        raise TeamError(
-                            "request_id was already used for a different operation"
+                        (request_id,),
+                    ).fetchone()
+                    if receipt is None:
+                        now = utc_now()
+                        connection.execute(
+                            """
+                            INSERT INTO request_receipts(
+                                request_id, operation, payload_hash, status,
+                                result_json, error, created_at, updated_at
+                            ) VALUES (?, ?, ?, 'pending', NULL, ?, ?, ?)
+                            """,
+                            (
+                                request_id,
+                                name,
+                                payload_hash,
+                                owner_json,
+                                now,
+                                now,
+                            ),
                         )
-                    if str(receipt["payload_hash"]) != payload_hash:
-                        raise TeamError(
-                            "request_id was already used with a different payload"
+                        _ACTIVE_RECEIPT_OWNERS.add(
+                            (request_id, owner_token)
                         )
-                    if receipt["status"] == "completed":
-                        try:
-                            return json.loads(str(receipt["result_json"]))
-                        except (TypeError, ValueError) as exc:
+                        owns_request = True
+                    else:
+                        self._validate_receipt(
+                            receipt,
+                            name=name,
+                            payload_hash=payload_hash,
+                        )
+                        if receipt["status"] == "completed":
+                            try:
+                                return json.loads(
+                                    str(receipt["result_json"])
+                                )
+                            except (TypeError, ValueError) as exc:
+                                raise TeamError(
+                                    "stored request result is not valid JSON"
+                                ) from exc
+                        if receipt["status"] == "failed":
                             raise TeamError(
-                                "stored request result is not valid JSON"
-                            ) from exc
-                    if receipt["status"] == "failed":
-                        raise TeamError(
-                            "request_id previously failed: "
-                            + str(receipt["error"] or "unknown error")
+                                "request_id previously failed: "
+                                + str(receipt["error"] or "unknown error")
+                            )
+                        effect = self._durable_request_effect(
+                            connection,
+                            name,
+                            arguments,
+                            request_id,
                         )
+                        if effect is not None:
+                            recovered = self._recover_effect_result(
+                                name,
+                                arguments,
+                                effect,
+                                request_id,
+                            )
+                            has_recovered_result = True
+                        else:
+                            owner = self._decode_receipt_owner(
+                                receipt["error"]
+                            )
+                            if not self._receipt_owner_is_live(
+                                request_id,
+                                owner,
+                            ):
+                                previous_error = str(
+                                    receipt["error"] or ""
+                                )
+                                if owner is None and not self._legacy_pending_is_stale(
+                                    receipt["updated_at"]
+                                ):
+                                    takeover_error = None
+                                else:
+                                    updated = connection.execute(
+                                        """
+                                        UPDATE request_receipts
+                                        SET error = ?, updated_at = ?
+                                        WHERE request_id = ?
+                                          AND payload_hash = ?
+                                          AND status = 'pending'
+                                          AND error = ?
+                                        """,
+                                        (
+                                            owner_json,
+                                            utc_now(),
+                                            request_id,
+                                            payload_hash,
+                                            previous_error,
+                                        ),
+                                    )
+                                    if updated.rowcount == 1:
+                                        _ACTIVE_RECEIPT_OWNERS.add(
+                                            (request_id, owner_token)
+                                        )
+                                        owns_request = True
             if owns_request:
                 break
+            if has_recovered_result:
+                if recovered is not None:
+                    self._finish_request_receipt(
+                        request_id,
+                        name,
+                        payload_hash,
+                        result=recovered,
+                    )
+                    return recovered
+                conflict = (
+                    "request outcome is durable but cannot be reconstructed "
+                    "safely; inspect the affected task/job before using a new "
+                    "request_id"
+                )
+                self._fail_request_receipt(
+                    request_id,
+                    name,
+                    payload_hash,
+                    conflict,
+                )
+                raise TeamError(conflict)
             if time.monotonic() >= deadline:
                 raise TeamError(
                     "request_id is still pending or was interrupted; "
-                    "refusing to execute it a second time"
+                    "refusing to execute it a second time (safe conflict)"
                 )
             time.sleep(0.05)
 
         try:
-            result = self._call_tool_once(name, arguments)
+            actor = self._request_actor(arguments)
+            with request_mutation_scope(request_id, name, actor):
+                result = self._call_tool_once(name, arguments)
         except Exception as exc:
+            effect = self._load_durable_request_effect(
+                name,
+                arguments,
+                request_id,
+            )
+            if effect is not None:
+                recovered = self._recover_effect_result(
+                    name,
+                    arguments,
+                    effect,
+                    request_id,
+                )
+                if recovered is not None:
+                    self._finish_request_receipt(
+                        request_id,
+                        name,
+                        payload_hash,
+                        result=recovered,
+                    )
+                    return recovered
+                raise TeamError(
+                    "request committed a durable mutation but its result is "
+                    "ambiguous; inspect the affected task/job before retrying"
+                ) from exc
+            if self._is_transient_failure(exc):
+                self._delete_pending_request(
+                    request_id,
+                    name,
+                    payload_hash,
+                )
+                raise
             try:
                 self._finish_request_receipt(
                     request_id,
@@ -954,6 +1133,11 @@ class TeamMcpServer:
                     name,
                 )
             raise
+        finally:
+            with _ACTIVE_RECEIPT_OWNERS_LOCK:
+                _ACTIVE_RECEIPT_OWNERS.discard(
+                    (request_id, owner_token)
+                )
         self._finish_request_receipt(
             request_id,
             name,
@@ -961,6 +1145,369 @@ class TeamMcpServer:
             result=result,
         )
         return result
+
+    @staticmethod
+    def _validate_receipt(
+        receipt: Mapping[str, Any],
+        *,
+        name: str,
+        payload_hash: str,
+    ) -> None:
+        if str(receipt["operation"]) != name:
+            raise TeamError(
+                "request_id was already used for a different operation"
+            )
+        if str(receipt["payload_hash"]) != payload_hash:
+            raise TeamError(
+                "request_id was already used with a different payload"
+            )
+
+    @staticmethod
+    def _receipt_owner_json(owner_token: str) -> str:
+        identity = current_process_identity()
+        record: dict[str, Any] = {
+            "owner_token": owner_token,
+            "pid": os.getpid(),
+        }
+        if identity:
+            record["instance_id"] = identity["instance_id"]
+            record["creation_time"] = identity["creation_time"]
+            record["executable"] = identity["executable"]
+        return json.dumps(
+            record,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    @staticmethod
+    def _decode_receipt_owner(raw: object) -> dict[str, Any] | None:
+        try:
+            value = json.loads(str(raw or ""))
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(value, dict):
+            return None
+        if not str(value.get("owner_token") or "").strip():
+            return None
+        try:
+            pid = int(value.get("pid") or 0)
+        except (TypeError, ValueError):
+            return None
+        if pid <= 0:
+            return None
+        normalized = dict(value)
+        normalized["pid"] = pid
+        return normalized
+
+    @staticmethod
+    def _receipt_owner_is_live(
+        request_id: str,
+        owner: Mapping[str, Any] | None,
+    ) -> bool:
+        if owner is None:
+            return False
+        token = str(owner["owner_token"])
+        pid = int(owner["pid"])
+        if pid == os.getpid():
+            with _ACTIVE_RECEIPT_OWNERS_LOCK:
+                return (request_id, token) in _ACTIVE_RECEIPT_OWNERS
+        identity = process_identity(pid)
+        if not identity:
+            return False
+        expected = str(owner.get("instance_id") or "").strip()
+        return not expected or identity["instance_id"] == expected
+
+    @staticmethod
+    def _legacy_pending_is_stale(updated_at: object) -> bool:
+        try:
+            parsed = datetime.fromisoformat(
+                str(updated_at or "").replace("Z", "+00:00")
+            )
+        except ValueError:
+            return True
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return (
+            datetime.now(UTC) - parsed
+        ).total_seconds() >= LEGACY_PENDING_TAKEOVER_SECONDS
+
+    @staticmethod
+    def _request_actor(arguments: Mapping[str, Any]) -> str:
+        for key in ("actor", "sender"):
+            value = arguments.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return "system"
+
+    @staticmethod
+    def _is_transient_failure(exc: Exception) -> bool:
+        if isinstance(exc, (OSError, TimeoutError, sqlite3.OperationalError)):
+            return True
+        message = str(exc).lower()
+        if any(
+            marker in message
+            for marker in (
+                "database is locked",
+                "database is busy",
+                "temporarily unavailable",
+                "timed out",
+                "timeout",
+                "connection reset",
+            )
+        ):
+            return True
+        return False
+
+    def _delete_pending_request(
+        self,
+        request_id: str,
+        name: str,
+        payload_hash: str,
+    ) -> None:
+        with self.team.connection() as connection:
+            connection.execute(
+                """
+                DELETE FROM request_receipts
+                WHERE request_id = ? AND operation = ? AND payload_hash = ?
+                  AND status = 'pending'
+                """,
+                (request_id, name, payload_hash),
+            )
+
+    def _fail_request_receipt(
+        self,
+        request_id: str,
+        name: str,
+        payload_hash: str,
+        error: str,
+    ) -> None:
+        with self.team.connection() as connection:
+            connection.execute(
+                """
+                UPDATE request_receipts
+                SET status = 'failed', error = ?, updated_at = ?
+                WHERE request_id = ? AND operation = ? AND payload_hash = ?
+                  AND status = 'pending'
+                """,
+                (
+                    error[:4000],
+                    utc_now(),
+                    request_id,
+                    name,
+                    payload_hash,
+                ),
+            )
+
+    def _load_durable_request_effect(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        request_id: str,
+    ) -> dict[str, Any] | None:
+        with self.team.connection(write=False) as connection:
+            return self._durable_request_effect(
+                connection,
+                name,
+                arguments,
+                request_id,
+            )
+
+    @staticmethod
+    def _durable_request_effect(
+        connection: sqlite3.Connection,
+        name: str,
+        arguments: Mapping[str, Any],
+        request_id: str,
+    ) -> dict[str, Any] | None:
+        del arguments
+        row = connection.execute(
+            """
+            SELECT operation_type, status, result_json
+            FROM external_operations
+            WHERE operation_id = ?
+            """,
+            (request_id,),
+        ).fetchone()
+        if row is None or str(row["operation_type"]) != name:
+            return None
+        if row["status"] != "completed":
+            return None
+        try:
+            payload = json.loads(str(row["result_json"] or "{}"))
+        except (TypeError, ValueError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        changed = payload.get("changed_tables", [])
+        changed_tables = {
+            str(value) for value in changed if value
+        } if isinstance(changed, list) else set()
+        required_tables = {
+            "team_create_task": {"tasks"},
+            "team_create_worktree": {"tasks"},
+            "team_claim_task": {"tasks"},
+            "team_heartbeat": {"tasks"},
+            "team_update_task": {"tasks"},
+            "team_submit_task": {"tasks"},
+            "team_block_task": {"tasks"},
+            "team_unblock_task": {"tasks"},
+            "team_cancel_task": {"tasks"},
+            "team_review_task": {"tasks"},
+            "team_add_message": {"messages"},
+            "team_cluster_start": {"cluster_goals"},
+            "team_cluster_ensure": {"cluster_goals"},
+            "team_cluster_control": {"cluster_goals", "cluster_jobs"},
+            "team_goal_set_workstream": {"cluster_goals"},
+            "team_goal_set_checkpoint": {"cluster_goals"},
+            "team_goal_migrate_workflow": {"tasks", "cluster_goals"},
+            "team_agent_register_native": {"cluster_agents"},
+            "team_agent_reset": {"cluster_agents"},
+        }.get(name, set())
+        if required_tables and not (changed_tables & required_tables):
+            return None
+        return {
+            "result": payload,
+            "changed_tables": sorted(changed_tables),
+        }
+
+    def _recover_effect_result(
+        self,
+        name: str,
+        arguments: Mapping[str, Any],
+        effect: Mapping[str, Any],
+        request_id: str,
+    ) -> dict[str, Any] | None:
+        payload = effect.get("result")
+        result_payload = payload if isinstance(payload, Mapping) else {}
+        if (
+            name == "team_create_task"
+            and isinstance(result_payload.get("task_id"), str)
+        ):
+            return self.team.get_task(str(result_payload["task_id"]))
+        if name == "team_add_message" and result_payload.get(
+            "message_id"
+        ) is not None:
+            return {
+                "message_id": int(result_payload["message_id"]),
+                "project_id": result_payload.get("project_id"),
+                "task_id": result_payload.get("task_id"),
+                "sender": result_payload.get("sender"),
+                "recipient": result_payload.get("recipient"),
+                "body": result_payload.get("body"),
+            }
+        with self.team.connection(write=False) as connection:
+            events = connection.execute(
+                """
+                SELECT task_id, event_type, data_json
+                FROM task_events
+                WHERE json_extract(data_json, '$.request_id') = ?
+                ORDER BY event_id DESC
+                LIMIT 20
+                """,
+                (request_id,),
+            ).fetchall()
+        event = next(
+            (
+                row
+                for row in events
+                if row["event_type"]
+                in {
+                    "created",
+                    "claimed",
+                    "heartbeat",
+                    "progress",
+                    "submitted",
+                    "blocked",
+                    "unblocked",
+                    "canceled",
+                    "reviewed",
+                    "archived",
+                    "restored",
+                    "message",
+                    "worktree_created",
+                }
+            ),
+            None,
+        )
+        if name == "team_create_task" and event is not None:
+            return self.team.get_task(str(event["task_id"]))
+        if name == "team_create_worktree" and event is not None:
+            task = self.team.get_task(str(event["task_id"]))
+            try:
+                data = json.loads(str(event["data_json"]))
+            except (TypeError, ValueError):
+                data = {}
+            if isinstance(data, dict) and data.get("operation_id"):
+                task["worktree_operation_id"] = str(data["operation_id"])
+            return task
+        if name == "team_add_message" and event is not None:
+            try:
+                data = json.loads(str(event["data_json"]))
+            except (TypeError, ValueError):
+                data = {}
+            message_id = (
+                data.get("message_id") if isinstance(data, dict) else None
+            )
+            if message_id is not None:
+                return {
+                    "message_id": int(message_id),
+                    "project_id": self.team.get_task(
+                        str(event["task_id"])
+                    )["project_id"],
+                    "task_id": str(event["task_id"]),
+                    "sender": self._request_actor(arguments),
+                    "recipient": arguments.get("recipient"),
+                    "body": arguments.get("body", ""),
+                }
+        task_transitions = {
+            "team_claim_task",
+            "team_heartbeat",
+            "team_update_task",
+            "team_submit_task",
+            "team_block_task",
+            "team_unblock_task",
+            "team_cancel_task",
+            "team_review_task",
+        }
+        if name in task_transitions and event is not None:
+            result = self.team.get_task(str(event["task_id"]))
+            if name in {"team_claim_task", "team_heartbeat"}:
+                result["claim_token"] = result.get("claim_token")
+            return result
+        if name == "team_cluster_start":
+            objective = str(arguments.get("objective") or "")
+            with self.team.connection(write=False) as connection:
+                goal = connection.execute(
+                    """
+                    SELECT goal_id FROM cluster_goals
+                    WHERE objective = ?
+                    ORDER BY created_at DESC, goal_id DESC
+                    LIMIT 1
+                    """,
+                    (objective,),
+                ).fetchone()
+            if goal is not None:
+                return {
+                    "goal": self.cluster.get_goal(str(goal["goal_id"])),
+                    "daemon": cluster_daemon_status(self.settings),
+                }
+        if name in {
+            "team_cluster_control",
+            "team_goal_set_workstream",
+            "team_goal_set_checkpoint",
+            "team_goal_migrate_workflow",
+        }:
+            goal_id = arguments.get("goal_id")
+            if isinstance(goal_id, str) and goal_id:
+                goal = self.cluster.get_goal(goal_id)
+                if name == "team_cluster_control":
+                    return {
+                        "goal": goal,
+                        "daemon": cluster_daemon_status(self.settings),
+                    }
+                return goal
+        return None
 
     def _finish_request_receipt(
         self,
@@ -986,7 +1533,7 @@ class TeamMcpServer:
             connection.execute("BEGIN IMMEDIATE")
             receipt = connection.execute(
                 """
-                SELECT operation, payload_hash, status
+                SELECT operation, payload_hash, status, result_json, error
                 FROM request_receipts WHERE request_id = ?
                 """,
                 (request_id,),
@@ -998,7 +1545,17 @@ class TeamMcpServer:
             ):
                 raise TeamError("request receipt changed while the mutation ran")
             if receipt["status"] != "pending":
-                raise TeamError("request receipt is no longer pending")
+                if (
+                    status == "completed"
+                    and receipt["status"] == "completed"
+                    and str(receipt["result_json"] or "") == str(
+                        result_json or ""
+                    )
+                ):
+                    return
+                raise TeamError(
+                    "request receipt completed with a different outcome"
+                )
             updated = connection.execute(
                 """
                 UPDATE request_receipts
@@ -1126,30 +1683,58 @@ class TeamMcpServer:
                 commit_sha=arguments.get("commit_sha", ""),
             )
         if name == "team_block_task":
+            if not str(arguments.get("claim_token") or "").strip():
+                self.team.require_mcp_authority(
+                    arguments["actor"],
+                    operation="task block",
+                    allowed_actors=frozenset(
+                        {"lead", "main", "human", "teamd"}
+                    ),
+                    authority_token=arguments.get("authority_token"),
+                )
             return self.team.block_task(
                 arguments["task_id"],
                 actor=arguments["actor"],
                 reason=arguments["reason"],
                 claim_token=arguments.get("claim_token"),
+                authority_token=arguments.get("authority_token"),
             )
         if name == "team_unblock_task":
+            self.team.require_mcp_authority(
+                arguments["actor"],
+                operation="task unblock",
+                authority_token=arguments.get("authority_token"),
+            )
             return self.team.unblock_task(
                 arguments["task_id"],
                 actor=arguments["actor"],
+                authority_token=arguments.get("authority_token"),
             )
         if name == "team_cancel_task":
+            self.team.require_mcp_authority(
+                arguments["actor"],
+                operation="task cancellation",
+                authority_token=arguments.get("authority_token"),
+            )
             return self.team.cancel_task(
                 arguments["task_id"],
                 actor=arguments["actor"],
                 reason=arguments["reason"],
+                authority_token=arguments.get("authority_token"),
             )
         if name == "team_review_task":
+            self.team.require_mcp_authority(
+                arguments["actor"],
+                operation="task review",
+                authority_token=arguments.get("authority_token"),
+            )
             return self.team.review_task(
                 arguments["task_id"],
                 actor=arguments["actor"],
                 approve=_required_boolean(arguments, "approve"),
                 notes=arguments["notes"],
                 merge_commit=arguments.get("merge_commit", ""),
+                authority_token=arguments.get("authority_token"),
             )
         if name == "team_add_message":
             return self.team.add_message(
@@ -1211,12 +1796,16 @@ class TeamMcpServer:
                 raise TeamError(
                     "action must be pause, resume, cancel, archive, or restore"
                 )
+            actor = self.team.privileged_actor(
+                f"cluster goal {action}",
+                authority_token=arguments.get("authority_token"),
+            )
             reason = f"{action} requested through MCP"
             if action in {"archive", "restore"}:
                 goal = self.cluster.set_goal_archived(
                     arguments["goal_id"],
                     action == "archive",
-                    actor="human",
+                    actor=actor,
                 )
             elif action == "cancel":
                 goal = self.cluster.cancel_goal(
@@ -1250,19 +1839,31 @@ class TeamMcpServer:
                 ),
             }
         if name == "team_goal_set_workstream":
+            actor = self.team.privileged_actor(
+                "cluster goal workstream changes",
+                authority_token=arguments.get("authority_token"),
+            )
             return self.cluster.set_goal_workstream(
                 arguments["goal_id"],
                 workstream_key=arguments.get("workstream_key"),
                 continuity_reason=arguments.get("continuity_reason"),
-                actor="human",
+                actor=actor,
             )
         if name == "team_goal_set_checkpoint":
+            actor = self.team.privileged_actor(
+                "cluster goal checkpoint changes",
+                authority_token=arguments.get("authority_token"),
+            )
             return self.cluster.set_goal_checkpoint(
                 arguments["goal_id"],
                 summary=arguments["summary"],
-                actor="lead",
+                actor=actor,
             )
         if name == "team_goal_migrate_workflow":
+            self.team.privileged_actor(
+                "cluster goal workflow migration",
+                authority_token=arguments.get("authority_token"),
+            )
             return self.cluster.migrate_goal_workflow_epoch(
                 arguments["goal_id"],
                 actor=arguments["actor"],
@@ -1280,6 +1881,10 @@ class TeamMcpServer:
                 )
             }
         if name == "team_agent_reset":
+            self.team.privileged_actor(
+                "agent reset",
+                authority_token=arguments.get("authority_token"),
+            )
             return self.cluster.reset_agent(
                 arguments["agent_id"],
                 actor=arguments.get("actor", "human"),

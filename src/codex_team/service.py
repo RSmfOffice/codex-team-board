@@ -8,6 +8,8 @@ import secrets
 import sqlite3
 import subprocess
 from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator, Mapping
@@ -46,6 +48,40 @@ class TeamError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True, slots=True)
+class RequestMutation:
+    request_id: str
+    operation: str
+    actor: str
+
+
+_CURRENT_REQUEST_MUTATION: ContextVar[RequestMutation | None] = ContextVar(
+    "codex_team_request_mutation",
+    default=None,
+)
+
+
+@contextmanager
+def request_mutation_scope(
+    request_id: str,
+    operation: str,
+    actor: str,
+) -> Iterator[None]:
+    """Expose trusted request metadata to same-thread service mutations."""
+
+    token = _CURRENT_REQUEST_MUTATION.set(
+        RequestMutation(
+            request_id=request_id,
+            operation=operation,
+            actor=str(actor or "system").strip() or "system",
+        )
+    )
+    try:
+        yield
+    finally:
+        _CURRENT_REQUEST_MUTATION.reset(token)
+
+
 class TeamService:
     ROLE_FILES = {
         "team_explorer": "team-explorer.md",
@@ -70,6 +106,39 @@ class TeamService:
             tuple[tuple[Any, ...], str],
         ] = {}
 
+    def operator_authority(self) -> str:
+        """Load or atomically create the local privileged-operation token."""
+
+        self.settings.ensure()
+        path = self.settings.home / "operator-authority.token"
+        try:
+            token = path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            token = secrets.token_urlsafe(32)
+            try:
+                descriptor = os.open(
+                    path,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    0o600,
+                )
+            except FileExistsError:
+                token = path.read_text(encoding="utf-8").strip()
+            else:
+                with os.fdopen(
+                    descriptor,
+                    "w",
+                    encoding="utf-8",
+                    newline="\n",
+                ) as stream:
+                    stream.write(token + "\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+        if len(token) < 32:
+            raise TeamError(
+                "local operator authority token is missing or invalid"
+            )
+        return token
+
     @contextmanager
     def connection(self, *, write: bool = True) -> Iterator[sqlite3.Connection]:
         self.settings.ensure()
@@ -78,15 +147,197 @@ class TeamService:
             if write or not self.settings.db_path.is_file()
             else connect_readonly(self.settings.db_path)
         )
+        changed_tables: set[str] = set()
+        if write:
+            tracked_actions = {
+                sqlite3.SQLITE_INSERT,
+                sqlite3.SQLITE_UPDATE,
+                sqlite3.SQLITE_DELETE,
+            }
+
+            def track_changes(
+                action: int,
+                table_name: str | None,
+                _column: str | None,
+                _database: str | None,
+                _trigger: str | None,
+            ) -> int:
+                if action in tracked_actions and table_name:
+                    changed_tables.add(str(table_name))
+                return sqlite3.SQLITE_OK
+
+            connection.set_authorizer(track_changes)
         try:
             yield connection
             if write:
+                request = _CURRENT_REQUEST_MUTATION.get()
+                if request is not None:
+                    self._record_request_mutation(
+                        connection,
+                        request,
+                        changed_tables,
+                    )
                 connection.commit()
         except Exception:
             connection.rollback()
             raise
         finally:
             connection.close()
+
+    @staticmethod
+    def _record_request_mutation(
+        connection: sqlite3.Connection,
+        request: RequestMutation,
+        changed_tables: set[str],
+    ) -> None:
+        ignored = {
+            "dashboard_revision",
+            "external_operations",
+            "metadata",
+            "request_receipts",
+            "schema_migrations",
+        }
+        domain_tables = sorted(changed_tables - ignored)
+        if not domain_tables:
+            return
+        existing = connection.execute(
+            """
+            SELECT operation_type, result_json
+            FROM external_operations
+            WHERE operation_id = ?
+            """,
+            (request.request_id,),
+        ).fetchone()
+        if existing is not None:
+            if str(existing["operation_type"]) != request.operation:
+                raise TeamError(
+                    "request mutation ledger conflicts with another operation"
+                )
+            try:
+                previous = json.loads(str(existing["result_json"] or "{}"))
+            except (TypeError, ValueError):
+                previous = {}
+            if not isinstance(previous, dict):
+                previous = {}
+            previous_tables = previous.get("changed_tables", [])
+            if isinstance(previous_tables, list):
+                domain_tables = sorted(
+                    set(domain_tables)
+                    | {str(value) for value in previous_tables if value}
+                )
+            previous["changed_tables"] = domain_tables
+            result_json = json.dumps(
+                previous,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            connection.execute(
+                """
+                UPDATE external_operations
+                SET result_json = ?, updated_at = ?
+                WHERE operation_id = ? AND operation_type = ?
+                """,
+                (
+                    result_json,
+                    utc_now(),
+                    request.request_id,
+                    request.operation,
+                ),
+            )
+            return
+        now = utc_now()
+        result_json = json.dumps(
+            {"changed_tables": domain_tables},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        connection.execute(
+            """
+            INSERT INTO external_operations(
+                operation_id, operation_type, status, actor, payload_json,
+                result_json, created_at, updated_at, completed_at
+            ) VALUES (?, ?, 'completed', ?, '{}', ?, ?, ?, ?)
+            """,
+            (
+                request.request_id,
+                request.operation,
+                request.actor,
+                result_json,
+                now,
+                now,
+                now,
+            ),
+        )
+
+    @staticmethod
+    def _record_request_result(
+        connection: sqlite3.Connection,
+        result: Mapping[str, Any],
+        *,
+        task_id: str | None = None,
+        goal_id: str | None = None,
+        job_id: str | None = None,
+    ) -> None:
+        request = _CURRENT_REQUEST_MUTATION.get()
+        if request is None:
+            return
+        existing = connection.execute(
+            """
+            SELECT operation_type, result_json
+            FROM external_operations
+            WHERE operation_id = ?
+            """,
+            (request.request_id,),
+        ).fetchone()
+        result_json = json.dumps(
+            dict(result),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        now = utc_now()
+        if existing is None:
+            connection.execute(
+                """
+                INSERT INTO external_operations(
+                    operation_id, operation_type, status, goal_id, task_id,
+                    job_id, actor, payload_json, result_json, created_at,
+                    updated_at, completed_at
+                ) VALUES (?, ?, 'completed', ?, ?, ?, ?, '{}', ?, ?, ?, ?)
+                """,
+                (
+                    request.request_id,
+                    request.operation,
+                    goal_id,
+                    task_id,
+                    job_id,
+                    request.actor,
+                    result_json,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            return
+        if str(existing["operation_type"]) != request.operation:
+            raise TeamError(
+                "request mutation ledger conflicts with another operation"
+            )
+        connection.execute(
+            """
+            UPDATE external_operations
+            SET result_json = ?, updated_at = ?
+            WHERE operation_id = ? AND operation_type = ?
+            """,
+            (
+                result_json,
+                now,
+                request.request_id,
+                request.operation,
+            ),
+        )
 
     @staticmethod
     def _event(
@@ -101,6 +352,10 @@ class TeamService:
         correlation_id: str | None = None,
         assignment_id: str | None = None,
     ) -> None:
+        event_data = dict(data or {})
+        request = _CURRENT_REQUEST_MUTATION.get()
+        if request is not None:
+            event_data["request_id"] = request.request_id
         context = TeamService._event_context(
             connection,
             task_id,
@@ -121,10 +376,145 @@ class TeamService:
                 job_id or context.get("job_id"),
                 correlation_id or context.get("correlation_id"),
                 assignment_id or context.get("assignment_id"),
-                json.dumps(data or {}, ensure_ascii=False, sort_keys=True),
+                json.dumps(event_data, ensure_ascii=False, sort_keys=True),
                 utc_now(),
             ),
         )
+
+    @staticmethod
+    def _managed_caller_binding() -> tuple[str, str]:
+        role = os.environ.get("CODEX_TEAM_ROLE", "").strip().lower()
+        actor = os.environ.get("CODEX_TEAM_ACTOR", "").strip()
+        return role, actor
+
+    def authorize_privileged_actor(
+        self,
+        requested_actor: str,
+        *,
+        operation: str,
+        allowed_actors: frozenset[str] = frozenset(
+            {"lead", "main", "human"}
+        ),
+        authority_token: str | None = None,
+    ) -> str:
+        """Bind privileged mutations to the trusted local process role."""
+
+        if not isinstance(requested_actor, str):
+            raise TeamError("actor must be a string")
+        normalized_actor = requested_actor.strip().lower()
+        if not normalized_actor:
+            raise TeamError("actor is required")
+        if normalized_actor not in allowed_actors:
+            raise TeamError(
+                f"only the lead or human reviewer can perform {operation}"
+            )
+        role, bound_actor = self._managed_caller_binding()
+        if not role:
+            return normalized_actor
+        if role not in allowed_actors:
+            raise TeamError(
+                f"managed role {role} cannot perform {operation}"
+            )
+        if (
+            role == "lead"
+            and normalized_actor in {"lead", "main"}
+        ) or (
+            role == "main"
+            and normalized_actor == "main"
+        ) or (
+            role == "human"
+            and normalized_actor == "human"
+        ):
+            if (
+                bound_actor
+                and role != "lead"
+                and normalized_actor != bound_actor.lower()
+            ):
+                raise TeamError(
+                    "managed caller identity does not match its binding"
+                )
+            return normalized_actor
+        raise TeamError(
+            "managed caller identity does not match its binding"
+        )
+
+    def require_mcp_authority(
+        self,
+        requested_actor: str,
+        *,
+        operation: str,
+        authority_token: str | None = None,
+        allowed_actors: frozenset[str] = frozenset(
+            {"lead", "main", "human"}
+        ),
+    ) -> str:
+        """Require a capability or trusted role at the MCP boundary."""
+
+        if not isinstance(requested_actor, str):
+            raise TeamError("actor must be a string")
+        normalized_actor = requested_actor.strip().lower()
+        if normalized_actor not in allowed_actors:
+            raise TeamError(
+                f"only an authorized actor can perform {operation}"
+            )
+        token = (
+            authority_token.strip()
+            if isinstance(authority_token, str)
+            else ""
+        )
+        if token and secrets.compare_digest(
+            token,
+            self.operator_authority(),
+        ):
+            return normalized_actor
+        role, _actor = self._managed_caller_binding()
+        if role:
+            try:
+                return self.authorize_privileged_actor(
+                    normalized_actor,
+                    operation=operation,
+                    allowed_actors=allowed_actors,
+                )
+            except TeamError as exc:
+                raise TeamError(
+                    f"{operation} requires a valid local authority token"
+                ) from exc
+        raise TeamError(
+            f"{operation} requires a valid local authority token"
+        )
+
+    def privileged_actor(
+        self,
+        operation: str,
+        *,
+        authority_token: str | None = None,
+    ) -> str:
+        role, _actor = self._managed_caller_binding()
+        if not role:
+            return self.require_mcp_authority(
+                "human",
+                operation=operation,
+                authority_token=authority_token,
+            )
+        if role == "lead":
+            return self.require_mcp_authority(
+                "lead",
+                operation=operation,
+                authority_token=authority_token,
+            )
+        if role == "main":
+            return self.require_mcp_authority(
+                "main",
+                operation=operation,
+                authority_token=authority_token,
+            )
+        if role == "human":
+            return self.require_mcp_authority(
+                "human",
+                operation=operation,
+                authority_token=authority_token,
+            )
+        raise TeamError(f"managed role {role} cannot perform {operation}")
 
     @staticmethod
     def _event_context(
@@ -479,7 +869,16 @@ class TeamService:
         self,
         project_id: str,
         archived: bool,
+        *,
+        actor: str = "human",
+        authority_token: str | None = None,
     ) -> dict[str, Any]:
+        actor = self.authorize_privileged_actor(
+            actor,
+            operation="project archive changes",
+            allowed_actors=frozenset({"lead", "main", "human"}),
+            authority_token=authority_token,
+        )
         now = utc_now()
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -489,6 +888,8 @@ class TeamService:
             ).fetchone()
             if project is None:
                 raise TeamError(f"project not found: {project_id}")
+            if bool(project["archived_at"]) == bool(archived):
+                return dict(project)
             if archived:
                 active_goal = connection.execute(
                     """
@@ -545,7 +946,16 @@ class TeamService:
         self,
         task_id: str,
         archived: bool,
+        *,
+        actor: str = "human",
+        authority_token: str | None = None,
     ) -> dict[str, Any]:
+        actor = self.authorize_privileged_actor(
+            actor,
+            operation="task archive changes",
+            allowed_actors=frozenset({"lead", "main", "human"}),
+            authority_token=authority_token,
+        )
         now = utc_now()
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -559,52 +969,80 @@ class TeamService:
             ).fetchone()
             if task is None:
                 raise TeamError(f"task not found: {task_id}")
-            if archived:
-                if task["status"] == "running":
-                    raise TeamError(f"cannot archive running task: {task_id}")
-                active_job = connection.execute(
-                    """
-                    SELECT job_id FROM cluster_jobs
-                    WHERE task_id = ? AND status IN ('starting', 'running')
-                    LIMIT 1
-                    """,
-                    (task_id,),
-                ).fetchone()
-                active_goal = None
-                if task["goal_id"]:
-                    active_goal = connection.execute(
+            if bool(task["archived_at"]) == bool(archived):
+                pass
+            else:
+                if archived:
+                    if task["project_archived_at"]:
+                        raise TeamError(
+                            "project is archived; restore it before archiving tasks"
+                        )
+                    if task["status"] == "running":
+                        raise TeamError(f"cannot archive running task: {task_id}")
+                    active_job = connection.execute(
                         """
-                        SELECT goal_id FROM cluster_goals
-                        WHERE goal_id = ? AND status IN ('planning', 'active', 'paused')
+                        SELECT job_id FROM cluster_jobs
+                        WHERE task_id = ? AND status IN ('starting', 'running')
+                        LIMIT 1
                         """,
-                        (task["goal_id"],),
+                        (task_id,),
                     ).fetchone()
-                if active_job:
-                    raise TeamError(
-                        "cannot archive task with active job: "
-                        f"{active_job['job_id']}"
-                    )
-                if active_goal:
-                    raise TeamError(
-                        "cannot archive task in unfinished goal: "
-                        f"{active_goal['goal_id']}"
-                    )
-            connection.execute(
-                """
-                UPDATE tasks
-                SET archived_at = ?, archived_by_goal = 0,
-                    updated_at = ?, version = version + 1
-                WHERE task_id = ?
-                """,
-                (now if archived else None, now, task_id),
-            )
-            self._event(
-                connection,
-                task_id,
-                "archived" if archived else "restored",
-                "human",
-                {"archived": archived},
-            )
+                    active_goal = None
+                    if task["goal_id"]:
+                        active_goal = connection.execute(
+                            """
+                            SELECT goal_id FROM cluster_goals
+                            WHERE goal_id = ? AND status IN ('planning', 'active', 'paused')
+                            """,
+                            (task["goal_id"],),
+                        ).fetchone()
+                    if active_job:
+                        raise TeamError(
+                            "cannot archive task with active job: "
+                            f"{active_job['job_id']}"
+                        )
+                    if active_goal:
+                        raise TeamError(
+                            "cannot archive task in unfinished goal: "
+                            f"{active_goal['goal_id']}"
+                        )
+                else:
+                    if task["project_archived_at"]:
+                        raise TeamError(
+                            "project is archived; restore it before restoring tasks"
+                        )
+                    if task["archived_by_goal"]:
+                        raise TeamError(
+                            "task was archived by its goal; restore the goal first"
+                        )
+                    if task["goal_id"]:
+                        goal = connection.execute(
+                            """
+                            SELECT archived_at FROM cluster_goals
+                            WHERE goal_id = ?
+                            """,
+                            (task["goal_id"],),
+                        ).fetchone()
+                        if goal is not None and goal["archived_at"]:
+                            raise TeamError(
+                                "goal is archived; restore it before restoring tasks"
+                            )
+                connection.execute(
+                    """
+                    UPDATE tasks
+                    SET archived_at = ?, archived_by_goal = 0,
+                        updated_at = ?, version = version + 1
+                    WHERE task_id = ?
+                    """,
+                    (now if archived else None, now, task_id),
+                )
+                self._event(
+                    connection,
+                    task_id,
+                    "archived" if archived else "restored",
+                    actor,
+                    {"archived": archived},
+                )
         return self.get_task(task_id)
 
     def init_project(
@@ -957,6 +1395,12 @@ class TeamService:
                     "continuity_mode": continuity_mode,
                     "workflow_epoch": workflow_epoch_value,
                 },
+            )
+            self._record_request_result(
+                connection,
+                {"task_id": task_id},
+                task_id=task_id,
+                goal_id=goal_id,
             )
         return self.get_task(task_id)
 
@@ -2659,7 +3103,29 @@ class TeamService:
             )
             if updated.rowcount != 1:
                 raise TeamError("heartbeat conflicted with another update; reload and retry")
-            self._event(connection, task_id, "heartbeat", actor, {"lease_until": lease_until})
+            heartbeat_at = utc_now()
+            connection.execute(
+                """
+                UPDATE cluster_agents
+                SET last_seen_at = ?, session_stale = 0, updated_at = ?
+                WHERE project_id = ? AND actor = ? AND runtime = 'native'
+                  AND current_task_id = ? AND archived_at IS NULL
+                """,
+                (
+                    heartbeat_at,
+                    heartbeat_at,
+                    task["project_id"],
+                    actor,
+                    task_id,
+                ),
+            )
+            self._event(
+                connection,
+                task_id,
+                "heartbeat",
+                actor,
+                {"lease_until": lease_until},
+            )
         result = self.get_task(task_id)
         result["claim_token"] = claim_token
         return result
@@ -2733,6 +3199,7 @@ class TeamService:
         actor: str,
         reason: str,
         claim_token: str | None = None,
+        authority_token: str | None = None,
     ) -> dict[str, Any]:
         actor = actor.strip()
         reason = reason.strip()
@@ -2756,14 +3223,14 @@ class TeamService:
                     normalized_token,
                     actor,
                 )
-            elif task["status"] == "running" and actor not in {
-                "lead",
-                "main",
-                "human",
-                "teamd",
-            }:
-                raise TeamError(
-                    "blocking a running task requires the active claim_token"
+            elif task["status"] == "running" or _CURRENT_MCP_CALL.get():
+                actor = self.authorize_privileged_actor(
+                    actor,
+                    operation="task block",
+                    allowed_actors=frozenset(
+                        {"lead", "main", "human", "teamd"}
+                    ),
+                    authority_token=authority_token,
                 )
             if task["status"] in TERMINAL_STATUSES:
                 raise TeamError("cannot block terminal task")
@@ -2793,10 +3260,21 @@ class TeamService:
             self._event(connection, task_id, "blocked", actor, {"reason": reason})
         return self.get_task(task_id)
 
-    def unblock_task(self, task_id: str, *, actor: str) -> dict[str, Any]:
+    def unblock_task(
+        self,
+        task_id: str,
+        *,
+        actor: str,
+        authority_token: str | None = None,
+    ) -> dict[str, Any]:
         actor = actor.strip()
         if not actor:
             raise TeamError("actor is required")
+        actor = self.authorize_privileged_actor(
+            actor,
+            operation="task unblock",
+            authority_token=authority_token,
+        )
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             task = connection.execute(
@@ -2829,7 +3307,15 @@ class TeamService:
         *,
         actor: str,
         reason: str,
+        authority_token: str | None = None,
     ) -> dict[str, Any]:
+        if not isinstance(actor, str):
+            raise TeamError("actor must be a string")
+        actor = self.authorize_privileged_actor(
+            actor,
+            operation="task cancellation",
+            authority_token=authority_token,
+        )
         reason = reason.strip()
         if not reason:
             raise TeamError("cancel reason is required")
@@ -2989,6 +3475,7 @@ class TeamService:
         approve: bool,
         notes: str,
         merge_commit: str = "",
+        authority_token: str | None = None,
     ) -> dict[str, Any]:
         if not isinstance(actor, str):
             raise TeamError("actor must be a string")
@@ -2998,9 +3485,11 @@ class TeamService:
             raise TeamError("notes must be a string")
         if not isinstance(merge_commit, str):
             raise TeamError("merge_commit must be a string")
-        actor = actor.strip()
-        if actor.lower() not in {"lead", "main", "human"}:
-            raise TeamError("only the lead or human reviewer can review tasks")
+        actor = self.authorize_privileged_actor(
+            actor,
+            operation="task review",
+            authority_token=authority_token,
+        )
         with self.connection(write=False) as connection:
             task = connection.execute(
                 """
@@ -3253,14 +3742,20 @@ class TeamService:
                     sender,
                     {"recipient": recipient, "message_id": message_id},
                 )
-        return {
-            "message_id": message_id,
-            "project_id": project["project_id"],
-            "task_id": task_id,
-            "sender": sender,
-            "recipient": recipient,
-            "body": body,
-        }
+            message = {
+                "message_id": message_id,
+                "project_id": project["project_id"],
+                "task_id": task_id,
+                "sender": sender,
+                "recipient": recipient,
+                "body": body,
+            }
+            self._record_request_result(
+                connection,
+                message,
+                task_id=task_id,
+            )
+        return message
 
     def list_messages(
         self,
