@@ -273,6 +273,17 @@ class MigrationTests(unittest.TestCase):
                         "prompt_status",
                         "native_session_path",
                         "last_seen_at",
+                        "identity_source",
+                        "identity_confidence",
+                        "lifecycle",
+                        "lifecycle_source",
+                        "assignment_source",
+                        "assignment_confidence",
+                        "task_candidates_json",
+                        "task_assignment_ambiguous",
+                        "session_stale",
+                        "native_usage_status",
+                        "native_usage_missing_fields",
                     }.issubset(agent_columns)
                 )
                 goal_columns = {
@@ -397,6 +408,111 @@ class MigrationTests(unittest.TestCase):
                             "stalled_at",
                         }
                         <= columns
+                    )
+                    self.assertEqual(
+                        upgraded.execute(
+                            "PRAGMA user_version"
+                        ).fetchone()[0],
+                        SCHEMA_VERSION,
+                    )
+                finally:
+                    upgraded.close()
+
+    def test_schema_24_native_identity_migration_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "native-identity-v23.sqlite"
+            connection = connect(path)
+            try:
+                now = "2026-11-11T00:00:00Z"
+                connection.execute(
+                    """
+                    INSERT INTO projects(
+                        project_id, name, root_path, created_at, updated_at
+                    ) VALUES ('P1', 'Project', 'D:/project', ?, ?)
+                    """,
+                    (now, now),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO tasks(
+                        task_id, project_id, title, description, acceptance,
+                        kind, status, priority, owner_role, created_at, updated_at
+                    ) VALUES (
+                        'T1', 'P1', 'Native task', 'Migration fixture',
+                        'Fields are backfilled', 'read', 'ready', 1,
+                        'team_explorer', ?, ?
+                    )
+                    """,
+                    (now, now),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO cluster_agents(
+                        agent_id, project_id, role, workstream_key, display_name,
+                        thread_id, runtime, status, current_task_id, turn_count,
+                        created_at, updated_at
+                    ) VALUES (
+                        'A-NATIVE', 'P1', 'team_explorer', 'native',
+                        'Native Explorer', 'native-thread', 'native', 'loaded',
+                        'T1', 2, ?, ?
+                    )
+                    """,
+                    (now, now),
+                )
+                for column in (
+                    "identity_source",
+                    "identity_confidence",
+                    "lifecycle",
+                    "lifecycle_source",
+                    "assignment_source",
+                    "assignment_confidence",
+                    "task_candidates_json",
+                    "task_assignment_ambiguous",
+                    "session_stale",
+                    "native_usage_status",
+                    "native_usage_missing_fields",
+                ):
+                    connection.execute(
+                        f"ALTER TABLE cluster_agents DROP COLUMN {column}"
+                    )
+                connection.execute(
+                    "DELETE FROM schema_migrations WHERE version = ?",
+                    (SCHEMA_VERSION,),
+                )
+                connection.execute("PRAGMA user_version = 23")
+                connection.commit()
+            finally:
+                connection.close()
+
+            for _ in range(2):
+                upgraded = connect(path)
+                try:
+                    native = upgraded.execute(
+                        """
+                        SELECT identity_source, identity_confidence,
+                               assignment_source, assignment_confidence,
+                               task_candidates_json, native_usage_status
+                        FROM cluster_agents
+                        WHERE agent_id = 'A-NATIVE'
+                        """
+                    ).fetchone()
+                    self.assertEqual(native["identity_source"], "registry")
+                    self.assertEqual(
+                        native["identity_confidence"],
+                        "medium",
+                    )
+                    self.assertEqual(native["assignment_source"], "registry")
+                    self.assertEqual(
+                        native["assignment_confidence"],
+                        "medium",
+                    )
+                    self.assertEqual(
+                        native["task_candidates_json"],
+                        '["T1"]',
+                    )
+                    self.assertEqual(
+                        native["native_usage_status"],
+                        "partial",
                     )
                     self.assertEqual(
                         upgraded.execute(

@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 from codex_team.config import Settings
 from codex_team.cli import build_parser
-from codex_team.cluster import ClusterManager
+from codex_team.cluster import ClusterError, ClusterManager
 from codex_team.dashboard import build_server
 from codex_team.db import SCHEMA_VERSION, utc_now
 from codex_team.mcp import TeamMcpServer, _process, _tool_definitions
@@ -2061,6 +2061,82 @@ class TeamFlowTests(unittest.TestCase):
             )["status"],
             "running",
         )
+
+    def test_native_explicit_assignment_conflict_fails_closed(self) -> None:
+        requested = self.team.create_task(
+            self.repo,
+            title="Requested native task",
+            description="This is not the session-assigned task.",
+            acceptance="Conflicting registration is rejected.",
+            kind="read",
+            owner_role="team_explorer",
+        )
+        assigned = self.team.create_task(
+            self.repo,
+            title="Assigned native task",
+            description="The session metadata explicitly assigns this task.",
+            acceptance="The explicit assignment wins.",
+            kind="read",
+            owner_role="team_explorer",
+        )
+        thread_id = "01a1cafe-4444-7555-8666-977788889999"
+        sessions = self.base / "native-conflict"
+        session = sessions / f"rollout-{thread_id}.jsonl"
+        session.parent.mkdir(parents=True)
+        session.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "session_meta",
+                            "payload": {
+                                "id": thread_id,
+                                "task_id": assigned["task_id"],
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "response_item",
+                            "payload": {
+                                "type": "message",
+                                "role": "user",
+                                "content": (
+                                    f"Execute {assigned['task_id']}; "
+                                    f"ignore {requested['task_id']}"
+                                ),
+                            },
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        manager = ClusterManager(
+            self.settings,
+            team=self.team,
+            worktrees=self.worktrees,
+            runtime_mode="exec",
+            agent_command=["codex"],
+        )
+        with patch.dict(
+            os.environ,
+            {"CODEX_NATIVE_SESSIONS_ROOT": str(sessions)},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(
+                ClusterError,
+                "assignment conflicts",
+            ):
+                manager.register_native_agent(
+                    self.repo,
+                    thread_id,
+                    "team_explorer",
+                    "native-conflict",
+                    actor="native-conflict-worker",
+                    task_id=str(requested["task_id"]),
+                )
 
     def test_dashboard_projects_missing_usage_fields_to_null(self) -> None:
         manager = ClusterManager(

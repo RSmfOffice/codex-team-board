@@ -907,6 +907,101 @@ class AgentPoolTests(unittest.TestCase):
                 task_id="T2",
             )
 
+    def test_native_identity_lifecycle_and_usage_unknown_are_auditable(
+        self,
+    ) -> None:
+        self.seed_runtime_references()
+        native = self.pool.register_native_thread(
+            "P1",
+            "unknown",
+            "native-round3",
+            "native-round3-thread",
+            "native-round3-actor",
+            identity_source="agent_path_inference",
+            identity_confidence="low",
+            lifecycle="completed",
+            lifecycle_source="session_events",
+            assignment_source="unique_session_candidate",
+            assignment_confidence="medium",
+            task_candidates=["T1"],
+            task_assignment_ambiguous=False,
+            session_stale=True,
+            usage={
+                "available": True,
+                "status": "partial",
+                "missing_fields": ["turn_count", "context_tokens"],
+                "last_input_tokens": 100,
+                "last_cached_input_tokens": 80,
+                "last_uncached_input_tokens": 20,
+                "total_input_tokens": None,
+                "total_cached_input_tokens": None,
+                "total_uncached_input_tokens": None,
+                "output_tokens": 5,
+                "context_tokens": None,
+                "model_context_window": 1000,
+                "turn_count": None,
+            },
+        )
+        self.assertEqual(native["role"], "unknown")
+        self.assertEqual(
+            native["identity_source"],
+            "agent_path_inference",
+        )
+        self.assertEqual(native["identity_confidence"], "low")
+        self.assertEqual(native["lifecycle"], "completed")
+        self.assertEqual(
+            native["assignment_source"],
+            "unique_session_candidate",
+        )
+        self.assertEqual(native["task_candidates"], ["T1"])
+        self.assertTrue(native["session_stale"])
+        self.assertEqual(native["native_usage_status"], "partial")
+        self.assertIn(
+            "turn_count",
+            native["native_usage_missing_fields"],
+        )
+        self.assertIsNone(
+            self.pool.select_agent(
+                "P1",
+                "team_explorer",
+                "native-round3",
+                "reuse",
+                "read",
+                "",
+                "",
+            )
+        )
+
+        stale = self.pool.register_native_thread(
+            "P1",
+            "unknown",
+            "native-round3",
+            "native-round3-thread",
+            "native-round3-actor",
+            identity_source="registry",
+            identity_confidence="medium",
+            lifecycle="unknown",
+            lifecycle_source="unknown",
+            assignment_source="registry",
+            assignment_confidence="high",
+            task_candidates=["T1"],
+            session_stale=True,
+            usage={
+                "available": False,
+                "status": "unavailable",
+                "missing_fields": ["turn_count"],
+                "model_context_window": None,
+            },
+        )
+        self.assertEqual(stale["native_usage_status"], "stale")
+        self.assertEqual(stale["last_input_tokens"], 100)
+        events = self.agent_events(native["agent_id"])
+        self.assertEqual(
+            events[-1]["data"]["identity_source"],
+            "registry",
+        )
+        self.assertEqual(events[-1]["data"]["lifecycle"], "unknown")
+
     def test_archive_stale_managed_agents_is_dry_run_by_default(self) -> None:
         current_profile = agent_cache_profile(
             "current role instructions",

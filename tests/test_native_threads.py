@@ -428,6 +428,274 @@ class NativeThreadTests(unittest.TestCase):
             self.assertEqual(result["agent_nickname"], "Noether")
             self.assertEqual(result["agent_role"], "team_worker")
 
+    def test_explicit_metadata_wins_and_missing_role_is_not_defaulted(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            explicit_thread = "01a1cafe-1111-7222-8333-944455556670"
+            explicit_path = root / f"rollout-{explicit_thread}.jsonl"
+            explicit_path.write_text(
+                json.dumps(
+                    {
+                        "type": "session_meta",
+                        "payload": {
+                            "id": explicit_thread,
+                            "agent_path": "/root/explorer-name",
+                            "agent_role": "team_worker",
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            explicit = inspect_native_session(
+                explicit_thread,
+                root=root,
+                stale_after_seconds=3600,
+            )
+            self.assertEqual(explicit["agent_role"], "team_worker")
+            self.assertEqual(
+                explicit["identity_source"],
+                "explicit_session_metadata",
+            )
+            self.assertEqual(explicit["identity_confidence"], "high")
+
+            missing_thread = "01a1cafe-1111-7222-8333-944455556671"
+            missing_path = root / f"rollout-{missing_thread}.jsonl"
+            missing_path.write_text(
+                json.dumps(
+                    {
+                        "type": "session_meta",
+                        "payload": {
+                            "id": missing_thread,
+                            "agent_path": "/root/session-7",
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            missing = inspect_native_session(
+                missing_thread,
+                root=root,
+                stale_after_seconds=3600,
+            )
+            self.assertIsNone(missing["agent_role"])
+            self.assertEqual(missing["identity_source"], "missing")
+            self.assertEqual(missing["identity_confidence"], "unknown")
+
+    def test_session_selection_uses_verified_metadata_and_latest_mtime(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            thread_id = "01a1cafe-1111-7222-8333-944455556672"
+            old_path = root / f"a-{thread_id}.jsonl"
+            new_path = root / f"z-{thread_id}.jsonl"
+            mismatch_path = root / f"mismatch-{thread_id}.jsonl"
+            for path, role, thread in (
+                (old_path, "team_reviewer", thread_id),
+                (new_path, "team_worker", thread_id),
+                (
+                    mismatch_path,
+                    "team_explorer",
+                    "01a1cafe-9999-7222-8333-944455556672",
+                ),
+            ):
+                path.write_text(
+                    json.dumps(
+                        {
+                            "type": "session_meta",
+                            "payload": {
+                                "id": thread,
+                                "agent_role": role,
+                            },
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+            os.utime(old_path, (100, 100))
+            os.utime(new_path, (200, 200))
+            os.utime(mismatch_path, (300, 300))
+
+            self.assertEqual(
+                find_native_session(thread_id, root=root),
+                new_path,
+            )
+            inspected = inspect_native_session(
+                thread_id,
+                root=root,
+                stale_after_seconds=10_000_000,
+            )
+            self.assertEqual(
+                inspected["session_selection_source"],
+                "metadata_and_mtime",
+            )
+            self.assertEqual(inspected["session_candidate_count"], 3)
+            self.assertEqual(inspected["agent_role"], "team_worker")
+
+    def test_multiple_tasks_are_ambiguous_and_lifecycle_is_explicit(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            thread_id = "01a1cafe-1111-7222-8333-944455556673"
+            first_task = "T-20261110-AAAAAA"
+            second_task = "T-20261110-BBBBBB"
+            path = root / f"rollout-{thread_id}.jsonl"
+            path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "session_meta",
+                                "payload": {
+                                    "id": thread_id,
+                                    "source": {
+                                        "subagent": {
+                                            "thread_spawn": {
+                                                "agent_path": "/root/unclassified"
+                                            }
+                                        }
+                                    },
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "event_msg",
+                                "payload": {"type": "task_started"},
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": (
+                                        f"Coordinate {first_task} and "
+                                        f"{second_task}"
+                                    ),
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "event_msg",
+                                "payload": {
+                                    "type": "token_count",
+                                    "info": {
+                                        "total_token_usage": {
+                                            "input_tokens": 100,
+                                            "cached_input_tokens": 80,
+                                            "output_tokens": 5,
+                                        }
+                                    },
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "event_msg",
+                                "payload": {"type": "task_complete"},
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            discovered = discover_native_sessions(root=root)
+            self.assertEqual(len(discovered), 1)
+            self.assertEqual(
+                discovered[0]["task_candidates"],
+                [first_task, second_task],
+            )
+            self.assertTrue(
+                discovered[0]["task_assignment_ambiguous"]
+            )
+            self.assertIsNone(discovered[0]["assignment_task_id"])
+            self.assertEqual(discovered[0]["lifecycle"], "completed")
+            usage = discovered[0]["usage"]
+            self.assertEqual(usage["status"], "partial")
+            self.assertIsNone(usage["last_input_tokens"])
+            self.assertEqual(usage["total_input_tokens"], 100)
+            self.assertIsNone(usage["turn_count"])
+            self.assertIn("last_input_tokens", usage["missing_fields"])
+            self.assertIn("turn_count", usage["missing_fields"])
+
+    def test_explicit_assignment_wins_and_half_written_tail_is_ignored(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            thread_id = "01a1cafe-1111-7222-8333-944455556674"
+            assigned = "T-20261110-CCCCCC"
+            referenced = "T-20261110-DDDDDD"
+            path = root / f"rollout-{thread_id}.jsonl"
+            path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "session_meta",
+                                "payload": {
+                                    "id": thread_id,
+                                    "task_id": assigned,
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": (
+                                        f"Execute {assigned}; "
+                                        f"compare {referenced}"
+                                    ),
+                                },
+                            }
+                        ),
+                        '{"type":"event_msg","payload":{"type":"tok',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            inspected = inspect_native_session(
+                thread_id,
+                task_id=assigned,
+                root=root,
+                stale_after_seconds=3600,
+            )
+            self.assertEqual(
+                inspected["task_candidates"],
+                [assigned, referenced],
+            )
+            self.assertEqual(
+                inspected["assignment_task_id"],
+                assigned,
+            )
+            self.assertEqual(
+                inspected["assignment_source"],
+                "explicit_session_metadata",
+            )
+            self.assertFalse(
+                inspected["task_assignment_ambiguous"]
+            )
+            self.assertEqual(inspected["prompt_status"], "delivered")
+            self.assertEqual(
+                inspected["usage"]["status"],
+                "unavailable",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

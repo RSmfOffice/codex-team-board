@@ -1274,6 +1274,12 @@ class ClusterManager:
         display_name: str | None = None,
         model: str = "",
         model_provider: str = "",
+        task_candidates: list[str] | None = None,
+        task_assignment_ambiguous: bool | None = None,
+        assignment_source: str | None = None,
+        assignment_confidence: str | None = None,
+        identity_source: str | None = None,
+        identity_confidence: str | None = None,
     ) -> dict[str, Any]:
         project = self.team.project_for_repo(repo)
         self.team.ensure_project_active(project)
@@ -1288,9 +1294,107 @@ class ClusterManager:
             thread_id,
             task_id=task_id,
         )
+        inspection_assignment = str(
+            inspection.get("assignment_task_id") or ""
+        ).strip().upper()
+        requested_task = str(task_id or "").strip().upper()
+        if (
+            requested_task
+            and inspection_assignment
+            and requested_task != inspection_assignment
+        ):
+            raise ClusterError(
+                "native session assignment conflicts with the requested task"
+            )
+        requested_role = str(role or "").strip().lower()
+        session_role = str(inspection.get("agent_role") or "").strip().lower()
+        documented_roles = {
+            "lead",
+            "team_explorer",
+            "team_worker",
+            "team_reviewer",
+        }
+        effective_role = (
+            session_role
+            if (
+                session_role in documented_roles
+                and inspection.get("identity_source")
+                == "explicit_session_metadata"
+            )
+            else requested_role
+            if requested_role in documented_roles
+            else session_role
+            if session_role in documented_roles
+            else "unknown"
+        )
+        resolved_identity_source = str(
+            identity_source
+            or inspection.get("identity_source")
+            or "missing"
+        )
+        resolved_identity_confidence = str(
+            identity_confidence
+            or inspection.get("identity_confidence")
+            or "unknown"
+        )
+        if (
+            not session_role
+            and effective_role != "unknown"
+            and identity_source is None
+        ):
+            resolved_identity_source = "registration"
+            resolved_identity_confidence = "medium"
+        elif identity_source is None:
+            if (
+                session_role in documented_roles
+                and inspection.get("identity_source")
+                == "explicit_session_metadata"
+            ):
+                resolved_identity_source = "explicit_session_metadata"
+                resolved_identity_confidence = "high"
+            elif requested_role in documented_roles:
+                resolved_identity_source = "registration"
+                resolved_identity_confidence = "medium"
+        candidates = sorted(
+            {
+                str(value).strip().upper()
+                for value in (
+                    task_candidates
+                    if task_candidates is not None
+                    else inspection.get("task_candidates", [])
+                )
+                if str(value).strip()
+            }
+        )
+        if task_id and str(task_id).strip().upper() not in candidates:
+            candidates.append(str(task_id).strip().upper())
+            candidates.sort()
+        assignment_ambiguous = (
+            bool(task_assignment_ambiguous)
+            if task_assignment_ambiguous is not None
+            else bool(inspection.get("task_assignment_ambiguous"))
+        )
+        resolved_assignment_source = str(
+            assignment_source
+            or inspection.get("assignment_source")
+            or "none"
+        )
+        resolved_assignment_confidence = str(
+            assignment_confidence
+            or inspection.get("assignment_confidence")
+            or "unknown"
+        )
+        if task_id and resolved_assignment_source in {"none", "ambiguous"}:
+            resolved_assignment_source = "registration"
+            resolved_assignment_confidence = "high"
+            assignment_ambiguous = False
+        elif not task_id and len(candidates) > 1:
+            resolved_assignment_source = "ambiguous"
+            resolved_assignment_confidence = "unknown"
+            assignment_ambiguous = True
         agent = self.agent_pool.register_native_thread(
             str(project["project_id"]),
-            role,
+            effective_role,
             workstream_key,
             thread_id,
             actor,
@@ -1312,6 +1416,17 @@ class ClusterManager:
                 if isinstance(inspection.get("usage"), Mapping)
                 else None
             ),
+            identity_source=resolved_identity_source,
+            identity_confidence=resolved_identity_confidence,
+            lifecycle=str(inspection.get("lifecycle") or "unknown"),
+            lifecycle_source=str(
+                inspection.get("lifecycle_source") or "unknown"
+            ),
+            assignment_source=resolved_assignment_source,
+            assignment_confidence=resolved_assignment_confidence,
+            task_candidates=candidates,
+            task_assignment_ambiguous=assignment_ambiguous,
+            session_stale=bool(inspection.get("session_stale", True)),
         )
         if task_id:
             event_type = (
@@ -1332,6 +1447,11 @@ class ClusterManager:
                         "parent_thread_id": inspection.get(
                             "parent_thread_id"
                         ),
+                        "identity_source": resolved_identity_source,
+                        "identity_confidence": resolved_identity_confidence,
+                        "lifecycle": inspection.get("lifecycle"),
+                        "task_candidates": candidates,
+                        "task_assignment_ambiguous": assignment_ambiguous,
                     },
                     thread_id=thread_id,
                     correlation_id=f"native:{thread_id}",
@@ -1340,6 +1460,12 @@ class ClusterManager:
         return {
             "agent": agent,
             "inspection": inspection,
+            "effective_role": effective_role,
+            "role_mismatch": bool(
+                session_role
+                and requested_role
+                and session_role != requested_role
+            ),
             "same_task_only": True,
         }
 
@@ -1385,10 +1511,7 @@ class ClusterManager:
                 str(row["thread_id"]): dict(row)
                 for row in connection.execute(
                     """
-                    SELECT thread_id, runtime, project_id, role,
-                           workstream_key, current_task_id, display_name,
-                           model_provider, last_seen_at, turn_count,
-                           model_context_window, last_input_tokens
+                    SELECT *
                     FROM cluster_agents
                     """
                 ).fetchall()
@@ -1421,6 +1544,198 @@ class ClusterManager:
                     return project
             return None
 
+        def native_state_needs_refresh(
+            existing: Mapping[str, Any],
+            item: Mapping[str, Any],
+        ) -> bool:
+            if existing.get("runtime") != "native":
+                return False
+            if not item.get("session_found", True):
+                return bool(
+                    int(existing.get("session_stale") or 0) != 1
+                    or existing.get("native_usage_status")
+                    not in {"stale", "unavailable"}
+                )
+            usage = (
+                item.get("usage")
+                if isinstance(item.get("usage"), Mapping)
+                else {}
+            )
+            item_candidates = json.dumps(
+                sorted(
+                    {
+                        str(value)
+                        for value in item.get("task_candidates", [])
+                        if str(value)
+                    }
+                ),
+                separators=(",", ":"),
+            )
+            return any(
+                (
+                    existing.get("last_seen_at")
+                    != item.get("last_seen_at"),
+                    existing.get("identity_source")
+                    != item.get("identity_source"),
+                    existing.get("identity_confidence")
+                    != item.get("identity_confidence"),
+                    existing.get("lifecycle") != item.get("lifecycle"),
+                    int(existing.get("session_stale") or 0)
+                    != int(bool(item.get("session_stale"))),
+                    bool(int(existing.get("task_assignment_ambiguous") or 0))
+                    != bool(item.get("task_assignment_ambiguous")),
+                    existing.get("task_candidates_json") != item_candidates,
+                    existing.get("native_usage_status")
+                    != usage.get("status"),
+                )
+            )
+
+        def valid_task_id(
+            value: Any,
+            project: Mapping[str, Any],
+        ) -> str | None:
+            task_id = str(value or "").strip().upper()
+            task = tasks.get(task_id)
+            if (
+                task is None
+                or task["project_id"] != str(project["project_id"])
+                or task["archived"]
+            ):
+                return None
+            return task_id
+
+        def existing_candidates(existing: Mapping[str, Any]) -> list[str]:
+            try:
+                parsed = json.loads(
+                    str(existing.get("task_candidates_json") or "[]")
+                )
+            except (TypeError, ValueError):
+                parsed = []
+            values = parsed if isinstance(parsed, list) else []
+            return sorted(
+                {
+                    str(value).strip().upper()
+                    for value in values
+                    if str(value).strip()
+                }
+            )
+
+        def normalized_native_state(
+            item: Mapping[str, Any],
+            existing: Mapping[str, Any] | None,
+            project: Mapping[str, Any],
+        ) -> dict[str, Any]:
+            candidates = sorted(
+                {
+                    str(value).strip().upper()
+                    for value in item.get("task_candidates", [])
+                    if str(value).strip()
+                }
+            )
+            if existing is not None:
+                candidates = sorted(
+                    set(candidates) | set(existing_candidates(existing))
+                )
+            session_role = str(
+                item.get("agent_role") or ""
+            ).strip().lower()
+            existing_role = (
+                str(existing.get("role") or "").strip().lower()
+                if existing is not None
+                else ""
+            )
+            documented_roles = {
+                "lead",
+                "team_explorer",
+                "team_worker",
+                "team_reviewer",
+            }
+            if (
+                session_role in documented_roles
+                and (
+                    item.get("identity_source")
+                    == "explicit_session_metadata"
+                    or existing_role not in documented_roles
+                )
+            ):
+                role = session_role
+                identity_source = str(
+                    item.get("identity_source")
+                    or "explicit_session_metadata"
+                )
+                identity_confidence = str(
+                    item.get("identity_confidence") or "high"
+                )
+            elif existing_role in documented_roles:
+                role = existing_role
+                identity_source = "registry"
+                identity_confidence = "medium"
+            else:
+                role = "unknown"
+                identity_source = "missing"
+                identity_confidence = "unknown"
+
+            existing_task = valid_task_id(
+                existing.get("current_task_id") if existing else None,
+                project,
+            )
+            explicit_task = valid_task_id(
+                item.get("assignment_task_id"),
+                project,
+            )
+            if existing_task:
+                task_id = existing_task
+                assignment_source = "registry"
+                assignment_confidence = "high"
+                assignment_ambiguous = bool(
+                    item.get("task_assignment_ambiguous")
+                    or len(candidates) > 1
+                )
+            elif explicit_task:
+                task_id = explicit_task
+                assignment_source = str(
+                    item.get("assignment_source")
+                    or "explicit_session_metadata"
+                )
+                assignment_confidence = str(
+                    item.get("assignment_confidence") or "high"
+                )
+                assignment_ambiguous = bool(
+                    item.get("task_assignment_ambiguous")
+                )
+            elif len(candidates) == 1 and candidates[0] in tasks:
+                task_id = valid_task_id(candidates[0], project)
+                assignment_source = (
+                    "unique_session_candidate"
+                    if task_id
+                    else "none"
+                )
+                assignment_confidence = "medium" if task_id else "unknown"
+                assignment_ambiguous = False
+            else:
+                task_id = None
+                assignment_source = (
+                    "ambiguous" if len(candidates) > 1 else "none"
+                )
+                assignment_confidence = (
+                    "unknown"
+                    if assignment_source == "ambiguous"
+                    else "unknown"
+                )
+                assignment_ambiguous = len(candidates) > 1
+
+            return {
+                **dict(item),
+                "role": role,
+                "identity_source": identity_source,
+                "identity_confidence": identity_confidence,
+                "task_id": task_id,
+                "task_candidates": candidates,
+                "assignment_source": assignment_source,
+                "assignment_confidence": assignment_confidence,
+                "task_assignment_ambiguous": assignment_ambiguous,
+            }
+
         registered: list[dict[str, Any]] = []
         refreshed: list[dict[str, Any]] = []
         skipped_existing: list[str] = []
@@ -1439,47 +1754,15 @@ class ClusterManager:
                 skipped_unknown_project.append(thread_id)
                 continue
             existing = registered_threads.get(thread_id)
-            usage = (
-                item.get("usage")
-                if isinstance(item.get("usage"), Mapping)
-                else {}
-            )
+            state = normalized_native_state(item, existing, project)
+            if (
+                existing is not None
+                and not native_state_needs_refresh(existing, state)
+            ):
+                skipped_existing.append(thread_id)
+                continue
             if existing is not None:
-                usage_window = usage.get("model_context_window")
-                needs_refresh = (
-                    existing.get("runtime") == "native"
-                    and (
-                        existing.get("last_seen_at")
-                        != item.get("last_seen_at")
-                        or (
-                            bool(usage.get("available"))
-                            and int(existing.get("turn_count") or 0) == 0
-                        )
-                        or (
-                            usage_window is not None
-                            and existing.get("model_context_window")
-                            != usage_window
-                        )
-                    )
-                )
-                if not needs_refresh:
-                    skipped_existing.append(thread_id)
-                    continue
-            task_id = next(
-                (
-                    task_id_value
-                    for task_id_value in item.get("task_ids", [])
-                    if task_id_value in tasks
-                    and tasks[task_id_value]["project_id"]
-                    == str(project["project_id"])
-                    and not tasks[task_id_value]["archived"]
-                ),
-                None,
-            )
-            if existing is not None:
-                task_id = task_id or existing.get("current_task_id")
                 workstream_key = str(existing["workstream_key"])
-                role = str(existing["role"])
             else:
                 parent_thread_id = item.get("parent_thread_id")
                 workstream_key = (
@@ -1487,23 +1770,30 @@ class ClusterManager:
                     if parent_thread_id
                     else f"native:{thread_id}"
                 )
-                role = str(
-                    item.get("agent_role") or "team_explorer"
-                )
             try:
                 result = self.register_native_agent(
                     project["root_path"],
                     thread_id,
-                    role,
+                    str(state["role"]),
                     workstream_key,
                     actor=f"{actor}:{thread_id}",
-                    task_id=task_id,
+                    task_id=state["task_id"],
                     display_name=(
                         item.get("agent_nickname")
                         or item.get("agent_path")
                         or thread_id
                     ),
                     model_provider=str(item.get("model_provider") or ""),
+                    task_candidates=state["task_candidates"],
+                    task_assignment_ambiguous=state[
+                        "task_assignment_ambiguous"
+                    ],
+                    assignment_source=state["assignment_source"],
+                    assignment_confidence=state[
+                        "assignment_confidence"
+                    ],
+                    identity_source=state["identity_source"],
+                    identity_confidence=state["identity_confidence"],
                 )
             except (AgentPoolError, ClusterError, TeamError, OSError) as exc:
                 errors.append(
@@ -1531,41 +1821,35 @@ class ClusterManager:
             project = projects_by_id.get(str(existing.get("project_id")))
             if project is None:
                 continue
-            inspection = inspect_native_session(thread_id)
-            if not inspection.get("session_found"):
-                continue
-            usage = (
-                inspection.get("usage")
-                if isinstance(inspection.get("usage"), Mapping)
-                else {}
+            inspection = inspect_native_session(
+                thread_id,
+                task_id=existing.get("current_task_id"),
             )
-            usage_window = usage.get("model_context_window")
-            needs_refresh = (
-                existing.get("last_seen_at")
-                != inspection.get("last_seen_at")
-                or (
-                    bool(usage.get("available"))
-                    and int(existing.get("turn_count") or 0) == 0
-                )
-                or (
-                    usage_window is not None
-                    and existing.get("model_context_window") != usage_window
-                )
-            )
-            if not needs_refresh:
+            state = normalized_native_state(inspection, existing, project)
+            if not native_state_needs_refresh(existing, state):
                 continue
             try:
                 result = self.register_native_agent(
                     project["root_path"],
                     thread_id,
-                    str(existing["role"]),
+                    str(state["role"]),
                     str(existing["workstream_key"]),
                     actor=f"{actor}:{thread_id}",
-                    task_id=existing.get("current_task_id"),
+                    task_id=state["task_id"],
                     display_name=str(existing.get("display_name") or thread_id),
                     model_provider=str(
                         existing.get("model_provider") or ""
                     ),
+                    task_candidates=state["task_candidates"],
+                    task_assignment_ambiguous=state[
+                        "task_assignment_ambiguous"
+                    ],
+                    assignment_source=state["assignment_source"],
+                    assignment_confidence=state[
+                        "assignment_confidence"
+                    ],
+                    identity_source=state["identity_source"],
+                    identity_confidence=state["identity_confidence"],
                 )
             except (AgentPoolError, ClusterError, TeamError, OSError) as exc:
                 errors.append(

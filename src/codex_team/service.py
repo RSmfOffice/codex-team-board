@@ -1889,20 +1889,86 @@ class TeamService:
                     cache_profile_contract_status(agent.get("profile"))
                 )
                 if agent.get("runtime") == "native":
-                    agent["usage_available"] = bool(
-                        int(agent.get("turn_count") or 0)
+                    try:
+                        missing_fields = json.loads(
+                            str(
+                                agent.get(
+                                    "native_usage_missing_fields",
+                                    "[]",
+                                )
+                                or "[]"
+                            )
+                        )
+                    except (TypeError, ValueError):
+                        missing_fields = []
+                    if not isinstance(missing_fields, list):
+                        missing_fields = []
+                    agent["native_usage_missing_fields"] = sorted(
+                        {
+                            str(field)
+                            for field in missing_fields
+                            if str(field).strip()
+                        }
                     )
-                    if not agent["usage_available"]:
+                    try:
+                        candidates = json.loads(
+                            str(
+                                agent.get(
+                                    "task_candidates_json",
+                                    "[]",
+                                )
+                                or "[]"
+                            )
+                        )
+                    except (TypeError, ValueError):
+                        candidates = []
+                    if not isinstance(candidates, list):
+                        candidates = []
+                    agent["task_candidates"] = sorted(
+                        {
+                            str(value).strip().upper()
+                            for value in candidates
+                            if str(value).strip()
+                        }
+                    )
+                    agent.pop("task_candidates_json", None)
+                    agent["task_assignment_ambiguous"] = bool(
+                        int(agent.get("task_assignment_ambiguous") or 0)
+                    )
+                    agent["session_stale"] = bool(
+                        int(agent.get("session_stale") or 0)
+                    )
+                    usage_status = str(
+                        agent.get("native_usage_status") or "unavailable"
+                    )
+                    agent["usage_stale"] = usage_status == "stale"
+                    token_fields = (
+                        "last_input_tokens",
+                        "last_cached_input_tokens",
+                        "last_uncached_input_tokens",
+                        "total_input_tokens",
+                        "total_cached_input_tokens",
+                        "total_uncached_input_tokens",
+                        "context_tokens",
+                    )
+                    if usage_status in {"unavailable", "unknown"}:
                         for field in (
-                            "last_input_tokens",
-                            "last_cached_input_tokens",
-                            "last_uncached_input_tokens",
-                            "total_input_tokens",
-                            "total_cached_input_tokens",
-                            "total_uncached_input_tokens",
-                            "context_tokens",
+                            *token_fields,
+                            "turn_count",
                         ):
                             agent[field] = None
+                        agent["usage_available"] = False
+                    else:
+                        for field in agent["native_usage_missing_fields"]:
+                            if field in token_fields or field == "turn_count":
+                                agent[field] = None
+                        agent["usage_available"] = bool(
+                            agent.get("turn_count") is not None
+                            or any(
+                                agent.get(field) is not None
+                                for field in token_fields
+                            )
+                        )
                 total_rate = self._cache_hit_rate(
                     agent.get("total_input_tokens"),
                     agent.get("total_cached_input_tokens"),

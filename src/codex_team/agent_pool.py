@@ -10,6 +10,13 @@ from typing import Any, Iterator, Mapping
 
 from .cache_contract import cache_profile_contract_status
 from .db import connect, connect_readonly, utc_now
+from .native_threads import (
+    ASSIGNMENT_CONFIDENCES,
+    ASSIGNMENT_SOURCES,
+    IDENTITY_CONFIDENCES,
+    IDENTITY_SOURCES,
+    NATIVE_LIFECYCLES,
+)
 
 
 # Bump whenever stable thread instructions or context architecture change.
@@ -91,6 +98,19 @@ class AgentPool:
         return result
 
     @staticmethod
+    def _enum_value(
+        value: str,
+        name: str,
+        allowed: frozenset[str],
+    ) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized not in allowed:
+            raise AgentPoolError(
+                f"{name} must be one of: {', '.join(sorted(allowed))}"
+            )
+        return normalized
+
+    @staticmethod
     def _normalize_model(value: str | None) -> str:
         return str(value or "").strip()
 
@@ -109,7 +129,27 @@ class AgentPool:
 
     @staticmethod
     def _agent_dict(row: sqlite3.Row) -> dict[str, Any]:
-        return dict(row)
+        agent = dict(row)
+        for field in (
+            "task_candidates_json",
+            "native_usage_missing_fields",
+        ):
+            target = (
+                "task_candidates"
+                if field == "task_candidates_json"
+                else "native_usage_missing_fields"
+            )
+            try:
+                value = json.loads(str(agent.get(field) or "[]"))
+            except (TypeError, ValueError):
+                value = []
+            agent[target] = value if isinstance(value, list) else []
+        for field in (
+            "task_assignment_ambiguous",
+            "session_stale",
+        ):
+            agent[field] = bool(int(agent.get(field) or 0))
+        return agent
 
     @staticmethod
     def _usage_value(usage: Mapping[str, Any], *names: str) -> Any:
@@ -200,15 +240,73 @@ class AgentPool:
         model_context_window = cls._optional_non_negative_int(
             values.get("model_context_window")
         )
+        missing_fields = sorted(
+            {
+                str(field).strip()
+                for field in values.get("missing_fields", [])
+                if str(field).strip()
+            }
+        )
         if not values.get("available"):
+            existing = connection.execute(
+                """
+                SELECT native_usage_status, native_usage_missing_fields
+                FROM cluster_agents
+                WHERE agent_id = ?
+                """,
+                (agent_id,),
+            ).fetchone()
+            previous_status = (
+                str(existing["native_usage_status"] or "")
+                if existing is not None
+                else ""
+            )
+            usage_status = (
+                "stale"
+                if previous_status in {"available", "partial", "stale"}
+                else "unavailable"
+            )
+            if usage_status == "stale" and existing is not None:
+                stored_missing = str(
+                    existing["native_usage_missing_fields"] or "[]"
+                )
+                try:
+                    parsed_missing = json.loads(stored_missing)
+                except (TypeError, ValueError):
+                    parsed_missing = []
+                if isinstance(parsed_missing, list):
+                    missing_fields = sorted(
+                        str(field) for field in parsed_missing
+                    )
             if model_context_window is not None:
                 connection.execute(
                     """
                     UPDATE cluster_agents
-                    SET model_context_window = ?
+                    SET model_context_window = ?,
+                        native_usage_status = ?,
+                        native_usage_missing_fields = ?
                     WHERE agent_id = ?
                     """,
-                    (model_context_window, agent_id),
+                    (
+                        model_context_window,
+                        usage_status,
+                        json.dumps(missing_fields, separators=(",", ":")),
+                        agent_id,
+                    ),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE cluster_agents
+                    SET native_usage_status = ?,
+                        native_usage_missing_fields = ?
+                    WHERE agent_id = ?
+                    """,
+                    (
+                        usage_status,
+                        json.dumps(missing_fields, separators=(",", ":")),
+                        agent_id,
+                    ),
                 )
             return
 
@@ -233,7 +331,9 @@ class AgentPool:
                 context_tokens = ?,
                 model_context_window = COALESCE(?, model_context_window),
                 turn_count = ?,
-                last_turn_id = COALESCE(?, last_turn_id)
+                last_turn_id = COALESCE(?, last_turn_id),
+                native_usage_status = ?,
+                native_usage_missing_fields = ?
             WHERE agent_id = ?
             """,
             (
@@ -247,6 +347,8 @@ class AgentPool:
                 model_context_window,
                 count("turn_count"),
                 last_turn_id,
+                "partial" if missing_fields else "available",
+                json.dumps(missing_fields, separators=(",", ":")),
                 agent_id,
             ),
         )
@@ -495,10 +597,19 @@ class AgentPool:
         native_session_path: str | None = None,
         last_seen_at: str | None = None,
         usage: Mapping[str, Any] | None = None,
+        identity_source: str = "unknown",
+        identity_confidence: str = "unknown",
+        lifecycle: str = "unknown",
+        lifecycle_source: str = "unknown",
+        assignment_source: str = "none",
+        assignment_confidence: str = "unknown",
+        task_candidates: list[str] | tuple[str, ...] | None = None,
+        task_assignment_ambiguous: bool = False,
+        session_stale: bool = True,
     ) -> dict[str, Any]:
         project_id = self._require_text(project_id, "project_id")
         role = self._require_text(role, "role").lower()
-        if role not in self.ROLES:
+        if role not in self.ROLES and role != "unknown":
             raise AgentPoolError(f"unsupported role: {role}")
         workstream_key = self._require_text(workstream_key, "workstream_key")
         thread_id = self._require_text(thread_id, "thread_id")
@@ -511,6 +622,59 @@ class AgentPool:
             raise AgentPoolError(
                 "prompt_status must be unknown, delivered, or missing"
             )
+        identity_source = self._enum_value(
+            identity_source,
+            "identity_source",
+            IDENTITY_SOURCES,
+        )
+        identity_confidence = self._enum_value(
+            identity_confidence,
+            "identity_confidence",
+            IDENTITY_CONFIDENCES,
+        )
+        lifecycle = self._enum_value(
+            lifecycle,
+            "lifecycle",
+            NATIVE_LIFECYCLES,
+        )
+        lifecycle_source = self._require_text(
+            lifecycle_source,
+            "lifecycle_source",
+        ).lower()
+        assignment_source = self._enum_value(
+            assignment_source,
+            "assignment_source",
+            ASSIGNMENT_SOURCES,
+        )
+        assignment_confidence = self._enum_value(
+            assignment_confidence,
+            "assignment_confidence",
+            ASSIGNMENT_CONFIDENCES,
+        )
+        normalized_candidates = sorted(
+            {
+                str(value).strip().upper()
+                for value in (task_candidates or [])
+                if str(value).strip()
+            }
+        )
+        if task_id:
+            normalized_task = str(task_id).strip().upper()
+            if normalized_task not in normalized_candidates:
+                normalized_candidates.append(normalized_task)
+                normalized_candidates.sort()
+        if assignment_source == "none" and task_id:
+            assignment_source = "registration"
+            assignment_confidence = (
+                "high"
+                if assignment_confidence == "unknown"
+                else assignment_confidence
+            )
+        candidates_json = json.dumps(
+            normalized_candidates,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
         model = self._normalize_model(model)
         model_provider = self._normalize_model(model_provider)
         now = utc_now()
@@ -571,10 +735,19 @@ class AgentPool:
                     existing["workstream_key"],
                 )
                 requested = (project_id, role, workstream_key)
-                if identity != requested:
+                if identity != requested and not (
+                    existing["role"] == "unknown"
+                    and role in self.ROLES
+                ) and not (
+                    role == "unknown"
+                    and existing["role"] in self.ROLES
+                ):
                     raise AgentPoolError(
                         f"thread {thread_id} is registered with different native metadata"
                     )
+                effective_role = (
+                    existing["role"] if role == "unknown" else role
+                )
                 if (
                     existing["current_task_id"]
                     and task_id
@@ -586,18 +759,27 @@ class AgentPool:
                 connection.execute(
                     """
                     UPDATE cluster_agents
-                    SET display_name = ?, model = ?, model_provider = ?,
+                    SET role = ?, display_name = ?, model = ?, model_provider = ?,
                         current_task_id = COALESCE(?, current_task_id),
                         current_goal_id = COALESCE(?, current_goal_id),
                         parent_thread_id = COALESCE(?, parent_thread_id),
                         agent_path = COALESCE(?, agent_path),
                         agent_nickname = COALESCE(?, agent_nickname),
                         actor = ?, prompt_hash = ?,
-                        prompt_status = ?, native_session_path = ?,
-                        last_seen_at = ?, last_used_at = ?, updated_at = ?
+                        prompt_status = ?,
+                        native_session_path = COALESCE(?, native_session_path),
+                        last_seen_at = COALESCE(?, last_seen_at),
+                        last_used_at = COALESCE(?, last_used_at),
+                        updated_at = ?,
+                        identity_source = ?, identity_confidence = ?,
+                        lifecycle = ?, lifecycle_source = ?,
+                        assignment_source = ?, assignment_confidence = ?,
+                        task_candidates_json = ?,
+                        task_assignment_ambiguous = ?, session_stale = ?
                     WHERE agent_id = ?
                     """,
                     (
+                        effective_role,
                         display_name
                         or existing["display_name"]
                         or agent_nickname
@@ -614,9 +796,18 @@ class AgentPool:
                         prompt_hash,
                         prompt_status,
                         native_session_path,
-                        last_seen_at or now,
-                        last_seen_at or now,
+                        last_seen_at,
+                        last_seen_at,
                         now,
+                        identity_source,
+                        identity_confidence,
+                        lifecycle,
+                        lifecycle_source,
+                        assignment_source,
+                        assignment_confidence,
+                        candidates_json,
+                        int(bool(task_assignment_ambiguous)),
+                        int(bool(session_stale)),
                         existing["agent_id"],
                     ),
                 )
@@ -635,6 +826,15 @@ class AgentPool:
                         "task_id": task_id,
                         "prompt_status": prompt_status,
                         "session_path": native_session_path,
+                        "identity_source": identity_source,
+                        "identity_confidence": identity_confidence,
+                        "lifecycle": lifecycle,
+                        "session_stale": bool(session_stale),
+                        "assignment_source": assignment_source,
+                        "task_candidates": normalized_candidates,
+                        "task_assignment_ambiguous": bool(
+                            task_assignment_ambiguous
+                        ),
                         "usage_available": bool(
                             (usage or {}).get("available")
                         ),
@@ -651,11 +851,16 @@ class AgentPool:
                     agent_id, project_id, role, workstream_key, display_name,
                     thread_id, runtime, parent_thread_id, agent_path,
                     agent_nickname, actor, prompt_hash, prompt_status,
-                    native_session_path, last_seen_at, profile, status,
+                    native_session_path, last_seen_at, identity_source,
+                    identity_confidence, lifecycle, lifecycle_source,
+                    assignment_source, assignment_confidence,
+                    task_candidates_json, task_assignment_ambiguous,
+                    session_stale, profile, status,
                     model, model_provider, current_goal_id, current_task_id,
                     last_loaded_at, last_used_at, created_at, updated_at
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, 'native', ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     'native', 'loaded', ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
@@ -677,6 +882,15 @@ class AgentPool:
                     prompt_status,
                     native_session_path,
                     last_seen_at or now,
+                    identity_source,
+                    identity_confidence,
+                    lifecycle,
+                    lifecycle_source,
+                    assignment_source,
+                    assignment_confidence,
+                    candidates_json,
+                    int(bool(task_assignment_ambiguous)),
+                    int(bool(session_stale)),
                     model,
                     model_provider,
                     current_goal_id,
@@ -708,6 +922,15 @@ class AgentPool:
                     "agent_nickname": agent_nickname,
                     "prompt_status": prompt_status,
                     "session_path": native_session_path,
+                    "identity_source": identity_source,
+                    "identity_confidence": identity_confidence,
+                    "lifecycle": lifecycle,
+                    "session_stale": bool(session_stale),
+                    "assignment_source": assignment_source,
+                    "task_candidates": normalized_candidates,
+                    "task_assignment_ambiguous": bool(
+                        task_assignment_ambiguous
+                    ),
                     "usage_available": bool(
                         (usage or {}).get("available")
                     ),
