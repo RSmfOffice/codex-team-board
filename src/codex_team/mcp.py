@@ -38,7 +38,11 @@ from .prompt_contract import (
     instructions_for_surface,
 )
 from .processes import current_process_identity, process_identity
-from .service import TeamError, TeamService, request_mutation_scope
+from .service import (
+    TeamError,
+    TeamService,
+    request_mutation_scope,
+)
 from .validation import SchemaValidationError, validate_input_schema
 from .worktrees import WorktreeManager
 
@@ -489,6 +493,10 @@ def _tool_definitions() -> list[dict[str, Any]]:
                     "actor": {"type": "string"},
                     "reason": {"type": "string", "minLength": 1},
                     "claim_token": {"type": "string"},
+                    "authority_token": {
+                        "type": "string",
+                        "description": "Local privileged-operation token when no claim token is supplied.",
+                    },
                 },
                 "required": ["task_id", "actor", "reason"],
                 "additionalProperties": False,
@@ -499,7 +507,14 @@ def _tool_definitions() -> list[dict[str, Any]]:
             "description": "Return a blocked task to ready after the blocker is resolved.",
             "inputSchema": {
                 "type": "object",
-                "properties": {"task_id": task_id, "actor": {"type": "string"}},
+                "properties": {
+                    "task_id": task_id,
+                    "actor": {"type": "string"},
+                    "authority_token": {
+                        "type": "string",
+                        "description": "Local privileged-operation token.",
+                    },
+                },
                 "required": ["task_id", "actor"],
                 "additionalProperties": False,
             },
@@ -515,6 +530,10 @@ def _tool_definitions() -> list[dict[str, Any]]:
                     "task_id": task_id,
                     "actor": {"type": "string"},
                     "reason": {"type": "string", "minLength": 1},
+                    "authority_token": {
+                        "type": "string",
+                        "description": "Local privileged-operation token.",
+                    },
                 },
                 "required": ["task_id", "actor", "reason"],
                 "additionalProperties": False,
@@ -537,6 +556,10 @@ def _tool_definitions() -> list[dict[str, Any]]:
                     "merge_commit": {
                         "type": "string",
                         "description": "Required when approving a write task; record the commit merged into the main branch.",
+                    },
+                    "authority_token": {
+                        "type": "string",
+                        "description": "Local privileged-operation token.",
                     },
                 },
                 "required": ["task_id", "actor", "approve", "notes"],
@@ -684,6 +707,10 @@ def _tool_definitions() -> list[dict[str, Any]]:
                             "restore",
                         ],
                     },
+                    "authority_token": {
+                        "type": "string",
+                        "description": "Local privileged-operation token.",
+                    },
                 },
                 "required": ["goal_id", "action"],
                 "additionalProperties": False,
@@ -701,6 +728,10 @@ def _tool_definitions() -> list[dict[str, Any]]:
                     "goal_id": {"type": "string", "minLength": 1},
                     "workstream_key": {"type": "string"},
                     "continuity_reason": {"type": "string"},
+                    "authority_token": {
+                        "type": "string",
+                        "description": "Local privileged-operation token.",
+                    },
                 },
                 "required": ["goal_id"],
                 "additionalProperties": False,
@@ -721,6 +752,10 @@ def _tool_definitions() -> list[dict[str, Any]]:
                         "type": "string",
                         "minLength": 1,
                         "maxLength": 12000,
+                    },
+                    "authority_token": {
+                        "type": "string",
+                        "description": "Local privileged-operation token.",
                     },
                 },
                 "required": ["goal_id", "summary"],
@@ -745,6 +780,10 @@ def _tool_definitions() -> list[dict[str, Any]]:
                     "reason": {
                         "type": "string",
                         "minLength": 1,
+                    },
+                    "authority_token": {
+                        "type": "string",
+                        "description": "Local privileged-operation token.",
                     },
                 },
                 "required": ["goal_id", "actor", "reason"],
@@ -783,6 +822,10 @@ def _tool_definitions() -> list[dict[str, Any]]:
                     "reason": {
                         "type": "string",
                         "default": "manual reset requested through MCP",
+                    },
+                    "authority_token": {
+                        "type": "string",
+                        "description": "Local privileged-operation token.",
                     },
                 },
                 "required": ["agent_id"],
@@ -1640,30 +1683,58 @@ class TeamMcpServer:
                 commit_sha=arguments.get("commit_sha", ""),
             )
         if name == "team_block_task":
+            if not str(arguments.get("claim_token") or "").strip():
+                self.team.require_mcp_authority(
+                    arguments["actor"],
+                    operation="task block",
+                    allowed_actors=frozenset(
+                        {"lead", "main", "human", "teamd"}
+                    ),
+                    authority_token=arguments.get("authority_token"),
+                )
             return self.team.block_task(
                 arguments["task_id"],
                 actor=arguments["actor"],
                 reason=arguments["reason"],
                 claim_token=arguments.get("claim_token"),
+                authority_token=arguments.get("authority_token"),
             )
         if name == "team_unblock_task":
+            self.team.require_mcp_authority(
+                arguments["actor"],
+                operation="task unblock",
+                authority_token=arguments.get("authority_token"),
+            )
             return self.team.unblock_task(
                 arguments["task_id"],
                 actor=arguments["actor"],
+                authority_token=arguments.get("authority_token"),
             )
         if name == "team_cancel_task":
+            self.team.require_mcp_authority(
+                arguments["actor"],
+                operation="task cancellation",
+                authority_token=arguments.get("authority_token"),
+            )
             return self.team.cancel_task(
                 arguments["task_id"],
                 actor=arguments["actor"],
                 reason=arguments["reason"],
+                authority_token=arguments.get("authority_token"),
             )
         if name == "team_review_task":
+            self.team.require_mcp_authority(
+                arguments["actor"],
+                operation="task review",
+                authority_token=arguments.get("authority_token"),
+            )
             return self.team.review_task(
                 arguments["task_id"],
                 actor=arguments["actor"],
                 approve=_required_boolean(arguments, "approve"),
                 notes=arguments["notes"],
                 merge_commit=arguments.get("merge_commit", ""),
+                authority_token=arguments.get("authority_token"),
             )
         if name == "team_add_message":
             return self.team.add_message(
@@ -1724,12 +1795,13 @@ class TeamMcpServer:
             if action not in {"pause", "resume", "cancel", "archive", "restore"}:
                 raise TeamError(
                     "action must be pause, resume, cancel, archive, or restore"
+                )
+            actor = self.team.privileged_actor(
+                f"cluster goal {action}",
+                authority_token=arguments.get("authority_token"),
             )
             reason = f"{action} requested through MCP"
             if action in {"archive", "restore"}:
-                actor = self.team.privileged_actor(
-                    f"cluster goal {action}"
-                )
                 goal = self.cluster.set_goal_archived(
                     arguments["goal_id"],
                     action == "archive",
@@ -1767,19 +1839,31 @@ class TeamMcpServer:
                 ),
             }
         if name == "team_goal_set_workstream":
+            actor = self.team.privileged_actor(
+                "cluster goal workstream changes",
+                authority_token=arguments.get("authority_token"),
+            )
             return self.cluster.set_goal_workstream(
                 arguments["goal_id"],
                 workstream_key=arguments.get("workstream_key"),
                 continuity_reason=arguments.get("continuity_reason"),
-                actor="human",
+                actor=actor,
             )
         if name == "team_goal_set_checkpoint":
+            actor = self.team.privileged_actor(
+                "cluster goal checkpoint changes",
+                authority_token=arguments.get("authority_token"),
+            )
             return self.cluster.set_goal_checkpoint(
                 arguments["goal_id"],
                 summary=arguments["summary"],
-                actor="lead",
+                actor=actor,
             )
         if name == "team_goal_migrate_workflow":
+            self.team.privileged_actor(
+                "cluster goal workflow migration",
+                authority_token=arguments.get("authority_token"),
+            )
             return self.cluster.migrate_goal_workflow_epoch(
                 arguments["goal_id"],
                 actor=arguments["actor"],
@@ -1797,6 +1881,10 @@ class TeamMcpServer:
                 )
             }
         if name == "team_agent_reset":
+            self.team.privileged_actor(
+                "agent reset",
+                authority_token=arguments.get("authority_token"),
+            )
             return self.cluster.reset_agent(
                 arguments["agent_id"],
                 actor=arguments.get("actor", "human"),

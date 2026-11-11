@@ -106,6 +106,39 @@ class TeamService:
             tuple[tuple[Any, ...], str],
         ] = {}
 
+    def operator_authority(self) -> str:
+        """Load or atomically create the local privileged-operation token."""
+
+        self.settings.ensure()
+        path = self.settings.home / "operator-authority.token"
+        try:
+            token = path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            token = secrets.token_urlsafe(32)
+            try:
+                descriptor = os.open(
+                    path,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    0o600,
+                )
+            except FileExistsError:
+                token = path.read_text(encoding="utf-8").strip()
+            else:
+                with os.fdopen(
+                    descriptor,
+                    "w",
+                    encoding="utf-8",
+                    newline="\n",
+                ) as stream:
+                    stream.write(token + "\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+        if len(token) < 32:
+            raise TeamError(
+                "local operator authority token is missing or invalid"
+            )
+        return token
+
     @contextmanager
     def connection(self, *, write: bool = True) -> Iterator[sqlite3.Connection]:
         self.settings.ensure()
@@ -362,6 +395,7 @@ class TeamService:
         allowed_actors: frozenset[str] = frozenset(
             {"lead", "main", "human"}
         ),
+        authority_token: str | None = None,
     ) -> str:
         """Bind privileged mutations to the trusted local process role."""
 
@@ -376,55 +410,109 @@ class TeamService:
             )
         role, bound_actor = self._managed_caller_binding()
         if not role:
-            # Direct CLI/library calls are the local human control path.
             return normalized_actor
-        if role not in {"lead", "main", "human"}:
+        if role not in allowed_actors:
             raise TeamError(
                 f"managed role {role} cannot perform {operation}"
             )
-        if role == "lead" and normalized_actor not in {"lead", "main"}:
-            raise TeamError(
-                "a managed lead cannot impersonate the human actor"
-            )
-        if role == "main" and normalized_actor != "main":
-            raise TeamError(
-                "a managed main caller cannot impersonate another actor"
-            )
-        if role == "human" and normalized_actor != "human":
-            raise TeamError(
-                "a managed human caller cannot impersonate another actor"
-            )
-        if bound_actor:
-            expected_actor = bound_actor.lower()
+        if (
+            role == "lead"
+            and normalized_actor in {"lead", "main"}
+        ) or (
+            role == "main"
+            and normalized_actor == "main"
+        ) or (
+            role == "human"
+            and normalized_actor == "human"
+        ):
             if (
-                normalized_actor not in {"lead", "main", "human"}
-                or normalized_actor != expected_actor
+                bound_actor
+                and role != "lead"
+                and normalized_actor != bound_actor.lower()
             ):
-                if expected_actor not in allowed_actors:
-                    raise TeamError(
-                        "managed caller is not authorized for this operation"
-                    )
-                normalized_actor = expected_actor
-        return normalized_actor
+                raise TeamError(
+                    "managed caller identity does not match its binding"
+                )
+            return normalized_actor
+        raise TeamError(
+            "managed caller identity does not match its binding"
+        )
 
-    def privileged_actor(self, operation: str) -> str:
+    def require_mcp_authority(
+        self,
+        requested_actor: str,
+        *,
+        operation: str,
+        authority_token: str | None = None,
+        allowed_actors: frozenset[str] = frozenset(
+            {"lead", "main", "human"}
+        ),
+    ) -> str:
+        """Require a capability or trusted role at the MCP boundary."""
+
+        if not isinstance(requested_actor, str):
+            raise TeamError("actor must be a string")
+        normalized_actor = requested_actor.strip().lower()
+        if normalized_actor not in allowed_actors:
+            raise TeamError(
+                f"only an authorized actor can perform {operation}"
+            )
+        token = (
+            authority_token.strip()
+            if isinstance(authority_token, str)
+            else ""
+        )
+        if token and secrets.compare_digest(
+            token,
+            self.operator_authority(),
+        ):
+            return normalized_actor
+        role, _actor = self._managed_caller_binding()
+        if role:
+            try:
+                return self.authorize_privileged_actor(
+                    normalized_actor,
+                    operation=operation,
+                    allowed_actors=allowed_actors,
+                )
+            except TeamError as exc:
+                raise TeamError(
+                    f"{operation} requires a valid local authority token"
+                ) from exc
+        raise TeamError(
+            f"{operation} requires a valid local authority token"
+        )
+
+    def privileged_actor(
+        self,
+        operation: str,
+        *,
+        authority_token: str | None = None,
+    ) -> str:
         role, _actor = self._managed_caller_binding()
         if not role:
-            return "human"
-        if role == "lead":
-            return self.authorize_privileged_actor(
-                "lead",
-                operation=operation,
-            )
-        if role == "main":
-            return self.authorize_privileged_actor(
-                "main",
-                operation=operation,
-            )
-        if role == "human":
-            return self.authorize_privileged_actor(
+            return self.require_mcp_authority(
                 "human",
                 operation=operation,
+                authority_token=authority_token,
+            )
+        if role == "lead":
+            return self.require_mcp_authority(
+                "lead",
+                operation=operation,
+                authority_token=authority_token,
+            )
+        if role == "main":
+            return self.require_mcp_authority(
+                "main",
+                operation=operation,
+                authority_token=authority_token,
+            )
+        if role == "human":
+            return self.require_mcp_authority(
+                "human",
+                operation=operation,
+                authority_token=authority_token,
             )
         raise TeamError(f"managed role {role} cannot perform {operation}")
 
@@ -783,11 +871,13 @@ class TeamService:
         archived: bool,
         *,
         actor: str = "human",
+        authority_token: str | None = None,
     ) -> dict[str, Any]:
         actor = self.authorize_privileged_actor(
             actor,
             operation="project archive changes",
             allowed_actors=frozenset({"lead", "main", "human"}),
+            authority_token=authority_token,
         )
         now = utc_now()
         with self.connection() as connection:
@@ -858,11 +948,13 @@ class TeamService:
         archived: bool,
         *,
         actor: str = "human",
+        authority_token: str | None = None,
     ) -> dict[str, Any]:
         actor = self.authorize_privileged_actor(
             actor,
             operation="task archive changes",
             allowed_actors=frozenset({"lead", "main", "human"}),
+            authority_token=authority_token,
         )
         now = utc_now()
         with self.connection() as connection:
@@ -3107,6 +3199,7 @@ class TeamService:
         actor: str,
         reason: str,
         claim_token: str | None = None,
+        authority_token: str | None = None,
     ) -> dict[str, Any]:
         actor = actor.strip()
         reason = reason.strip()
@@ -3130,14 +3223,14 @@ class TeamService:
                     normalized_token,
                     actor,
                 )
-            elif task["status"] == "running" and actor not in {
-                "lead",
-                "main",
-                "human",
-                "teamd",
-            }:
-                raise TeamError(
-                    "blocking a running task requires the active claim_token"
+            elif task["status"] == "running" or _CURRENT_MCP_CALL.get():
+                actor = self.authorize_privileged_actor(
+                    actor,
+                    operation="task block",
+                    allowed_actors=frozenset(
+                        {"lead", "main", "human", "teamd"}
+                    ),
+                    authority_token=authority_token,
                 )
             if task["status"] in TERMINAL_STATUSES:
                 raise TeamError("cannot block terminal task")
@@ -3167,10 +3260,21 @@ class TeamService:
             self._event(connection, task_id, "blocked", actor, {"reason": reason})
         return self.get_task(task_id)
 
-    def unblock_task(self, task_id: str, *, actor: str) -> dict[str, Any]:
+    def unblock_task(
+        self,
+        task_id: str,
+        *,
+        actor: str,
+        authority_token: str | None = None,
+    ) -> dict[str, Any]:
         actor = actor.strip()
         if not actor:
             raise TeamError("actor is required")
+        actor = self.authorize_privileged_actor(
+            actor,
+            operation="task unblock",
+            authority_token=authority_token,
+        )
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             task = connection.execute(
@@ -3203,7 +3307,15 @@ class TeamService:
         *,
         actor: str,
         reason: str,
+        authority_token: str | None = None,
     ) -> dict[str, Any]:
+        if not isinstance(actor, str):
+            raise TeamError("actor must be a string")
+        actor = self.authorize_privileged_actor(
+            actor,
+            operation="task cancellation",
+            authority_token=authority_token,
+        )
         reason = reason.strip()
         if not reason:
             raise TeamError("cancel reason is required")
@@ -3363,6 +3475,7 @@ class TeamService:
         approve: bool,
         notes: str,
         merge_commit: str = "",
+        authority_token: str | None = None,
     ) -> dict[str, Any]:
         if not isinstance(actor, str):
             raise TeamError("actor must be a string")
@@ -3375,6 +3488,7 @@ class TeamService:
         actor = self.authorize_privileged_actor(
             actor,
             operation="task review",
+            authority_token=authority_token,
         )
         with self.connection(write=False) as connection:
             task = connection.execute(

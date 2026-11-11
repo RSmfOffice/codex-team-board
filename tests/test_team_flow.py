@@ -904,6 +904,113 @@ class TeamFlowTests(unittest.TestCase):
         )
         self.assertEqual(human_reviewed["status"], "done")
 
+    def test_mcp_privileged_operations_require_authority_token(self) -> None:
+        server = TeamMcpServer(self.settings)
+
+        def reviewable_task(title: str) -> dict[str, object]:
+            task = self.team.create_task(
+                self.repo,
+                title=title,
+                description="The public MCP boundary needs authority.",
+                acceptance="Actor spoofing is rejected without a token.",
+                kind="read",
+                owner_role="team_explorer",
+            )
+            claimed = self.team.claim_task(
+                str(task["task_id"]),
+                actor=f"{title}-worker",
+            )
+            self.team.submit_task(
+                str(task["task_id"]),
+                actor=f"{title}-worker",
+                claim_token=str(claimed["claim_token"]),
+                result="ready for review",
+                tests="authority fixture",
+            )
+            return task
+
+        review_task = reviewable_task("MCP forged review")
+        with patch.dict(
+            os.environ,
+            {
+                "CODEX_TEAM_ROLE": "",
+                "CODEX_TEAM_ACTOR": "",
+            },
+            clear=False,
+        ):
+            with self.assertRaisesRegex(
+                TeamError,
+                "local authority token",
+            ):
+                server.call_tool(
+                    "team_review_task",
+                    {
+                        "task_id": review_task["task_id"],
+                        "actor": "lead",
+                        "approve": True,
+                        "notes": "forged review",
+                    },
+                )
+            reviewed = server.call_tool(
+                "team_review_task",
+                {
+                    "task_id": review_task["task_id"],
+                    "actor": "lead",
+                    "approve": True,
+                    "notes": "authorized review",
+                    "authority_token": self.team.operator_authority(),
+                },
+            )
+        self.assertEqual(reviewed["status"], "done")
+
+        block_task = self.team.create_task(
+            self.repo,
+            title="MCP forged block",
+            description="Running claims need authority without a token.",
+            acceptance="A forged lead cannot clear another claim.",
+            kind="read",
+            owner_role="team_explorer",
+        )
+        claimed = self.team.claim_task(
+            str(block_task["task_id"]),
+            actor="block-victim",
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "CODEX_TEAM_ROLE": "",
+                "CODEX_TEAM_ACTOR": "",
+            },
+            clear=False,
+        ):
+            with self.assertRaisesRegex(
+                TeamError,
+                "local authority token",
+            ):
+                server.call_tool(
+                    "team_block_task",
+                    {
+                        "task_id": block_task["task_id"],
+                        "actor": "lead",
+                        "reason": "forged block",
+                    },
+                )
+            blocked = server.call_tool(
+                "team_block_task",
+                {
+                    "task_id": block_task["task_id"],
+                    "actor": "lead",
+                    "reason": "authorized block",
+                    "authority_token": self.team.operator_authority(),
+                },
+            )
+        self.assertEqual(blocked["status"], "blocked")
+        self.assertEqual(
+            self.team.get_task(str(block_task["task_id"]))["claimed_by"],
+            None,
+        )
+        self.assertIsNotNone(claimed["claim_token"])
+
     def test_concurrent_review_has_one_terminal_winner(self) -> None:
         task = self.team.create_task(
             self.repo,
@@ -3808,6 +3915,7 @@ class TeamFlowTests(unittest.TestCase):
                 "actor": "lead",
                 "approve": True,
                 "notes": "accepted",
+                "authority_token": self.team.operator_authority(),
             },
         )
         self.assertEqual(done["status"], "done")
@@ -3834,6 +3942,7 @@ class TeamFlowTests(unittest.TestCase):
                 "task_id": stale["task_id"],
                 "actor": "lead",
                 "reason": "superseded",
+                "authority_token": self.team.operator_authority(),
             },
         )
         self.assertEqual(canceled["status"], "canceled")
