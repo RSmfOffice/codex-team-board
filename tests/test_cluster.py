@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, patch
 from codex_team import __version__
 from codex_team.cluster import (
     _ClusterAppServerEvents,
+    ClusterError,
     ClusterManager,
     LEAD_DEVELOPER_INSTRUCTIONS,
     TICK_PHASE_ORDER,
@@ -30,7 +31,14 @@ from codex_team.cluster import (
     _stable_developer_instructions,
 )
 from codex_team.agent_pool import CURRENT_AGENT_PROFILE, AgentPool
-from codex_team.app_server import AppServerEvents, AppServerRuntime
+from codex_team.app_server import (
+    AppServerDisconnectedError,
+    AppServerEvents,
+    AppServerProtocolError,
+    AppServerRPCError,
+    AppServerRuntime,
+    AppServerTimeoutError,
+)
 from codex_team.cli import build_parser
 from codex_team.config import Settings
 from codex_team.db import utc_now
@@ -77,6 +85,58 @@ def _repo(base: Path, name: str) -> Path:
     git(repo, "config", "user.email", "cluster-test@example.invalid")
     git(repo, "config", "user.name", "Cluster Test")
     return repo
+
+
+def _native_session_file(
+    root: Path,
+    thread_id: str,
+    *,
+    cwd: Path | None,
+    task_id: str | None = None,
+    role: str = "team_worker",
+) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"rollout-{thread_id}.jsonl"
+    metadata: dict[str, object] = {
+        "id": thread_id,
+        "model_provider": "test-provider",
+        "source": {
+            "subagent": {
+                "thread_spawn": {
+                    "parent_thread_id": "parent-thread",
+                    "agent_path": "/root/team_worker",
+                    "agent_nickname": "Worker",
+                    "agent_role": role,
+                }
+            }
+        },
+    }
+    if cwd is not None:
+        metadata["cwd"] = str(cwd)
+    events: list[dict[str, object]] = [
+        {"type": "session_meta", "payload": metadata}
+    ]
+    if task_id:
+        events.append(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": f"Execute {task_id}",
+                        }
+                    ],
+                },
+            }
+        )
+    path.write_text(
+        "\n".join(json.dumps(event) for event in events) + "\n",
+        encoding="utf-8",
+    )
+    return path
 
 
 def _manager_profile(
@@ -2273,6 +2333,119 @@ class ClusterSchedulerTests(unittest.TestCase):
                 "running",
             )
 
+    def test_settlement_failure_is_isolated_and_retried_next_tick(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            repo = _repo(base, "settle-isolation")
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime_mode="exec",
+            )
+            try:
+                poison_goal = manager.create_goal(
+                    repo,
+                    objective="Settle poisoned job",
+                )
+                manager.set_goal_status(
+                    poison_goal["goal_id"],
+                    "failed",
+                    reason="fixture boundary",
+                )
+                healthy_goal = manager.create_goal(
+                    repo,
+                    objective="Settle healthy job",
+                )
+                now = utc_now()
+                jobs = (
+                    (
+                        "J-POISON",
+                        poison_goal["goal_id"],
+                        "2026-11-11T00:00:00Z",
+                    ),
+                    (
+                        "J-HEALTHY",
+                        healthy_goal["goal_id"],
+                        "2026-11-11T00:00:01Z",
+                    ),
+                )
+                with team.connection() as connection:
+                    for job_id, goal_id, started_at in jobs:
+                        log_path = base / f"{job_id}.jsonl"
+                        output_path = base / f"{job_id}.md"
+                        log_path.write_text("", encoding="utf-8")
+                        output_path.write_text("", encoding="utf-8")
+                        connection.execute(
+                            """
+                            INSERT INTO cluster_jobs(
+                                job_id, goal_id, kind, role, status,
+                                attempt, log_path, output_path, started_at
+                            ) VALUES (?, ?, 'lead', 'lead', 'running',
+                                      1, ?, ?, ?)
+                            """,
+                            (
+                                job_id,
+                                goal_id,
+                                str(log_path),
+                                str(output_path),
+                                started_at,
+                            ),
+                        )
+
+                real_finish_job = manager._finish_job
+
+                def inject_poison(job, exit_code, **kwargs):
+                    if job["job_id"] == "J-POISON":
+                        raise RuntimeError(
+                            "database busy password=top-secret-value"
+                        )
+                    return real_finish_job(job, exit_code, **kwargs)
+
+                with patch.object(
+                    manager,
+                    "_finish_job",
+                    side_effect=inject_poison,
+                ):
+                    first = manager._reconcile_jobs()
+                self.assertEqual(first["deferred"], 1)
+                self.assertEqual(first["processed"], 1)
+                self.assertEqual(
+                    first["errors"][0]["job_id"],
+                    "J-POISON",
+                )
+                self.assertNotIn(
+                    "top-secret-value",
+                    first["errors"][0]["redacted_error"],
+                )
+                with team.connection(write=False) as connection:
+                    statuses = {
+                        row["job_id"]: row["status"]
+                        for row in connection.execute(
+                            """
+                            SELECT job_id, status FROM cluster_jobs
+                            WHERE job_id IN ('J-POISON', 'J-HEALTHY')
+                            """
+                        ).fetchall()
+                    }
+                self.assertEqual(statuses["J-POISON"], "running")
+                self.assertEqual(statuses["J-HEALTHY"], "failed")
+
+                second = manager._reconcile_jobs()
+                self.assertEqual(second["count"], 1)
+                self.assertEqual(second["deferred"], 0)
+                with team.connection(write=False) as connection:
+                    poison_status = connection.execute(
+                        """
+                        SELECT status FROM cluster_jobs
+                        WHERE job_id = 'J-POISON'
+                        """
+                    ).fetchone()["status"]
+                self.assertEqual(poison_status, "failed")
+            finally:
+                manager.close()
+
     def test_fake_app_server_reuses_thread_across_worktrees_with_turn_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
@@ -3765,6 +3938,206 @@ class ClusterSchedulerTests(unittest.TestCase):
                 [event["event_type"] for event in result["events"]],
             )
 
+    def test_transient_app_server_delivery_errors_retry_in_place(self) -> None:
+        for case_name in ("thread", "turn"):
+            with (
+                self.subTest(case=case_name),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                base = Path(temporary)
+                settings = _settings(base)
+                team = TeamService(settings)
+                repo = _repo(base, f"transient-{case_name}")
+                runtime = StubAppServerRuntime()
+                manager = ClusterManager(
+                    settings,
+                    team=team,
+                    runtime=runtime,
+                    runtime_mode="app_server",
+                )
+                try:
+                    goal = manager.create_goal(
+                        repo,
+                        objective=f"Transient {case_name} delivery",
+                    )
+                    task = team.create_task(
+                        repo,
+                        title=f"Transient {case_name}",
+                        description="A transport failure is retryable.",
+                        acceptance="The App Server turn is eventually delivered.",
+                        kind="read",
+                        owner_role="team_explorer",
+                        goal_id=goal["goal_id"],
+                    )
+                    calls = 0
+                    if case_name == "thread":
+                        real_start = runtime.start_thread
+
+                        def flaky_start(*args, **kwargs):
+                            nonlocal calls
+                            calls += 1
+                            if calls == 1:
+                                raise AppServerDisconnectedError(
+                                    "transport disconnected"
+                                )
+                            return real_start(*args, **kwargs)
+
+                        delivery_patch = patch.object(
+                            runtime,
+                            "start_thread",
+                            side_effect=flaky_start,
+                        )
+                    else:
+                        real_turn = runtime.start_turn
+
+                        def flaky_turn(*args, **kwargs):
+                            nonlocal calls
+                            calls += 1
+                            if calls == 1:
+                                raise AppServerTimeoutError(
+                                    "prompt delivery timed out"
+                                )
+                            return real_turn(*args, **kwargs)
+
+                        delivery_patch = patch.object(
+                            runtime,
+                            "start_turn",
+                            side_effect=flaky_turn,
+                        )
+                    with delivery_patch:
+                        dispatched = manager._dispatch_worker(
+                            manager.get_goal(goal["goal_id"]),
+                            team.get_task(task["task_id"]),
+                        )
+                    self.assertEqual(dispatched["runtime"], "app_server")
+                    self.assertEqual(calls, 2)
+                    self.assertEqual(
+                        team.get_task(task["task_id"])["status"],
+                        "ready",
+                    )
+                    events = manager.get_goal(goal["goal_id"])["events"]
+                    self.assertFalse(
+                        [
+                            event
+                            for event in events
+                            if event["event_type"] == "agent_runtime_fallback"
+                        ]
+                    )
+                finally:
+                    manager.close()
+
+    def test_permanent_app_server_delivery_errors_do_not_retry(self) -> None:
+        class FakeProcess:
+            pid = 434343
+
+            def __init__(self) -> None:
+                self.stdin = io.StringIO()
+                self.stdout = io.StringIO()
+                self.stderr = io.StringIO()
+
+            def poll(self) -> None:
+                return None
+
+            def wait(self, timeout: float | None = None) -> int:
+                return 0
+
+        for case_name in ("thread", "turn"):
+            with (
+                self.subTest(case=case_name),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                base = Path(temporary)
+                settings = _settings(base)
+                team = TeamService(settings)
+                repo = _repo(base, f"permanent-{case_name}")
+                runtime = StubAppServerRuntime()
+                manager = ClusterManager(
+                    settings,
+                    team=team,
+                    runtime=runtime,
+                    runtime_mode="app_server",
+                )
+                try:
+                    goal = manager.create_goal(
+                        repo,
+                        objective=f"Permanent {case_name} delivery",
+                    )
+                    task = team.create_task(
+                        repo,
+                        title=f"Permanent {case_name}",
+                        description="Protocol failures are deterministic.",
+                        acceptance="The app path fails without retry.",
+                        kind="read",
+                        owner_role="team_explorer",
+                        goal_id=goal["goal_id"],
+                    )
+                    calls = 0
+
+                    def permanent_start(*args, **kwargs):
+                        nonlocal calls
+                        calls += 1
+                        raise AppServerProtocolError(
+                            "invalid JSON-RPC response"
+                        )
+
+                    def permanent_turn(*args, **kwargs):
+                        nonlocal calls
+                        calls += 1
+                        raise AppServerRPCError(
+                            "turn/start",
+                            -32602,
+                            "invalid prompt payload",
+                        )
+
+                    process = FakeProcess()
+                    real_popen = subprocess.Popen
+
+                    def popen(command, *args, **kwargs):
+                        if command and command[0] == "git":
+                            return real_popen(command, *args, **kwargs)
+                        return process
+
+                    delivery_patch = patch.object(
+                        runtime,
+                        (
+                            "start_thread"
+                            if case_name == "thread"
+                            else "start_turn"
+                        ),
+                        side_effect=(
+                            permanent_start
+                            if case_name == "thread"
+                            else permanent_turn
+                        ),
+                    )
+                    with (
+                        delivery_patch,
+                        patch(
+                            "codex_team.cluster.subprocess.Popen",
+                            side_effect=popen,
+                        ),
+                    ):
+                        dispatched = manager._dispatch_worker(
+                            manager.get_goal(goal["goal_id"]),
+                            team.get_task(task["task_id"]),
+                        )
+                    self.assertEqual(dispatched["runtime"], "exec")
+                    self.assertEqual(calls, 1)
+                    fallback = next(
+                        event
+                        for event in manager.get_goal(goal["goal_id"])["events"]
+                        if event["event_type"] == "agent_runtime_fallback"
+                        and event["data"].get("job_id")
+                        == dispatched["job_id"]
+                    )
+                    self.assertFalse(fallback["data"]["retryable"])
+                    self.assertEqual(
+                        fallback["data"]["failure_class"],
+                        "permanent",
+                    )
+                finally:
+                    manager.close()
+
     def test_app_server_start_failure_falls_back_to_exec_in_same_job(self) -> None:
         class FakeProcess:
             pid = 424242
@@ -4658,6 +5031,107 @@ class ClusterSchedulerTests(unittest.TestCase):
             self.assertNotEqual(first["thread_id"], second["thread_id"])
             self.assertEqual(len(runtime.start_threads), 2)
             self.assertEqual(runtime.resume_threads, [])
+
+    def test_cancel_guards_terminal_archived_and_stale_task_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            repo = _repo(base, "cancel-guards")
+            runtime = StubAppServerRuntime()
+            manager = ClusterManager(
+                settings,
+                team=team,
+                runtime=runtime,
+                runtime_mode="app_server",
+            )
+            try:
+                completed = manager.create_goal(
+                    repo,
+                    objective="Already complete",
+                )
+                manager.set_goal_status(
+                    completed["goal_id"],
+                    "active",
+                    reason="fixture activate",
+                )
+                manager.set_goal_status(
+                    completed["goal_id"],
+                    "completed",
+                    reason="fixture complete",
+                )
+                archived = manager.create_goal(
+                    repo,
+                    objective="Already archived",
+                )
+                manager.set_goal_status(
+                    archived["goal_id"],
+                    "failed",
+                    reason="fixture failed",
+                )
+                manager.set_goal_archived(archived["goal_id"], True)
+
+                with (
+                    patch.object(manager, "_interrupt_app_turn") as interrupt,
+                    patch.object(manager, "_terminate_exec_job") as terminate,
+                    patch.object(manager, "_settle_job_row") as settle,
+                ):
+                    with self.assertRaisesRegex(
+                        ClusterError,
+                        "terminal goal",
+                    ):
+                        manager.cancel_goal(completed["goal_id"])
+                    with self.assertRaisesRegex(
+                        ClusterError,
+                        "archived goal",
+                    ):
+                        manager.cancel_goal(archived["goal_id"])
+                interrupt.assert_not_called()
+                terminate.assert_not_called()
+                settle.assert_not_called()
+
+                active = manager.create_goal(
+                    repo,
+                    objective="Stale running task without a job",
+                )
+                task = team.create_task(
+                    repo,
+                    title="Stale running task",
+                    description="No active job owns this task.",
+                    acceptance="Cancellation must clear the running status.",
+                    kind="read",
+                    owner_role="team_explorer",
+                    goal_id=active["goal_id"],
+                )
+                with team.connection() as connection:
+                    connection.execute(
+                        """
+                        UPDATE tasks
+                        SET status = 'running', claimed_by = 'stale-owner',
+                            claim_token = 'stale-token', lease_until = ?,
+                            updated_at = ?, version = version + 1
+                        WHERE task_id = ?
+                        """,
+                        (utc_now(), utc_now(), task["task_id"]),
+                    )
+                canceled = manager.cancel_goal(
+                    active["goal_id"],
+                    reason="guard test",
+                )
+                self.assertEqual(canceled["status"], "failed")
+                self.assertFalse(
+                    [
+                        job
+                        for job in canceled["jobs"]
+                        if job["status"] in {"starting", "running"}
+                    ]
+                )
+                self.assertEqual(
+                    team.get_task(task["task_id"])["status"],
+                    "blocked",
+                )
+            finally:
+                manager.close()
 
     def test_app_server_timeout_and_cancel_interrupt_active_turns(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -5781,6 +6255,309 @@ class ClusterSchedulerTests(unittest.TestCase):
             }.issubset(tool_names)
         )
 
+    def test_native_registration_requires_owned_session_cwd_and_task(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            repo_a = _repo(base, "native-owner-a")
+            repo_b = _repo(base, "native-owner-b")
+            manager = ClusterManager(settings, team=team)
+            try:
+                goal_a = manager.create_goal(
+                    repo_a,
+                    objective="Native owner A",
+                )
+                task_a = team.create_task(
+                    repo_a,
+                    title="Native task A",
+                    description="Owned by project A.",
+                    acceptance="The session cwd matches project A.",
+                    kind="read",
+                    owner_role="team_explorer",
+                    goal_id=goal_a["goal_id"],
+                )
+                manager.set_goal_status(
+                    goal_a["goal_id"],
+                    "failed",
+                    reason="fixture boundary",
+                )
+                goal_b = manager.create_goal(
+                    repo_b,
+                    objective="Native owner B",
+                )
+                task_b = team.create_task(
+                    repo_b,
+                    title="Native task B",
+                    description="Owned by project B.",
+                    acceptance="Foreign sessions are rejected.",
+                    kind="read",
+                    owner_role="team_explorer",
+                    goal_id=goal_b["goal_id"],
+                )
+                sessions = base / "native-owner-sessions"
+                missing_thread = "01a1cafe-3001-7333-8444-955566667701"
+                foreign_thread = "01a1cafe-3002-7333-8444-955566667702"
+                mismatch_thread = "01a1cafe-3003-7333-8444-955566667703"
+                _native_session_file(
+                    sessions,
+                    missing_thread,
+                    cwd=None,
+                    task_id=task_a["task_id"],
+                )
+                _native_session_file(
+                    sessions,
+                    foreign_thread,
+                    cwd=repo_b,
+                    task_id=task_b["task_id"],
+                )
+                _native_session_file(
+                    sessions,
+                    mismatch_thread,
+                    cwd=repo_a,
+                    task_id=task_b["task_id"],
+                )
+                with patch.dict(
+                    os.environ,
+                    {"CODEX_NATIVE_SESSIONS_ROOT": str(sessions)},
+                    clear=False,
+                ):
+                    with self.assertRaisesRegex(ClusterError, "cwd is missing"):
+                        manager.register_native_agent(
+                            repo_a,
+                            missing_thread,
+                            "team_explorer",
+                            "missing-cwd",
+                            actor="native-missing",
+                            task_id=task_a["task_id"],
+                        )
+                    with self.assertRaisesRegex(
+                        ClusterError,
+                        "does not belong",
+                    ):
+                        manager.register_native_agent(
+                            repo_a,
+                            foreign_thread,
+                            "team_explorer",
+                            "foreign-cwd",
+                            actor="native-foreign",
+                            task_id=task_a["task_id"],
+                        )
+                    with self.assertRaisesRegex(
+                        ClusterError,
+                        "assignment conflicts",
+                    ):
+                        manager.register_native_agent(
+                            repo_a,
+                            mismatch_thread,
+                            "team_explorer",
+                            "task-mismatch",
+                            actor="native-mismatch",
+                            task_id=task_a["task_id"],
+                        )
+                    synced = manager.sync_native_agents(
+                        actor="native-boundary-test",
+                        project_id=goal_a["project_id"],
+                    )
+                self.assertEqual(synced["registered_count"], 0)
+                self.assertIn(
+                    missing_thread,
+                    synced["skipped_unknown_project"],
+                )
+                self.assertIn(
+                    foreign_thread,
+                    synced["skipped_unknown_project"],
+                )
+                self.assertEqual(
+                    synced["errors"][0]["thread_id"],
+                    mismatch_thread,
+                )
+                self.assertEqual(manager.list_agents(), [])
+            finally:
+                manager.close()
+
+    def test_native_project_cannot_rebind_and_refresh_preserves_assignment(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            settings = _settings(base)
+            team = TeamService(settings)
+            repo_a = _repo(base, "native-refresh-a")
+            repo_b = _repo(base, "native-refresh-b")
+            manager = ClusterManager(settings, team=team)
+            try:
+                goal_a = manager.create_goal(
+                    repo_a,
+                    objective="Native refresh A",
+                )
+                task_a = team.create_task(
+                    repo_a,
+                    title="Native refresh A",
+                    description="Same project and task.",
+                    acceptance="Refresh preserves assignment.",
+                    kind="read",
+                    owner_role="team_explorer",
+                    goal_id=goal_a["goal_id"],
+                )
+                manager.set_goal_status(
+                    goal_a["goal_id"],
+                    "failed",
+                    reason="fixture boundary",
+                )
+                goal_b = manager.create_goal(
+                    repo_b,
+                    objective="Native refresh B",
+                )
+                task_b = team.create_task(
+                    repo_b,
+                    title="Native refresh B",
+                    description="Foreign project task.",
+                    acceptance="Rebinding is rejected.",
+                    kind="read",
+                    owner_role="team_explorer",
+                    goal_id=goal_b["goal_id"],
+                )
+                thread_id = "01a1cafe-4001-7333-8444-955566661001"
+                sessions = base / "native-refresh-sessions"
+                path = _native_session_file(
+                    sessions,
+                    thread_id,
+                    cwd=repo_a,
+                    task_id=task_a["task_id"],
+                    role="team_explorer",
+                )
+                old = time.time() - 3600
+                os.utime(path, (old, old))
+                with patch.dict(
+                    os.environ,
+                    {"CODEX_NATIVE_SESSIONS_ROOT": str(sessions)},
+                    clear=False,
+                ):
+                    registered = manager.register_native_agent(
+                        repo_a,
+                        thread_id,
+                        "team_explorer",
+                        "native-refresh",
+                        actor="native-refresher",
+                        task_id=task_a["task_id"],
+                    )
+                native = registered["agent"]
+                self.assertTrue(native["session_stale"])
+                now = utc_now()
+                with team.connection() as connection:
+                    connection.execute(
+                        """
+                        INSERT INTO cluster_jobs(
+                            job_id, goal_id, task_id, kind, role, status,
+                            attempt, log_path, output_path, started_at,
+                            finished_at
+                        ) VALUES (
+                            'J-NATIVE-REFRESH', ?, ?, 'worker',
+                            'team_explorer', 'completed', 1, ?, ?, ?, ?
+                        )
+                        """,
+                        (
+                            goal_a["goal_id"],
+                            task_a["task_id"],
+                            str(base / "native.log"),
+                            str(base / "native.md"),
+                            now,
+                            now,
+                        ),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE cluster_agents
+                        SET current_job_id = 'J-NATIVE-REFRESH'
+                        WHERE agent_id = ?
+                        """,
+                        (native["agent_id"],),
+                    )
+
+                _native_session_file(
+                    sessions,
+                    thread_id,
+                    cwd=repo_a,
+                    task_id=task_a["task_id"],
+                    role="team_explorer",
+                )
+                with patch.dict(
+                    os.environ,
+                    {"CODEX_NATIVE_SESSIONS_ROOT": str(sessions)},
+                    clear=False,
+                ):
+                    first_sync = manager.sync_native_agents(
+                        actor="native-refresh-test",
+                        project_id=goal_a["project_id"],
+                    )
+                    second_sync = manager.sync_native_agents(
+                        actor="native-refresh-test",
+                        project_id=goal_a["project_id"],
+                    )
+                self.assertEqual(
+                    first_sync["refreshed_count"],
+                    1,
+                    first_sync,
+                )
+                refreshed = AgentPool(settings).list_agents(
+                    goal_a["project_id"],
+                )[0]
+                self.assertEqual(refreshed["project_id"], goal_a["project_id"])
+                self.assertEqual(
+                    refreshed["current_task_id"],
+                    task_a["task_id"],
+                )
+                self.assertEqual(
+                    refreshed["current_job_id"],
+                    "J-NATIVE-REFRESH",
+                )
+                self.assertFalse(refreshed["session_stale"])
+                self.assertEqual(refreshed["lifecycle"], "active")
+                self.assertIsNotNone(refreshed["last_seen_at"])
+                self.assertEqual(second_sync["refreshed_count"], 0)
+                self.assertIn(thread_id, second_sync["skipped_existing"])
+
+                _native_session_file(
+                    sessions,
+                    thread_id,
+                    cwd=repo_b,
+                    task_id=task_b["task_id"],
+                    role="team_explorer",
+                )
+                with patch.dict(
+                    os.environ,
+                    {"CODEX_NATIVE_SESSIONS_ROOT": str(sessions)},
+                    clear=False,
+                ):
+                    with self.assertRaisesRegex(
+                        ClusterError,
+                        "different project",
+                    ):
+                        manager.register_native_agent(
+                            repo_b,
+                            thread_id,
+                            "team_explorer",
+                            "native-refresh",
+                            actor="native-rebind",
+                            task_id=task_b["task_id"],
+                        )
+                unchanged = next(
+                    agent
+                    for agent in manager.list_agents()
+                    if agent["thread_id"] == thread_id
+                )
+                self.assertEqual(
+                    unchanged["project_id"],
+                    goal_a["project_id"],
+                )
+                self.assertEqual(
+                    unchanged["current_task_id"],
+                    task_a["task_id"],
+                )
+            finally:
+                manager.close()
+
     def test_mcp_agent_and_workstream_tools_round_trip_database_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
@@ -5865,26 +6642,12 @@ class ClusterSchedulerTests(unittest.TestCase):
             )
             thread_id = "01a1cafe-2222-7333-8444-955566667777"
             sessions = base / "native-sessions"
-            session = sessions / f"rollout-{thread_id}.jsonl"
-            session.parent.mkdir(parents=True)
-            session.write_text(
-                json.dumps(
-                    {
-                        "type": "response_item",
-                        "payload": {
-                            "type": "message",
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "input_text",
-                                    "text": f"Execute {task['task_id']}",
-                                }
-                            ],
-                        },
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
+            _native_session_file(
+                sessions,
+                thread_id,
+                cwd=repo,
+                task_id=task["task_id"],
+                role="team_explorer",
             )
             with patch.dict(
                 os.environ,
