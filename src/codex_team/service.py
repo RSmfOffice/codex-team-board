@@ -1785,6 +1785,7 @@ class TeamService:
                         "total_cached_input_tokens",
                         "total_uncached_input_tokens",
                         "context_tokens",
+                        "output_tokens",
                     )
                     if usage_status in {"unavailable", "unknown"}:
                         for field in (

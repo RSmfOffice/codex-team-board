@@ -88,6 +88,8 @@ TICK_RETRY_BUDGET = 4
 TICK_PHASE_MAX_ATTEMPTS = 2
 TICK_PHASE_RETRY_BASE_SECONDS = 0.05
 TICK_PHASE_RETRY_MAX_SECONDS = 0.5
+TICK_CONTROL_BACKOFF_BASE_SECONDS = 5.0
+TICK_CONTROL_BACKOFF_MAX_SECONDS = 60.0
 LEAD_DEVELOPER_INSTRUCTIONS = """You are the managed Lead for an automated
 Codex work cluster. Do not spawn subagents; the deterministic teamd dispatcher
 launches Workers. You may use shell tools and the stable codexTeamBoard Core
@@ -2131,11 +2133,25 @@ class ClusterManager:
                 if previous
                 else 1
             )
+            cross_tick_delay = (
+                min(
+                    TICK_CONTROL_BACKOFF_BASE_SECONDS
+                    * (2 ** (consecutive - 1)),
+                    TICK_CONTROL_BACKOFF_MAX_SECONDS,
+                )
+                if name == "control"
+                else 0.0
+            )
             self._phase_failure_state[name] = {
                 "signature": signature,
                 "failures": consecutive,
                 "error_code": first_error["error_code"],
                 "redacted_error": first_error["redacted_error"],
+                "next_retry_at": (
+                    time.monotonic() + cross_tick_delay
+                    if cross_tick_delay
+                    else 0.0
+                ),
             }
             can_retry = bool(
                 allow_retry
@@ -2171,6 +2187,45 @@ class ClusterManager:
                     }
                 )
                 return False
+
+            previous_failure = self._phase_failure_state.get(name)
+            if name == "control" and previous_failure:
+                next_retry_at = float(
+                    previous_failure.get("next_retry_at") or 0
+                )
+                now = time.monotonic()
+                if next_retry_at > now:
+                    normalized = normalize_errors(
+                        name,
+                        {
+                            "source": "phase_backoff",
+                            "error_code": str(
+                                previous_failure.get("error_code")
+                                or "control_phase_failure"
+                            ),
+                            "redacted_error": str(
+                                previous_failure.get("redacted_error")
+                                or "control phase backoff active"
+                            ),
+                        },
+                    )
+                    append_phase(
+                        name,
+                        ok=False,
+                        attempts=0,
+                        duration_ms=0.0,
+                        counts={
+                            "count": 0,
+                            "backoff_suppressed": True,
+                            "retry_in_seconds": round(
+                                next_retry_at - now,
+                                3,
+                            ),
+                        },
+                        phase_errors=normalized,
+                        retry_suppressed=True,
+                    )
+                    return False
 
             started = time.perf_counter()
             attempts = 0
@@ -2236,6 +2291,7 @@ class ClusterManager:
                         name,
                         normalized,
                         attempts,
+                        allow_retry=name != "recover",
                     )
                     if can_retry:
                         retry_used += 1

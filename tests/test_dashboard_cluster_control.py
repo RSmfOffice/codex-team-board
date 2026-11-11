@@ -812,6 +812,45 @@ class DashboardClusterControlTests(unittest.TestCase):
         self.assertIsNone(unknown_usage_agent["last_cached_input_tokens"])
         self.assertIsNone(unknown_usage_agent["last_uncached_input_tokens"])
         self.assertIsNone(unknown_usage_agent["context_tokens"])
+        self.assertIsNone(unknown_usage_agent["output_tokens"])
+
+        with self.team.connection() as connection:
+            connection.execute(
+                """
+                UPDATE cluster_agents
+                SET native_usage_status = 'partial',
+                    native_usage_missing_fields = '["turn_count","output_tokens"]',
+                    last_input_tokens = 12,
+                    output_tokens = 0
+                WHERE thread_id = ?
+                """,
+                (unknown_thread_id,),
+            )
+        partial_board = self.get("/api/board")
+        partial_unknown_output = next(
+            agent
+            for agent in partial_board["cluster_agents"]
+            if agent["thread_id"] == unknown_thread_id
+        )
+        self.assertIsNone(partial_unknown_output["output_tokens"])
+
+        with self.team.connection() as connection:
+            connection.execute(
+                """
+                UPDATE cluster_agents
+                SET native_usage_missing_fields = '["turn_count"]',
+                    output_tokens = 7
+                WHERE thread_id = ?
+                """,
+                (unknown_thread_id,),
+            )
+        known_output_board = self.get("/api/board")
+        known_output = next(
+            agent
+            for agent in known_output_board["cluster_agents"]
+            if agent["thread_id"] == unknown_thread_id
+        )
+        self.assertEqual(known_output["output_tokens"], 7)
 
     def test_sync_native_refreshes_usage_on_same_second_mtime_change(
         self,
