@@ -3223,7 +3223,7 @@ class TeamService:
                     normalized_token,
                     actor,
                 )
-            elif task["status"] == "running" or _CURRENT_MCP_CALL.get():
+            elif task["status"] == "running":
                 actor = self.authorize_privileged_actor(
                     actor,
                     operation="task block",
