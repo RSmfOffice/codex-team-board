@@ -63,6 +63,9 @@ let refreshQueued = false;
 let queuedForceRender = false;
 let lastBoardSignature = "";
 let lastBoardRevision = "";
+let lastSummaryRevision = "";
+let summaryEtag = "";
+let boardEtag = "";
 let detailRequestVersion = 0;
 let lastNativeAgentSyncAt = 0;
 let nativeAgentSyncInFlight = false;
@@ -272,6 +275,39 @@ async function requestJson(url, options = {}, label = "request") {
   return data;
 }
 
+async function requestRevisableJson(
+  url,
+  options = {},
+  label = "request",
+  etag = "",
+) {
+  const headers = { ...(options.headers || {}) };
+  if (etag) headers["If-None-Match"] = etag;
+  const response = await fetch(url, { ...options, headers });
+  const responseEtag = response.headers?.get("ETag") || etag;
+  if (response.status === 304) {
+    return {
+      notModified: true,
+      data: null,
+      etag: responseEtag,
+    };
+  }
+  let data = {};
+  try {
+    data = await response.json();
+  } catch {
+    data = {};
+  }
+  if (!response.ok) {
+    throw new Error(data.error || `${label} ${response.status}`);
+  }
+  return {
+    notModified: false,
+    data,
+    etag: responseEtag,
+  };
+}
+
 function fillProjectSelect(select, projects, options) {
   const {
     allLabel = "",
@@ -410,6 +446,13 @@ function updateArchiveButton() {
   button.classList.toggle("restore", Boolean(project?.archived_at));
 }
 
+function resetDashboardRevisionCache() {
+  lastBoardRevision = "";
+  lastSummaryRevision = "";
+  summaryEtag = "";
+  boardEtag = "";
+}
+
 function syncProjectSelection(projectId, { refresh = true } = {}) {
   selectedProject = projectsById.has(projectId) ? projectId : "";
   const topSelect = document.getElementById("project-select");
@@ -421,7 +464,7 @@ function syncProjectSelection(projectId, { refresh = true } = {}) {
     clusterSelect.value = selectedProject;
   }
   closeDetail();
-  lastBoardRevision = "";
+  resetDashboardRevisionCache();
   if (refresh) void requestImmediateRefresh();
 }
 
@@ -1230,24 +1273,38 @@ async function pollBoard({ forceRender = false } = {}) {
     if (selectedProject) params.set("project_id", selectedProject);
     if (includeArchived) params.set("include_archived", "1");
     const suffix = params.size ? `?${params.toString()}` : "";
-    const summary = await requestJson(
+    const summaryResponse = await requestRevisableJson(
       `/api/summary${suffix}`,
       { cache: "no-store", signal: activeRequest.signal },
       "summary",
+      summaryEtag,
     );
-    const revision = String(summary.revision || "");
+    let revision = lastSummaryRevision;
+    if (!summaryResponse.notModified) {
+      summaryEtag = summaryResponse.etag;
+      revision = String(summaryResponse.data.revision || "");
+      lastSummaryRevision = revision;
+    } else if (!revision) {
+      summaryEtag = "";
+      throw new Error("summary returned 304 without a cached revision");
+    }
     const boardRequired = forceRender
       || !lastBoardRevision
       || revision !== lastBoardRevision
       || tasksById.size === 0;
     if (boardRequired) {
-      const data = await requestJson(
+      const boardResponse = await requestRevisableJson(
         `/api/board${suffix}`,
         { cache: "no-store", signal: activeRequest.signal },
         "board",
+        forceRender || tasksById.size === 0 ? "" : boardEtag,
       );
-      renderBoard(data, { force: forceRender });
-      lastBoardRevision = String(data.revision || revision);
+      if (!boardResponse.notModified) {
+        const data = boardResponse.data;
+        boardEtag = boardResponse.etag;
+        renderBoard(data, { force: forceRender });
+        lastBoardRevision = String(data.revision || revision);
+      }
     }
     const downBefore = pollFailures > 0;
     pollFailures = 0;
@@ -1300,7 +1357,7 @@ function handleVisibilityChange() {
     return;
   }
   refreshQueued = false;
-  lastBoardRevision = "";
+  resetDashboardRevisionCache();
   void pollBoard();
 }
 
@@ -1547,7 +1604,7 @@ function initializeDashboard() {
     const project = projectsById.get(selectedProject);
     if (!includeArchived && project?.archived_at) selectedProject = "";
     projectsLoaded = false;
-    lastBoardRevision = "";
+    resetDashboardRevisionCache();
     void requestImmediateRefresh();
   });
   document.getElementById("archive-target").addEventListener(
@@ -1579,6 +1636,7 @@ if (typeof window !== "undefined") {
     nextActionText,
     renderBoard,
     renderAgentThreads,
+    requestRevisableJson,
     summaryNumber,
     tokenText,
     waitDurationText,

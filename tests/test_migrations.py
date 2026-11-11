@@ -5,7 +5,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from codex_team.db import SCHEMA_VERSION, connect
+from codex_team.db import (
+    DASHBOARD_REVISION_TABLES,
+    SCHEMA_VERSION,
+    connect,
+    read_dashboard_revision,
+)
 
 
 class MigrationTests(unittest.TestCase):
@@ -560,6 +565,109 @@ class MigrationTests(unittest.TestCase):
                         "PRAGMA user_version"
                     ).fetchone()[0],
                     SCHEMA_VERSION,
+                )
+            finally:
+                reopened.close()
+
+    def test_schema_25_revision_ledger_migrates_idempotently(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "revision-v24.sqlite"
+            connection = connect(path)
+            try:
+                now = "2030-01-01T00:00:00Z"
+                connection.execute(
+                    """
+                    INSERT INTO projects(
+                        project_id, name, root_path, created_at, updated_at
+                    ) VALUES ('P-REV', 'Revision Project', 'D:/revision',
+                              ?, ?)
+                    """,
+                    (now, now),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO tasks(
+                        task_id, project_id, title, description, acceptance,
+                        kind, status, priority, owner_role, created_at,
+                        updated_at
+                    ) VALUES (
+                        'T-REV', 'P-REV', 'Preserved task',
+                        'Migration fixture', 'No data loss', 'read', 'ready',
+                        1, 'team_explorer', ?, ?
+                    )
+                    """,
+                    (now, now),
+                )
+                connection.commit()
+                triggers = [
+                    str(row["name"])
+                    for row in connection.execute(
+                        """
+                        SELECT name FROM sqlite_master
+                        WHERE type = 'trigger'
+                          AND name LIKE 'trg_dashboard_revision_%'
+                        """
+                    ).fetchall()
+                ]
+                for trigger in triggers:
+                    connection.execute(f"DROP TRIGGER {trigger}")
+                connection.execute("DROP TABLE dashboard_revision")
+                connection.execute(
+                    "DELETE FROM schema_migrations WHERE version = ?",
+                    (SCHEMA_VERSION,),
+                )
+                connection.execute("PRAGMA user_version = 24")
+                connection.commit()
+            finally:
+                connection.close()
+
+            upgraded = connect(path)
+            try:
+                self.assertEqual(
+                    upgraded.execute("PRAGMA user_version").fetchone()[0],
+                    SCHEMA_VERSION,
+                )
+                task = upgraded.execute(
+                    """
+                    SELECT title FROM tasks WHERE task_id = 'T-REV'
+                    """
+                ).fetchone()
+                self.assertEqual(task["title"], "Preserved task")
+                self.assertGreaterEqual(read_dashboard_revision(upgraded), 0)
+                for table in DASHBOARD_REVISION_TABLES:
+                    count = upgraded.execute(
+                        """
+                        SELECT COUNT(*) AS count
+                        FROM sqlite_master
+                        WHERE type = 'trigger' AND tbl_name = ?
+                        """,
+                        (table,),
+                    ).fetchone()["count"]
+                    self.assertEqual(int(count), 3)
+                upgraded.execute(
+                    """
+                    UPDATE tasks
+                    SET title = 'Post-migration update'
+                    WHERE task_id = 'T-REV'
+                    """
+                )
+                upgraded.commit()
+                revision = read_dashboard_revision(upgraded)
+            finally:
+                upgraded.close()
+
+            reopened = connect(path)
+            try:
+                self.assertEqual(read_dashboard_revision(reopened), revision)
+                task = reopened.execute(
+                    """
+                    SELECT title FROM tasks WHERE task_id = 'T-REV'
+                    """
+                ).fetchone()
+                self.assertEqual(task["title"], "Post-migration update")
+                self.assertEqual(
+                    reopened.execute("PRAGMA integrity_check").fetchone()[0],
+                    "ok",
                 )
             finally:
                 reopened.close()

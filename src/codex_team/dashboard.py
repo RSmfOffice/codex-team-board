@@ -86,6 +86,19 @@ def _contextual_revision(base: str, context: object) -> str:
     return f"{base}:api-{digest}"
 
 
+def _dashboard_context(
+    project_id: str | None,
+    include_archived: bool,
+    runtime: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "scope": "dashboard",
+        "project_id": project_id or "",
+        "include_archived": bool(include_archived),
+        "cluster_runtime": runtime,
+    }
+
+
 def _authority_parts(value: str) -> tuple[str, int | None]:
     parsed = urlsplit(f"//{value}")
     if (
@@ -206,7 +219,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             data["cluster_runtime"] = runtime
             data["revision"] = _contextual_revision(
                 data["revision"],
-                runtime,
+                _dashboard_context(
+                    project_id,
+                    include_archived,
+                    runtime,
+                ),
             )
             self._send_revisable_json(data)
             return
@@ -222,7 +239,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             data["cluster_runtime"] = runtime
             data["revision"] = _contextual_revision(
                 data["revision"],
-                runtime,
+                _dashboard_context(
+                    project_id,
+                    include_archived,
+                    runtime,
+                ),
             )
             self._send_revisable_json(data)
             return
