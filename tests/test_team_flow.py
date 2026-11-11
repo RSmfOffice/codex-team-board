@@ -2209,6 +2209,8 @@ class TeamFlowTests(unittest.TestCase):
                         {
                             "type": "session_meta",
                             "payload": {
+                                "id": thread_id,
+                                "cwd": str(self.repo),
                                 "source": {
                                     "subagent": {
                                         "thread_spawn": {
@@ -2401,20 +2403,35 @@ class TeamFlowTests(unittest.TestCase):
         session = sessions / f"rollout-{thread_id}.jsonl"
         session.parent.mkdir(parents=True)
         session.write_text(
-            json.dumps(
-                {
-                    "type": "response_item",
-                    "payload": {
-                        "type": "message",
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "input_text",
-                                "text": "Only AGENTS and environment context",
-                            }
-                        ],
-                    },
-                }
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "session_meta",
+                            "payload": {
+                                "id": thread_id,
+                                "cwd": str(self.repo),
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "response_item",
+                            "payload": {
+                                "type": "message",
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "input_text",
+                                        "text": (
+                                            "Only AGENTS and environment context"
+                                        ),
+                                    }
+                                ],
+                            },
+                        }
+                    ),
+                ]
             )
             + "\n",
             encoding="utf-8",
@@ -2521,6 +2538,7 @@ class TeamFlowTests(unittest.TestCase):
                             "type": "session_meta",
                             "payload": {
                                 "id": thread_id,
+                                "cwd": str(self.repo),
                                 "task_id": assigned["task_id"],
                             },
                         }
@@ -2579,6 +2597,7 @@ class TeamFlowTests(unittest.TestCase):
                     "type": "session_meta",
                     "payload": {
                         "id": thread_id,
+                        "cwd": str(self.repo),
                         "source": {
                             "subagent": {
                                 "thread_spawn": {
@@ -2632,6 +2651,7 @@ class TeamFlowTests(unittest.TestCase):
                     "type": "session_meta",
                     "payload": {
                         "id": thread_id,
+                        "cwd": str(self.repo),
                         "agent_role": "team_explorer",
                     },
                 }
