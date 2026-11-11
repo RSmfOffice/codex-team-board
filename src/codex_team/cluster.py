@@ -1436,6 +1436,12 @@ class ClusterManager:
                 inspection.get("prompt_status") or "unknown"
             ),
             native_session_path=inspection.get("session_path"),
+            native_session_mtime_ns=int(
+                inspection.get("session_mtime_ns") or 0
+            ),
+            native_session_size=int(
+                inspection.get("session_size") or 0
+            ),
             last_seen_at=inspection.get("last_seen_at"),
             usage=(
                 inspection.get("usage")
@@ -1597,6 +1603,42 @@ class ClusterManager:
                 ),
                 separators=(",", ":"),
             )
+            usage_status = str(usage.get("status") or "unavailable")
+            existing_usage_status = str(
+                existing.get("native_usage_status") or "unavailable"
+            )
+            effective_usage_status = (
+                "stale"
+                if usage_status == "unavailable"
+                and existing_usage_status
+                in {"available", "partial", "stale"}
+                else usage_status
+            )
+            missing_usage_fields = {
+                str(field)
+                for field in usage.get("missing_fields", [])
+                if str(field).strip()
+            }
+            usage_changed = False
+            if effective_usage_status in {"available", "partial", "stale"}:
+                usage_fields = (
+                    "last_input_tokens",
+                    "last_cached_input_tokens",
+                    "last_uncached_input_tokens",
+                    "total_input_tokens",
+                    "total_cached_input_tokens",
+                    "total_uncached_input_tokens",
+                    "output_tokens",
+                    "context_tokens",
+                    "model_context_window",
+                    "turn_count",
+                    "last_turn_id",
+                )
+                usage_changed = any(
+                    existing.get(field) != usage.get(field)
+                    for field in usage_fields
+                    if field not in missing_usage_fields
+                )
             return any(
                 (
                     existing.get("last_seen_at")
@@ -1611,8 +1653,20 @@ class ClusterManager:
                     bool(int(existing.get("task_assignment_ambiguous") or 0))
                     != bool(item.get("task_assignment_ambiguous")),
                     existing.get("task_candidates_json") != item_candidates,
-                    existing.get("native_usage_status")
-                    != usage.get("status"),
+                    existing_usage_status != effective_usage_status,
+                    int(existing.get("native_session_mtime_ns") or 0)
+                    != int(
+                        item.get("session_mtime_ns")
+                        or item.get("native_session_mtime_ns")
+                        or 0
+                    ),
+                    int(existing.get("native_session_size") or 0)
+                    != int(
+                        item.get("session_size")
+                        or item.get("native_session_size")
+                        or 0
+                    ),
+                    usage_changed,
                 )
             )
 
@@ -2053,6 +2107,53 @@ class ClusterManager:
                 failed_phases.append(name)
             errors.extend(normalized)
 
+        def record_failure(
+            name: str,
+            normalized: list[dict[str, Any]],
+            attempts: int,
+            *,
+            allow_retry: bool = True,
+        ) -> tuple[bool, bool, float]:
+            first_error = normalized[0]
+            signature = hashlib.sha256(
+                (
+                    f"{first_error['error_code']}\0"
+                    f"{first_error['redacted_error']}"
+                ).encode("utf-8")
+            ).hexdigest()[:16]
+            previous = self._phase_failure_state.get(name)
+            same_signature = bool(
+                previous
+                and previous.get("signature") == signature
+            )
+            consecutive = (
+                int(previous.get("failures") or 0) + 1
+                if previous
+                else 1
+            )
+            self._phase_failure_state[name] = {
+                "signature": signature,
+                "failures": consecutive,
+                "error_code": first_error["error_code"],
+                "redacted_error": first_error["redacted_error"],
+            }
+            can_retry = bool(
+                allow_retry
+                and attempts < TICK_PHASE_MAX_ATTEMPTS
+                and retry_used < TICK_RETRY_BUDGET
+                and not same_signature
+            )
+            delay = min(
+                TICK_PHASE_RETRY_BASE_SECONDS
+                * (2 ** (consecutive - 1)),
+                TICK_PHASE_RETRY_MAX_SECONDS,
+            )
+            return (
+                can_retry,
+                bool(previous and same_signature),
+                delay,
+            )
+
         def run_phase(
             name: str,
             action: Any,
@@ -2075,7 +2176,6 @@ class ClusterManager:
             attempts = 0
             while attempts < TICK_PHASE_MAX_ATTEMPTS:
                 attempts += 1
-                retried_this_phase = False
                 try:
                     result = action()
                     if isinstance(result, Mapping):
@@ -2091,6 +2191,19 @@ class ClusterManager:
                                 name,
                                 f"{name} phase reported degraded work",
                             )
+                        can_retry, suppressed, delay = record_failure(
+                            name,
+                            normalized,
+                            attempts,
+                            # Worktree recovery may deliberately block a
+                            # Task on its first uncertain result. Do not
+                            # retry that returned error in the same tick.
+                            allow_retry=name != "recover",
+                        )
+                        if can_retry:
+                            retry_used += 1
+                            time.sleep(delay)
+                            continue
                         append_phase(
                             name,
                             ok=False,
@@ -2100,6 +2213,7 @@ class ClusterManager:
                             ) * 1000,
                             counts=counts,
                             phase_errors=normalized,
+                            retry_suppressed=suppressed,
                         )
                         return False
                     self._phase_failure_state.pop(name, None)
@@ -2118,42 +2232,13 @@ class ClusterManager:
                         name,
                         self._phase_error_record(name, exc),
                     )
-                    first_error = normalized[0]
-                    signature = hashlib.sha256(
-                        (
-                            f"{first_error['error_code']}\0"
-                            f"{first_error['redacted_error']}"
-                        ).encode("utf-8")
-                    ).hexdigest()[:16]
-                    previous = self._phase_failure_state.get(name)
-                    same_signature = bool(
-                        previous
-                        and previous.get("signature") == signature
-                    )
-                    consecutive = (
-                        int(previous.get("failures") or 0) + 1
-                        if previous
-                        else 1
-                    )
-                    self._phase_failure_state[name] = {
-                        "signature": signature,
-                        "failures": consecutive,
-                        "error_code": first_error["error_code"],
-                        "redacted_error": first_error["redacted_error"],
-                    }
-                    can_retry = bool(
-                        attempts < TICK_PHASE_MAX_ATTEMPTS
-                        and retry_used < TICK_RETRY_BUDGET
-                        and not same_signature
+                    can_retry, suppressed, delay = record_failure(
+                        name,
+                        normalized,
+                        attempts,
                     )
                     if can_retry:
                         retry_used += 1
-                        retried_this_phase = True
-                        delay = min(
-                            TICK_PHASE_RETRY_BASE_SECONDS
-                            * (2 ** (consecutive - 1)),
-                            TICK_PHASE_RETRY_MAX_SECONDS,
-                        )
                         time.sleep(delay)
                         continue
                     append_phase(
@@ -2164,10 +2249,7 @@ class ClusterManager:
                             time.perf_counter() - started
                         ) * 1000,
                         phase_errors=normalized,
-                        retry_suppressed=(
-                            bool(previous) and same_signature
-                            and not retried_this_phase
-                        ),
+                        retry_suppressed=suppressed,
                     )
                     return False
             return False

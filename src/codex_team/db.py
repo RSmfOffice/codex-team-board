@@ -6,7 +6,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 
 # Shared revision contract:
 # - `dashboard_revision.revision` is a non-negative, monotonically increasing
@@ -230,6 +230,8 @@ CREATE TABLE IF NOT EXISTS cluster_agents (
     prompt_hash TEXT NOT NULL DEFAULT '',
     prompt_status TEXT NOT NULL DEFAULT 'unknown',
     native_session_path TEXT,
+    native_session_mtime_ns INTEGER NOT NULL DEFAULT 0,
+    native_session_size INTEGER NOT NULL DEFAULT 0,
     last_seen_at TEXT,
     identity_source TEXT NOT NULL DEFAULT 'unknown',
     identity_confidence TEXT NOT NULL DEFAULT 'unknown',
@@ -261,6 +263,7 @@ CREATE TABLE IF NOT EXISTS cluster_agents (
     total_cached_input_tokens INTEGER NOT NULL DEFAULT 0,
     total_uncached_input_tokens INTEGER NOT NULL DEFAULT 0,
     context_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
     turn_count INTEGER NOT NULL DEFAULT 0,
     last_used_at TEXT,
     last_loaded_at TEXT,
@@ -488,6 +491,8 @@ CLUSTER_AGENT_MIGRATION_COLUMNS = {
     "prompt_hash": "TEXT NOT NULL DEFAULT ''",
     "prompt_status": "TEXT NOT NULL DEFAULT 'unknown'",
     "native_session_path": "TEXT",
+    "native_session_mtime_ns": "INTEGER NOT NULL DEFAULT 0",
+    "native_session_size": "INTEGER NOT NULL DEFAULT 0",
     "last_seen_at": "TEXT",
     "identity_source": "TEXT NOT NULL DEFAULT 'unknown'",
     "identity_confidence": "TEXT NOT NULL DEFAULT 'unknown'",
@@ -500,6 +505,7 @@ CLUSTER_AGENT_MIGRATION_COLUMNS = {
     "session_stale": "INTEGER NOT NULL DEFAULT 1",
     "native_usage_status": "TEXT NOT NULL DEFAULT 'unavailable'",
     "native_usage_missing_fields": "TEXT NOT NULL DEFAULT '[]'",
+    "output_tokens": "INTEGER NOT NULL DEFAULT 0",
 }
 
 

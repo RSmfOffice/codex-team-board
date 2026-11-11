@@ -91,11 +91,32 @@ def _dashboard_context(
     include_archived: bool,
     runtime: dict[str, object],
 ) -> dict[str, object]:
+    tick = runtime.get("tick")
+    stable_tick: dict[str, object] = {}
+    if isinstance(tick, dict):
+        failed_phases = tick.get("failed_phases")
+        if tick.get("degraded") or tick.get("error_code") or failed_phases:
+            stable_tick = {
+                "degraded": bool(tick.get("degraded")),
+                "failed_phases": (
+                    [str(item) for item in failed_phases]
+                    if isinstance(failed_phases, (list, tuple))
+                    else []
+                ),
+                "error_code": str(tick.get("error_code") or ""),
+            }
     return {
         "scope": "dashboard",
         "project_id": project_id or "",
         "include_archived": bool(include_archived),
-        "cluster_runtime": runtime,
+        "cluster_runtime": {
+            "runtime": runtime.get("runtime"),
+            "thread_reuse": bool(runtime.get("thread_reuse")),
+            "running": bool(runtime.get("running")),
+            "config_mismatch": bool(runtime.get("config_mismatch")),
+            "version": runtime.get("version"),
+            **({"tick": stable_tick} if stable_tick else {}),
+        },
     }
 
 

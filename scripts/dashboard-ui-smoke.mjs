@@ -145,7 +145,11 @@ const clusterSummaryCss = between(
   ".cluster-summary {",
   ".cluster-metric {",
 );
-expectText(clusterSummaryCss, "repeat(8, minmax(0, 1fr))", "cluster metrics");
+expectText(
+  clusterSummaryCss,
+  "repeat(auto-fit, minmax(160px, 1fr))",
+  "cluster metrics",
+);
 const boardCss = between(css, ".board {", ".lane {");
 expectText(boardCss, "repeat(5, minmax(0, 1fr))", "board layout");
 

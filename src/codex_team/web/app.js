@@ -1233,6 +1233,16 @@ function buildBoardSignature(data) {
   if (normalized.cluster_summary) {
     delete normalized.cluster_summary.oldest_heartbeat_age_seconds;
   }
+  const runtimeTick = normalized.cluster_runtime?.tick;
+  if (runtimeTick && typeof runtimeTick === "object") {
+    normalized.cluster_runtime.tick = {
+      degraded: Boolean(runtimeTick.degraded),
+      failed_phases: Array.isArray(runtimeTick.failed_phases)
+        ? runtimeTick.failed_phases.map(String)
+        : [],
+      error_code: String(runtimeTick.error_code || ""),
+    };
+  }
   for (const task of normalized.tasks || []) {
     delete task.claim_wait_seconds;
   }
