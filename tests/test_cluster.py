@@ -762,6 +762,8 @@ class ClusterSchedulerTests(unittest.TestCase):
                         result["skipped_phases"],
                     )
                     self.assertTrue(mocks["dispatch"].called)
+                if phase_name == "recover":
+                    self.assertEqual(mocks["recover"].call_count, 1)
 
     def test_tick_retry_budget_and_stable_signature_do_not_hot_loop(
         self,
@@ -875,6 +877,10 @@ class ClusterSchedulerTests(unittest.TestCase):
                 }
                 result = manager.tick()
                 second_result = manager.tick()
+                manager._phase_failure_state["control"][
+                    "next_retry_at"
+                ] = 0
+                third_result = manager.tick()
 
         self.assertEqual(mocks["reset"].call_count, 3)
         self.assertEqual(mocks["archive"].call_count, 3)
@@ -885,16 +891,23 @@ class ClusterSchedulerTests(unittest.TestCase):
         self.assertIn("archive denied", errors)
         self.assertNotIn("dispatch", result["skipped_phases"])
         self.assertTrue(safe_prepare.called)
-        self.assertEqual(mocks["dispatch"].call_count, 2)
+        self.assertEqual(mocks["dispatch"].call_count, 3)
         mocks["dispatch"].assert_called_with([safe_goal])
         second_control = next(
             phase
             for phase in second_result["phases"]
             if phase["name"] == "control"
         )
-        self.assertEqual(second_control["attempts"], 1)
+        self.assertEqual(second_control["attempts"], 0)
         self.assertTrue(second_control["retry_suppressed"])
         self.assertEqual(second_result["retry_used"], 0)
+        third_control = next(
+            phase
+            for phase in third_result["phases"]
+            if phase["name"] == "control"
+        )
+        self.assertEqual(third_control["attempts"], 1)
+        self.assertTrue(third_control["retry_suppressed"])
 
     def test_tick_worktree_uncertain_recovery_requires_manual_action(
         self,
