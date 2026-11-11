@@ -17,7 +17,7 @@ from codex_team.cluster import ClusterError, ClusterManager
 from codex_team.config import Settings
 from codex_team.dashboard import build_server
 from codex_team.db import SCHEMA_VERSION, utc_now
-from codex_team.service import TeamService
+from codex_team.service import TeamError, TeamService
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -352,6 +352,23 @@ class DashboardClusterControlTests(unittest.TestCase):
                 if agent["thread_id"] == thread_id
             )
             self.assertEqual(native["runtime"], "native")
+            self.assertEqual(native["role"], "team_reviewer")
+            self.assertEqual(
+                native["identity_source"],
+                "agent_path_inference",
+            )
+            self.assertEqual(native["identity_confidence"], "low")
+            self.assertEqual(native["lifecycle"], "active")
+            self.assertFalse(native["session_stale"])
+            self.assertEqual(
+                native["assignment_source"],
+                "unique_session_candidate",
+            )
+            self.assertEqual(
+                native["task_candidates"],
+                [task["task_id"]],
+            )
+            self.assertFalse(native["task_assignment_ambiguous"])
             self.assertEqual(native["prompt_status"], "delivered")
             self.assertEqual(native["current_task_id"], task["task_id"])
             self.assertFalse(native["usage_available"])
@@ -359,6 +376,11 @@ class DashboardClusterControlTests(unittest.TestCase):
             self.assertIsNone(native["last_cached_input_tokens"])
             self.assertIsNone(native["last_uncached_input_tokens"])
             self.assertIsNone(native["context_tokens"])
+            self.assertIsNone(native["turn_count"])
+            self.assertEqual(
+                native["native_usage_status"],
+                "unavailable",
+            )
 
             with session_path.open("a", encoding="utf-8") as stream:
                 stream.write(
@@ -406,7 +428,15 @@ class DashboardClusterControlTests(unittest.TestCase):
             self.assertEqual(usage_agent["last_uncached_input_tokens"], 200)
             self.assertEqual(usage_agent["context_tokens"], 1000)
             self.assertEqual(usage_agent["model_context_window"], 996147)
-            self.assertEqual(usage_agent["turn_count"], 1)
+            self.assertEqual(
+                usage_agent["native_usage_status"],
+                "partial",
+            )
+            self.assertIsNone(usage_agent["turn_count"])
+            self.assertIn(
+                "turn_count",
+                usage_agent["native_usage_missing_fields"],
+            )
             self.assertAlmostEqual(usage_agent["cache_hit_rate"], 0.8)
 
             status, third = self.post(
@@ -505,7 +535,7 @@ class DashboardClusterControlTests(unittest.TestCase):
         os.utime(session_path, (old_timestamp, old_timestamp))
         self.team.agent_pool.register_native_thread(
             str(self.project["project_id"]),
-            "team_reviewer",
+            "team_worker",
             "native:parent-old",
             thread_id,
             f"native:{thread_id}",
@@ -535,6 +565,9 @@ class DashboardClusterControlTests(unittest.TestCase):
             self.assertTrue(agent["usage_available"])
             self.assertEqual(agent["context_tokens"], 1000)
             self.assertEqual(agent["model_context_window"], 996147)
+            self.assertEqual(agent["role"], "team_worker")
+            self.assertEqual(agent["identity_source"], "registry")
+            self.assertEqual(agent["identity_confidence"], "medium")
 
             status, second = self.post(
                 "/api/agents/sync-native",
@@ -542,6 +575,155 @@ class DashboardClusterControlTests(unittest.TestCase):
             )
             self.assertEqual(status, 200)
             self.assertEqual(second["refreshed_count"], 0)
+
+    def test_native_sync_preserves_ambiguous_candidates_and_stales_usage(
+        self,
+    ) -> None:
+        first_task = self.team.create_task(
+            self.repo,
+            title="Native candidate one",
+            description="Referenced from a native prompt.",
+            acceptance="Remains a candidate.",
+            kind="read",
+            owner_role="team_explorer",
+        )
+        second_task = self.team.create_task(
+            self.repo,
+            title="Native candidate two",
+            description="Also referenced from the same prompt.",
+            acceptance="Remains a candidate.",
+            kind="read",
+            owner_role="team_explorer",
+        )
+        sessions_root = self.base / "ambiguous-native-sessions"
+        sessions_root.mkdir()
+        thread_id = "01a1cafe-7777-7222-8333-944455556666"
+        session_path = sessions_root / f"rollout-{thread_id}.jsonl"
+        session_path.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "session_meta",
+                            "payload": {
+                                "id": thread_id,
+                                "cwd": str(self.repo),
+                                "source": {
+                                    "subagent": {
+                                        "thread_spawn": {
+                                            "agent_path": "/root/unclassified"
+                                        }
+                                    }
+                                },
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "response_item",
+                            "payload": {
+                                "type": "message",
+                                "role": "user",
+                                "content": (
+                                    f"Compare {first_task['task_id']} with "
+                                    f"{second_task['task_id']}"
+                                ),
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "event_msg",
+                            "payload": {
+                                "type": "token_count",
+                                "info": {
+                                    "last_token_usage": {
+                                        "input_tokens": 100,
+                                        "cached_input_tokens": 80,
+                                        "output_tokens": 5,
+                                    },
+                                    "total_token_usage": {
+                                        "input_tokens": 200,
+                                        "cached_input_tokens": 160,
+                                        "output_tokens": 10,
+                                    },
+                                    "model_context_window": 1000,
+                                },
+                            },
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        with patch.dict(
+            os.environ,
+            {"CODEX_NATIVE_SESSIONS_ROOT": str(sessions_root)},
+        ):
+            status, first = self.post(
+                "/api/agents/sync-native",
+                {"limit": 100},
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(first["registered_count"], 1)
+            board = self.get("/api/board")
+            agent = next(
+                item
+                for item in board["cluster_agents"]
+                if item["thread_id"] == thread_id
+            )
+            self.assertEqual(agent["role"], "unknown")
+            self.assertEqual(agent["identity_source"], "missing")
+            self.assertIsNone(agent["current_task_id"])
+            self.assertTrue(agent["task_assignment_ambiguous"])
+            self.assertEqual(
+                agent["task_candidates"],
+                sorted(
+                    [
+                        first_task["task_id"],
+                        second_task["task_id"],
+                    ]
+                ),
+            )
+            self.assertEqual(agent["assignment_source"], "ambiguous")
+            self.assertEqual(agent["prompt_status"], "unknown")
+            self.assertEqual(agent["native_usage_status"], "partial")
+            with self.assertRaisesRegex(
+                TeamError,
+                "prompt has not been verified",
+            ):
+                self.team.claim_task(
+                    first_task["task_id"],
+                    actor=f"dashboard:{thread_id}",
+                )
+
+            session_path.unlink()
+            status, second = self.post(
+                "/api/agents/sync-native",
+                {"limit": 100},
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(second["refreshed_count"], 1)
+            stale_board = self.get("/api/board")
+            stale = next(
+                item
+                for item in stale_board["cluster_agents"]
+                if item["thread_id"] == thread_id
+            )
+            self.assertTrue(stale["session_stale"])
+            self.assertEqual(
+                stale["native_usage_status"],
+                "stale",
+            )
+            self.assertTrue(stale["usage_stale"])
+            self.assertTrue(stale["usage_available"])
+            self.assertEqual(stale["last_input_tokens"], 100)
+            self.assertEqual(
+                stale["native_session_path"],
+                str(session_path),
+            )
 
     def test_control_cluster_goal_pause_resume_and_cancel(self) -> None:
         cluster = ClusterManager(self.settings, team=self.team)

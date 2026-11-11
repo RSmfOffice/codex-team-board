@@ -660,14 +660,23 @@ nativeBoard.cluster_agents = [{
   agent_path: "/root/native_explorer",
   agent_nickname: "Erdos",
   prompt_status: "missing",
-  current_task_id: "T-NATIVE",
-  current_task_title: "验证任务送达",
+  current_task_id: null,
+  identity_source: "explicit_session_metadata",
+  identity_confidence: "high",
+  lifecycle: "completed",
+  session_stale: true,
+  assignment_source: "ambiguous",
+  assignment_confidence: "unknown",
+  task_candidates: ["T-NATIVE-1", "T-NATIVE-2"],
+  task_assignment_ambiguous: true,
+  native_usage_status: "partial",
+  native_usage_missing_fields: ["turn_count"],
   last_cached_input_tokens: 800,
   last_uncached_input_tokens: 200,
   context_tokens: 1000,
   model_context_window: 996147,
   cache_hit_rate: 0.8,
-  turn_count: 1,
+  turn_count: null,
 }];
 assert.equal(
   hooks.renderBoard(nativeBoard),
@@ -678,6 +687,21 @@ const nativeAgentHtml = fakeElements.get("agent-thread-list").innerHTML;
 assert.match(nativeAgentHtml, /runtime native/);
 assert.match(nativeAgentHtml, /prompt missing/);
 assert.match(nativeAgentHtml, /agent Erdos/);
+assert.match(nativeAgentHtml, /lifecycle 已完成 · stale/);
+assert.match(
+  nativeAgentHtml,
+  /identity explicit_session_metadata \/ high/,
+);
+assert.match(
+  nativeAgentHtml,
+  /assignment ambiguous \/ unknown · ambiguous/,
+);
+assert.match(nativeAgentHtml, /usage partial/);
+assert.match(
+  nativeAgentHtml,
+  /任务候选：T-NATIVE-1, T-NATIVE-2 · 需人工确认/,
+);
+assert.match(nativeAgentHtml, /turn —/);
 assert.match(nativeAgentHtml, /父 Thread：thread-parent-1/);
 assert.match(nativeAgentHtml, /Native thread 仅支持 same-task/);
 assert.match(nativeAgentHtml, /1,000 \/ 996,147/);

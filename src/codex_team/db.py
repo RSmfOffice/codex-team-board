@@ -6,7 +6,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
@@ -209,6 +209,17 @@ CREATE TABLE IF NOT EXISTS cluster_agents (
     prompt_status TEXT NOT NULL DEFAULT 'unknown',
     native_session_path TEXT,
     last_seen_at TEXT,
+    identity_source TEXT NOT NULL DEFAULT 'unknown',
+    identity_confidence TEXT NOT NULL DEFAULT 'unknown',
+    lifecycle TEXT NOT NULL DEFAULT 'unknown',
+    lifecycle_source TEXT NOT NULL DEFAULT 'unknown',
+    assignment_source TEXT NOT NULL DEFAULT 'none',
+    assignment_confidence TEXT NOT NULL DEFAULT 'unknown',
+    task_candidates_json TEXT NOT NULL DEFAULT '[]',
+    task_assignment_ambiguous INTEGER NOT NULL DEFAULT 0,
+    session_stale INTEGER NOT NULL DEFAULT 1,
+    native_usage_status TEXT NOT NULL DEFAULT 'unavailable',
+    native_usage_missing_fields TEXT NOT NULL DEFAULT '[]',
     profile TEXT NOT NULL DEFAULT 'legacy',
     status TEXT NOT NULL CHECK(status IN (
         'starting', 'busy', 'loaded', 'idle', 'stored',
@@ -424,6 +435,17 @@ CLUSTER_AGENT_MIGRATION_COLUMNS = {
     "prompt_status": "TEXT NOT NULL DEFAULT 'unknown'",
     "native_session_path": "TEXT",
     "last_seen_at": "TEXT",
+    "identity_source": "TEXT NOT NULL DEFAULT 'unknown'",
+    "identity_confidence": "TEXT NOT NULL DEFAULT 'unknown'",
+    "lifecycle": "TEXT NOT NULL DEFAULT 'unknown'",
+    "lifecycle_source": "TEXT NOT NULL DEFAULT 'unknown'",
+    "assignment_source": "TEXT NOT NULL DEFAULT 'none'",
+    "assignment_confidence": "TEXT NOT NULL DEFAULT 'unknown'",
+    "task_candidates_json": "TEXT NOT NULL DEFAULT '[]'",
+    "task_assignment_ambiguous": "INTEGER NOT NULL DEFAULT 0",
+    "session_stale": "INTEGER NOT NULL DEFAULT 1",
+    "native_usage_status": "TEXT NOT NULL DEFAULT 'unavailable'",
+    "native_usage_missing_fields": "TEXT NOT NULL DEFAULT '[]'",
 }
 
 
@@ -442,7 +464,11 @@ def connect(path: Path) -> sqlite3.Connection:
             connection.execute("PRAGMA foreign_keys=ON")
             connection.execute("PRAGMA busy_timeout=5000")
             connection.executescript(SCHEMA)
-            _upgrade_schema(connection)
+            previous_schema_version = effective_schema_version(connection)
+            _upgrade_schema(
+                connection,
+                previous_schema_version=previous_schema_version,
+            )
             connection.executescript(INDEXES)
             connection.execute(
                 """
@@ -498,7 +524,11 @@ def effective_schema_version(connection: sqlite3.Connection) -> int:
     return max(int(migrated or 0), int(pragma or 0))
 
 
-def _upgrade_schema(connection: sqlite3.Connection) -> None:
+def _upgrade_schema(
+    connection: sqlite3.Connection,
+    *,
+    previous_schema_version: int,
+) -> None:
     existing = {
         row["name"]
         for row in connection.execute("PRAGMA table_info(tasks)").fetchall()
@@ -593,6 +623,55 @@ def _upgrade_schema(connection: sqlite3.Connection) -> None:
             END
         """
     )
+    if previous_schema_version < 24:
+        for row in connection.execute(
+            """
+            SELECT agent_id, current_task_id, turn_count
+            FROM cluster_agents
+            WHERE runtime = 'native'
+            """
+        ).fetchall():
+            candidates = (
+                json.dumps([str(row["current_task_id"])])
+                if row["current_task_id"]
+                else "[]"
+            )
+            connection.execute(
+                """
+                UPDATE cluster_agents
+                SET identity_source = CASE
+                        WHEN identity_source = 'unknown' THEN 'registry'
+                        ELSE identity_source
+                    END,
+                    identity_confidence = CASE
+                        WHEN identity_confidence = 'unknown' THEN 'medium'
+                        ELSE identity_confidence
+                    END,
+                    assignment_source = CASE
+                        WHEN assignment_source = 'none' AND ? != '[]'
+                        THEN 'registry'
+                        ELSE assignment_source
+                    END,
+                    assignment_confidence = CASE
+                        WHEN assignment_confidence = 'unknown'
+                             AND ? != '[]'
+                        THEN 'medium'
+                        ELSE assignment_confidence
+                    END,
+                    task_candidates_json = CASE
+                        WHEN task_candidates_json = '[]' THEN ?
+                        ELSE task_candidates_json
+                    END,
+                    native_usage_status = CASE
+                        WHEN native_usage_status = 'unavailable'
+                             AND turn_count > 0
+                        THEN 'partial'
+                        ELSE native_usage_status
+                    END
+                WHERE agent_id = ?
+                """,
+                (candidates, candidates, candidates, row["agent_id"]),
+            )
     _backfill_workflow_epochs(connection)
     _backfill_goal_archive_tasks(connection)
     _backfill_goal_archive_all_tasks(connection)

@@ -40,6 +40,13 @@ const agentStatusLabels = Object.freeze({
   superseded: "已替换",
   failed: "失败",
 });
+const nativeLifecycleLabels = Object.freeze({
+  active: "运行中",
+  idle: "空闲",
+  completed: "已完成",
+  aborted: "已中止",
+  unknown: "未知",
+});
 
 let selectedProject = "";
 let selectedTaskId = "";
@@ -948,6 +955,26 @@ function renderAgentThreads(agents, events = []) {
     const nativeIdentity = agent.runtime === "native"
       ? agent.agent_nickname || agent.agent_path || ""
       : "";
+    const nativeLifecycle = agent.runtime === "native"
+      ? nativeLifecycleLabels[String(agent.lifecycle || "unknown").toLowerCase()]
+        || agent.lifecycle
+        || "未知"
+      : "";
+    const identityDiagnostic = agent.runtime === "native"
+      ? `${agent.identity_source || "unknown"} / ${agent.identity_confidence || "unknown"}`
+      : "";
+    const assignmentDiagnostic = agent.runtime === "native"
+      ? `${agent.assignment_source || "none"} / ${agent.assignment_confidence || "unknown"}`
+      : "";
+    const nativeUsageStatus = agent.runtime === "native"
+      ? agent.native_usage_status || "unavailable"
+      : "";
+    const nativeCandidates = Array.isArray(agent.task_candidates)
+      ? agent.task_candidates
+      : [];
+    const turnText = agent.turn_count === null || agent.turn_count === undefined
+      ? "—"
+      : agent.turn_count;
     const resetState = agent.reset_requested_at
       ? `重置已请求 ${timeText(agent.reset_requested_at)}${agent.reset_reason ? ` · ${agent.reset_reason}` : ""}`
       : latestEvent
@@ -980,10 +1007,22 @@ function renderAgentThreads(agents, events = []) {
             : ""}
           ${nativePrompt ? `<span>prompt ${escapeHtml(nativePrompt)}</span>` : ""}
           ${nativeIdentity ? `<span>agent ${escapeHtml(nativeIdentity)}</span>` : ""}
+          ${nativeLifecycle
+            ? `<span>lifecycle ${escapeHtml(nativeLifecycle)}${agent.session_stale ? " · stale" : ""}</span>`
+            : ""}
+          ${identityDiagnostic
+            ? `<span>identity ${escapeHtml(identityDiagnostic)}</span>`
+            : ""}
+          ${assignmentDiagnostic
+            ? `<span>assignment ${escapeHtml(assignmentDiagnostic)}${agent.task_assignment_ambiguous ? " · ambiguous" : ""}</span>`
+            : ""}
+          ${nativeUsageStatus
+            ? `<span>usage ${escapeHtml(nativeUsageStatus)}</span>`
+            : ""}
           <span>workstream ${escapeHtml(workstream)}</span>
           <span>thread ${escapeHtml(thread)}</span>
           <span>${escapeHtml(model)}</span>
-          <span>turn ${escapeHtml(agent.turn_count ?? 0)}</span>
+          <span>turn ${escapeHtml(turnText)}</span>
           <span>last ${escapeHtml(timeText(agent.last_used_at))}</span>
           <span>latest job ${escapeHtml(latestJob)}</span>
           <span>last cache/uncached ${escapeHtml(tokenText(cached))} / ${escapeHtml(tokenText(uncached))}</span>
@@ -993,6 +1032,9 @@ function renderAgentThreads(agents, events = []) {
           <div>当前目标：${escapeHtml(goalLabel)}</div>
           ${agent.runtime === "native" && agent.parent_thread_id
             ? `<div>父 Thread：${escapeHtml(agent.parent_thread_id)}</div>`
+            : ""}
+          ${agent.runtime === "native" && nativeCandidates.length
+            ? `<div>任务候选：${escapeHtml(nativeCandidates.join(", "))}${agent.task_assignment_ambiguous ? " · 需人工确认" : ""}</div>`
             : ""}
         </div>
         <div class="agent-thread-usage">
