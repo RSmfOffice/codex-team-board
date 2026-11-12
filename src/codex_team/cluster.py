@@ -104,6 +104,9 @@ TICK_PHASE_RETRY_MAX_SECONDS = 0.5
 TICK_CONTROL_BACKOFF_BASE_SECONDS = 5.0
 TICK_CONTROL_BACKOFF_MAX_SECONDS = 60.0
 APP_SERVER_DELIVERY_MAX_ATTEMPTS = 2
+DISPATCH_TRANSIENT_MAX_DEFERRALS = 5
+DISPATCH_DEFERRAL_BASE_SECONDS = 5.0
+DISPATCH_DEFERRAL_MAX_SECONDS = 120.0
 TRANSIENT_APP_SERVER_ERRORS = (
     AppServerDisconnectedError,
     AppServerStartupError,
@@ -441,6 +444,7 @@ class ClusterManager:
         self._app_state_lock = threading.RLock()
         self._tick_lock = threading.Lock()
         self._phase_failure_state: dict[str, dict[str, Any]] = {}
+        self._dispatch_deferrals: dict[str, dict[str, Any]] = {}
         self._runtime_fallback_reason = ""
         self.runtime = runtime
         if self.runtime is None and self.agent_runtime == "app_server":
@@ -3629,16 +3633,20 @@ class ClusterManager:
         candidates = self._ready_worker_candidates(goal, tasks, active_workers)
         if len(active_workers) < self.max_workers and candidates:
             task = candidates[0]
+            task_id = str(task["task_id"])
+            deferral = self._dispatch_deferrals.get(task_id)
+            if deferral and time.monotonic() < deferral["retry_after"]:
+                # Still backing off from a transient failure; do not hammer the
+                # runtime or spam events every tick.
+                return None, False, True
             try:
-                return (
-                    self._dispatch_worker(
-                        goal,
-                        task,
-                        reserve_claim=True,
-                    ),
-                    True,
-                    True,
+                job = self._dispatch_worker(
+                    goal,
+                    task,
+                    reserve_claim=True,
                 )
+                self._dispatch_deferrals.pop(task_id, None)
+                return job, True, True
             except WorkflowEpochMismatch as exc:
                 self.team.block_task(
                     task["task_id"],
@@ -3674,15 +3682,50 @@ class ClusterManager:
                 return None, True, True
             except Exception as exc:
                 if self._dispatch_error_is_transient(exc):
-                    # Transient runtime/transport failures must not escalate
-                    # into a manual block. Release the reservation so the task
-                    # returns to ready and the next tick can retry it; the
-                    # attempt ledger still bounds permanent failures.
+                    # Transient failures defer with backoff, but only a bounded
+                    # number of times; once the cap is reached the task blocks
+                    # so a persistently failing runtime cannot loop forever.
                     self._release_auto_worker_reservation(
-                        task["task_id"],
+                        task_id,
                         goal_id,
                         reason=f"transient dispatch failure: {exc}",
                     )
+                    count = (
+                        self._dispatch_deferrals.get(task_id, {}).get("count", 0)
+                        + 1
+                    )
+                    if count > DISPATCH_TRANSIENT_MAX_DEFERRALS:
+                        self._dispatch_deferrals.pop(task_id, None)
+                        self.team.block_task(
+                            task_id,
+                            actor="teamd",
+                            reason=(
+                                "automatic dispatch failed after "
+                                f"{DISPATCH_TRANSIENT_MAX_DEFERRALS} transient "
+                                f"retries: {exc}"
+                            ),
+                        )
+                        with self.team.connection() as connection:
+                            self._event(
+                                connection,
+                                goal_id,
+                                "dispatch_failed",
+                                "teamd",
+                                {
+                                    "task_id": task_id,
+                                    "error": self._redact_error(str(exc)),
+                                    "reason": "transient_retry_exhausted",
+                                },
+                            )
+                        return None, True, True
+                    backoff = min(
+                        DISPATCH_DEFERRAL_MAX_SECONDS,
+                        DISPATCH_DEFERRAL_BASE_SECONDS * (2 ** (count - 1)),
+                    )
+                    self._dispatch_deferrals[task_id] = {
+                        "count": count,
+                        "retry_after": time.monotonic() + backoff,
+                    }
                     with self.team.connection() as connection:
                         self._event(
                             connection,
@@ -3690,14 +3733,17 @@ class ClusterManager:
                             "dispatch_deferred",
                             "teamd",
                             {
-                                "task_id": task["task_id"],
+                                "task_id": task_id,
                                 "error": self._redact_error(str(exc)),
                                 "reason": "transient_dispatch_failure",
+                                "deferral_count": count,
+                                "backoff_seconds": backoff,
                             },
                         )
                     return None, True, False
+                self._dispatch_deferrals.pop(task_id, None)
                 self.team.block_task(
-                    task["task_id"],
+                    task_id,
                     actor="teamd",
                     reason=f"automatic dispatch failed: {exc}",
                 )
@@ -3707,7 +3753,7 @@ class ClusterManager:
                         goal_id,
                         "dispatch_failed",
                         "teamd",
-                        {"task_id": task["task_id"], "error": str(exc)},
+                        {"task_id": task_id, "error": self._redact_error(str(exc))},
                     )
                 return None, True, True
 
@@ -4243,7 +4289,12 @@ Do not return raw logs or a full transcript.
 
     @staticmethod
     def _dispatch_error_is_transient(exc: BaseException) -> bool:
-        """Classify dispatch failures that deserve a retry instead of a block."""
+        """Classify dispatch failures that deserve a retry instead of a block.
+
+        Only clearly recoverable conditions are transient. Permission, path and
+        schema errors are permanent and must block immediately rather than be
+        retried every tick (which would never produce a job to bound attempts).
+        """
         if isinstance(
             exc,
             (
@@ -4252,10 +4303,23 @@ Do not return raw logs or a full transcript.
                 AppServerTimeoutError,
                 ConnectionError,
                 TimeoutError,
-                OSError,
-                sqlite3.OperationalError,
             ),
         ):
+            return True
+        if isinstance(
+            exc,
+            (PermissionError, FileNotFoundError, NotADirectoryError, IsADirectoryError),
+        ):
+            return False
+        if isinstance(exc, sqlite3.OperationalError):
+            message = str(exc).casefold()
+            return any(
+                marker in message
+                for marker in ("database is locked", "database is busy")
+            )
+        if isinstance(exc, OSError):
+            # Remaining OSError subclasses (e.g. transient network failures)
+            # are recoverable; the permanent path/permission ones returned above.
             return True
         message = str(exc).casefold()
         return any(
