@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import sqlite3
 import subprocess
 import tempfile
@@ -56,6 +57,53 @@ class DispatchClassificationTests(unittest.TestCase):
                 ClusterManager._dispatch_error_is_transient(exc),
                 f"{exc!r} should be transient",
             )
+
+    def test_permanent_os_errors_are_not_transient(self) -> None:
+        # Disk full, read-only filesystem, file exists and no-such-process are
+        # permanent even though they are OSError subclasses; they must block
+        # immediately rather than be retried up to the deferral cap.
+        for exc in (
+            FileExistsError(errno.EEXIST, "file exists"),
+            OSError(errno.ENOSPC, "no space left on device"),
+            OSError(errno.EROFS, "read-only file system"),
+            ProcessLookupError(errno.ESRCH, "no such process"),
+            OSError(errno.EACCES, "permission denied"),
+            OSError(errno.ENOENT, "no such file or directory"),
+        ):
+            self.assertFalse(
+                ClusterManager._dispatch_error_is_transient(exc),
+                f"{exc!r} should be permanent",
+            )
+
+    def test_recoverable_os_errnos_are_transient(self) -> None:
+        for code in (
+            errno.EAGAIN,
+            errno.EWOULDBLOCK,
+            errno.EINTR,
+            errno.EBUSY,
+            errno.ETIMEDOUT,
+            errno.ECONNRESET,
+            errno.ECONNABORTED,
+            errno.ECONNREFUSED,
+            errno.ENETUNREACH,
+            errno.ENETDOWN,
+            errno.EHOSTUNREACH,
+            errno.EPIPE,
+        ):
+            exc = OSError(code, "recoverable os failure")
+            self.assertTrue(
+                ClusterManager._dispatch_error_is_transient(exc),
+                f"errno {code} should be transient",
+            )
+
+    def test_oserror_without_errno_is_permanent(self) -> None:
+        # A bare OSError with no errno is not on the allowlist and must not be
+        # treated as transient by default.
+        self.assertFalse(
+            ClusterManager._dispatch_error_is_transient(
+                OSError("unclassified os failure")
+            )
+        )
 
 
 class DispatchRetryTests(unittest.TestCase):

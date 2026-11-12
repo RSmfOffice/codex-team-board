@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import hashlib
 import os
@@ -107,6 +108,31 @@ APP_SERVER_DELIVERY_MAX_ATTEMPTS = 2
 DISPATCH_TRANSIENT_MAX_DEFERRALS = 5
 DISPATCH_DEFERRAL_BASE_SECONDS = 5.0
 DISPATCH_DEFERRAL_MAX_SECONDS = 120.0
+# Explicit errno allowlist for recoverable OS failures. Anything outside this
+# set (ENOSPC disk full, EROFS read-only fs, EEXIST, ESRCH no such process,
+# permission/path errors, ...) is permanent and blocks immediately instead of
+# being retried. Values are resolved portably; absent names are skipped.
+DISPATCH_TRANSIENT_OS_ERRNOS = frozenset(
+    value
+    for value in (
+        getattr(errno, name, None)
+        for name in (
+            "EAGAIN",
+            "EWOULDBLOCK",
+            "EINTR",
+            "EBUSY",
+            "ETIMEDOUT",
+            "ECONNRESET",
+            "ECONNABORTED",
+            "ECONNREFUSED",
+            "ENETUNREACH",
+            "ENETDOWN",
+            "EHOSTUNREACH",
+            "EPIPE",
+        )
+    )
+    if value is not None
+)
 TRANSIENT_APP_SERVER_ERRORS = (
     AppServerDisconnectedError,
     AppServerStartupError,
@@ -4291,9 +4317,11 @@ Do not return raw logs or a full transcript.
     def _dispatch_error_is_transient(exc: BaseException) -> bool:
         """Classify dispatch failures that deserve a retry instead of a block.
 
-        Only clearly recoverable conditions are transient. Permission, path and
-        schema errors are permanent and must block immediately rather than be
-        retried every tick (which would never produce a job to bound attempts).
+        Only an explicit allowlist is transient: connection/timeout exceptions,
+        SQLite lock/busy, and OSError carrying a recoverable errno. Every other
+        OSError (ENOSPC disk full, EROFS read-only filesystem, EEXIST, ESRCH no
+        such process, permission/path errors, ...) is permanent and blocks
+        immediately rather than being retried every tick.
         """
         if isinstance(
             exc,
@@ -4318,9 +4346,7 @@ Do not return raw logs or a full transcript.
                 for marker in ("database is locked", "database is busy")
             )
         if isinstance(exc, OSError):
-            # Remaining OSError subclasses (e.g. transient network failures)
-            # are recoverable; the permanent path/permission ones returned above.
-            return True
+            return exc.errno in DISPATCH_TRANSIENT_OS_ERRNOS
         message = str(exc).casefold()
         return any(
             marker in message
