@@ -1194,6 +1194,70 @@ class AgentPoolTests(unittest.TestCase):
             0,
         )
 
+    def test_policy_only_change_not_reused_but_not_auto_archived(self) -> None:
+        # A policy-only AGENTS change keeps the contract-level status "current"
+        # (the classifier ignores policy) yet changes the full profile, so the
+        # old Agent is no longer reusable and archive-stale yields 0 candidates.
+        # This locks the behavior documented in docs/cache-migration.md.
+        from codex_team.cache_contract import cache_profile_contract_status
+
+        policy_dir = Path(self.temporary.name)
+        old_policy = policy_dir / "AGENTS.old.md"
+        new_policy = policy_dir / "AGENTS.new.md"
+        old_policy.write_text("# old policy\n", encoding="utf-8")
+        new_policy.write_text("# new policy\n", encoding="utf-8")
+
+        def profile_for(policy_path: Path) -> str:
+            return agent_cache_profile(
+                "stable role instructions",
+                policy_path=policy_path,
+                sandbox_mode="workspace-write",
+                surface="core",
+                access_mode="full",
+                mcp_instructions="stable mcp instructions",
+            )
+
+        old_profile = profile_for(old_policy)
+        new_profile = profile_for(new_policy)
+        self.assertNotEqual(old_profile, new_profile)
+        self.assertEqual(cache_profile_contract_status(old_profile), "current")
+        self.assertEqual(cache_profile_contract_status(new_profile), "current")
+
+        old_agent = self.register(
+            thread_id="thread-policy-old",
+            profile=old_profile,
+        )
+        # The new expected profile no longer matches the old Agent: not reused.
+        self.assertIsNone(
+            self.pool.select_agent(
+                "P1",
+                "team_explorer",
+                "main",
+                "reuse",
+                "read",
+                "model-a",
+                "provider-a",
+                profile=new_profile,
+            )
+        )
+        # archive-stale does not treat a policy-only change as stale.
+        dry_run = self.pool.archive_stale_managed_agents()
+        self.assertEqual(dry_run["candidate_count"], 0)
+        self.assertEqual(dry_run["candidates"], [])
+        self.assertEqual(
+            self.pool.archive_stale_managed_agents(apply=True)["archived_count"],
+            0,
+        )
+        # The old Agent remains unarchived; manual reset is the recovery path.
+        with closing(connect(self.db_path)) as connection:
+            row = connection.execute(
+                "SELECT archived_at, reset_requested_at FROM cluster_agents "
+                "WHERE agent_id=?",
+                (old_agent["agent_id"],),
+            ).fetchone()
+        self.assertIsNone(row["archived_at"])
+        self.assertIsNone(row["reset_requested_at"])
+
 
 if __name__ == "__main__":
     unittest.main()

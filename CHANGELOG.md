@@ -20,6 +20,14 @@
   上限（此前大看板会报 too many SQL variables）；保持每任务 blocked_by 顺序。
 - canceled 任务在 summary/snapshot/events 的所有 scope 默认隐藏（此前项目范围
   的 summary/snapshot 会显示），归档可见性仍由 include_archived 控制。
+- 派发瞬时错误分类改为显式 errno 白名单（`DISPATCH_TRANSIENT_OS_ERRNOS`）：
+  仅 EAGAIN/EWOULDBLOCK/EINTR/EBUSY/ETIMEDOUT/ECONNRESET/ECONNABORTED/
+  ECONNREFUSED/ENETUNREACH/ENETDOWN/EHOSTUNREACH/EPIPE 可重试；FileExistsError、
+  ENOSPC 磁盘满、EROFS 只读文件系统、ProcessLookupError 及无 errno 的 OSError
+  一律判为永久错误立即 blocked，不再被通用 OSError 兜底误判为瞬时。
+- MCP 帧上限排除 framing 换行：正文恰好 16MiB 且带 `\n` 或 `\r\n` 的 JSONL 被
+  接受（此前换行计入上限导致恰好达上限被误拒），正文超上限一字节仍拒绝；
+  短行完整读取至换行，Content-Length 头部不受影响。
 
 ### Changed
 
@@ -27,6 +35,12 @@
   test = ["pytest>=8"]` 与 `[tool.pytest.ini_options]`；windows-ci/release
   改用 `pip install -e ".[test]"` + `compileall` + `pytest`；AGENTS 验证命令同步。
 - AGENTS 增加开发维护契约（架构边界、修改门禁、验证命令、测试约定）。
+- 修正 `docs/cache-migration.md`：明确 policy-only 变化下旧 managed Agent 的
+  契约状态仍为 `current`（分类器只比较 contract/manifest/workflow/schema，不含
+  policy），但完整 profile 失配使其不再复用；`agent archive-stale` 候选为 0，
+  需人工 `teamctl agent reset <agent-id>` 回收。删除不存在的
+  `team_agent_archive_stale` MCP 操作引用，改用真实 CLI 命令并区分版本级失效
+  与 policy-only 失效两种处理路径。
 
 ### Tests
 
@@ -38,6 +52,10 @@
   `test_read_model_consistency.py`（跨 scope 一致性）、
   `test_exec_log_differential.py`（单遍 vs 两遍差分）、
   `test_app_server_cleanup.py`（启动失败清理）。
+- 新增第二轮边界测试：`test_dispatch_transient.py` 增补 errno 白名单/永久
+  OS 错误/无 errno 用例；`test_security_hardening.py` 增补带 `\n`/`\r\n` 的
+  恰好达上限接受与超限拒绝用例；`test_agent_pool.py` 增补 policy-only 变化
+  「不复用但不自动归档」回归用例。
 
 - Dashboard 将 `main`、Native 和人工 claim 纳入 `active_executions`，即使没有
   `cluster_jobs` 也不再显示“无 Agent 运行”；Native claim 在同一事务内绑定
