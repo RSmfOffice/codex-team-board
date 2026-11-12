@@ -17,7 +17,6 @@ from .native_threads import (
     IDENTITY_SOURCES,
     NATIVE_LIFECYCLES,
 )
-from .usage import normalize_usage as _shared_normalize_usage
 
 
 # Bump whenever stable thread instructions or context architecture change.
@@ -173,18 +172,55 @@ class AgentPool:
 
     @classmethod
     def _normalize_usage(cls, usage: Mapping[str, Any] | None) -> dict[str, int | None]:
-        # Reuse the shared alias resolution/derivation, then apply the pool's
-        # stored-usage semantics: missing counts collapse to 0 and an explicit
-        # zero context window is treated as unknown.
-        normalized = _shared_normalize_usage(usage)
-        input_tokens = normalized["input_tokens"] or 0
-        cached_input_tokens = min(
-            normalized["cached_input_tokens"] or 0, input_tokens
+        # Preserve the pool's original stored-usage contract exactly: flat
+        # alias lookup (including the legacy ``cached_tokens`` alias), missing
+        # counts collapse to 0, no nested total/last handling and no input
+        # back-derivation. This intentionally differs from usage.normalize_usage
+        # so cached-hit and cost statistics stay byte-for-byte compatible.
+        values = usage or {}
+        input_tokens = max(
+            0,
+            int(
+                cls._usage_value(
+                    values, "input", "input_tokens", "inputTokens"
+                )
+                or 0
+            ),
+        )
+        cached_input_tokens = max(
+            0,
+            int(
+                cls._usage_value(
+                    values,
+                    "cached",
+                    "cached_tokens",
+                    "cached_input_tokens",
+                    "cachedInputTokens",
+                )
+                or 0
+            ),
+        )
+        cached_input_tokens = min(cached_input_tokens, input_tokens)
+        output_tokens = max(
+            0,
+            int(
+                cls._usage_value(
+                    values, "output", "output_tokens", "outputTokens"
+                )
+                or 0
+            ),
+        )
+        context_tokens = max(
+            0,
+            int(
+                cls._usage_value(
+                    values, "context", "context_tokens", "contextTokens"
+                )
+                or 0
+            ),
         )
         raw_window = cls._usage_value(
-            usage or {},
-            "model_context_window",
-            "modelContextWindow",
+            values, "model_context_window", "modelContextWindow"
         )
         model_context_window = (
             max(0, int(raw_window)) if raw_window not in {None, 0} else None
@@ -193,8 +229,8 @@ class AgentPool:
             "input_tokens": input_tokens,
             "cached_input_tokens": cached_input_tokens,
             "uncached_input_tokens": input_tokens - cached_input_tokens,
-            "output_tokens": normalized["output_tokens"] or 0,
-            "context_tokens": normalized["context_tokens"] or 0,
+            "output_tokens": output_tokens,
+            "context_tokens": context_tokens,
             "model_context_window": model_context_window,
         }
 
