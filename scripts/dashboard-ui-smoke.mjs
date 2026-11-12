@@ -179,7 +179,7 @@ assert.ok(
 expectText(pollBoardSource, "/api/summary", "pollBoard summary probe");
 expectText(
   pollBoardSource,
-  "syncNativeAgentThreads({ silent: true })",
+  "syncNativeAgentThreads({ silent: true, signal: activeRequest.signal })",
   "pollBoard native agent discovery",
 );
 expectText(pollBoardSource, "boardRequired", "pollBoard revision gate");
