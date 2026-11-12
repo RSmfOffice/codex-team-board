@@ -263,10 +263,20 @@ def cache_hit_rate(usage: Mapping[str, Any] | None) -> float | None:
     input_tokens = normalized["input_tokens"]
     cached_tokens = normalized["cached_input_tokens"]
     uncached_tokens = normalized["uncached_input_tokens"]
+    if cached_tokens is None:
+        return None
+    # Truncate cached to input at the normalization boundary so an inconsistent
+    # snapshot (cached > input) never silently reports a 100% hit rate.
+    if input_tokens is not None:
+        cached_tokens = min(cached_tokens, input_tokens)
     denominator = input_tokens
-    if denominator is None and cached_tokens is not None and uncached_tokens is not None:
+    if denominator is None and uncached_tokens is not None:
         denominator = cached_tokens + uncached_tokens
-    if not denominator or cached_tokens is None:
+    if not denominator:
+        return None
+    # If the final figures are still inconsistent, report unknown rather than a
+    # misleading rate.
+    if cached_tokens > denominator:
         return None
     return max(0.0, min(1.0, cached_tokens / denominator))
 
