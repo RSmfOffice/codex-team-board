@@ -1936,9 +1936,19 @@ def _tool_result(value: Any, *, is_error: bool = False) -> dict[str, Any]:
     }
 
 
+def _read_bounded_line(stream: Any) -> bytes:
+    """Read one line with a hard byte cap shared by both framing paths."""
+    line = stream.readline(MAX_MCP_MESSAGE_BYTES + 1)
+    if len(line) > MAX_MCP_MESSAGE_BYTES:
+        raise ValueError(
+            f"MCP message exceeds {MAX_MCP_MESSAGE_BYTES} bytes"
+        )
+    return line
+
+
 def _read_message(stream: Any) -> dict[str, Any] | None:
     while True:
-        line = stream.readline()
+        line = _read_bounded_line(stream)
         if not line:
             return None
         stripped = line.strip()
@@ -1954,7 +1964,7 @@ def _read_message(stream: Any) -> dict[str, Any] | None:
                     f"Content-Length must be between 0 and {MAX_MCP_MESSAGE_BYTES}"
                 )
             while True:
-                header = stream.readline()
+                header = _read_bounded_line(stream)
                 if not header or not header.strip():
                     break
             payload = stream.read(length)
@@ -2020,8 +2030,8 @@ def _process(server: TeamMcpServer, message: dict[str, Any]) -> dict[str, Any] |
             raise TeamError(f"method not found: {method}")
         return {"jsonrpc": "2.0", "id": message_id, "result": result}
     except (TeamError, SchemaValidationError) as exc:
-        LOGGER.warning("MCP request rejected: %s", exc)
         safe_message = redact_sensitive_text(str(exc))
+        LOGGER.warning("MCP request rejected: %s", safe_message)
         if method == "tools/call":
             return {
                 "jsonrpc": "2.0",
@@ -2036,8 +2046,10 @@ def _process(server: TeamMcpServer, message: dict[str, Any]) -> dict[str, Any] |
             "error": {"code": -32602, "message": safe_message},
         }
     except Exception as exc:
-        LOGGER.exception("MCP request failed: %s", method)
         safe_message = redact_sensitive_text(str(exc))
+        # Log only the redacted message; exc_info would leak raw secrets from
+        # the traceback into the log sink.
+        LOGGER.error("MCP request failed: %s: %s", method, safe_message)
         if method == "tools/call":
             return {
                 "jsonrpc": "2.0",
