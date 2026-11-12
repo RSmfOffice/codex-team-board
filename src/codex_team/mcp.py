@@ -1937,13 +1937,32 @@ def _tool_result(value: Any, *, is_error: bool = False) -> dict[str, Any]:
 
 
 def _read_bounded_line(stream: Any) -> bytes:
-    """Read one line with a hard byte cap shared by both framing paths."""
+    """Read one line with a hard byte cap shared by both framing paths.
+
+    The cap applies to the message body, not the framing terminator: a body of
+    exactly MAX_MCP_MESSAGE_BYTES followed by ``\\n`` or ``\\r\\n`` is accepted,
+    while a body one byte over the cap is refused. ``readline(MAX + 1)`` returns
+    at most MAX + 1 bytes; short lines arrive complete with their newline, so
+    framing headers stay intact. Only the exact-cap CRLF case needs a one-byte
+    lookahead to recover the trailing ``\\n`` that the size hint cut off.
+    """
     line = stream.readline(MAX_MCP_MESSAGE_BYTES + 1)
-    if len(line) > MAX_MCP_MESSAGE_BYTES:
-        raise ValueError(
-            f"MCP message exceeds {MAX_MCP_MESSAGE_BYTES} bytes"
-        )
-    return line
+    if len(line) <= MAX_MCP_MESSAGE_BYTES:
+        return line
+    # len(line) == MAX + 1. A trailing \n means the body is exactly MAX bytes.
+    if line.endswith(b"\n"):
+        return line
+    # A trailing \r may be the first half of a CRLF terminator after a MAX-byte
+    # body; peek the next byte to confirm without buffering an over-cap body.
+    if line.endswith(b"\r"):
+        nxt = stream.read(1)
+        if nxt == b"\n":
+            return line + nxt
+        if nxt:
+            stream.seek(-1, os.SEEK_CUR)
+    raise ValueError(
+        f"MCP message exceeds {MAX_MCP_MESSAGE_BYTES} bytes"
+    )
 
 
 def _read_message(stream: Any) -> dict[str, Any] | None:

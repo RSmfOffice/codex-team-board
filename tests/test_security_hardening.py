@@ -104,6 +104,25 @@ class McpFrameLimitTests(unittest.TestCase):
         message = _read_message(io.BytesIO(body.encode("utf-8")))
         self.assertEqual(message, "a" * (MAX_MCP_MESSAGE_BYTES - 2))
 
+    def test_jsonl_at_cap_with_newline_is_accepted(self) -> None:
+        # Normal JSONL terminates with a newline; the framing newline must not
+        # count against the body cap, so a max-size body + "\n" is accepted.
+        body = '"' + "a" * (MAX_MCP_MESSAGE_BYTES - 2) + '"'
+        self.assertEqual(len(body), MAX_MCP_MESSAGE_BYTES)
+        message = _read_message(io.BytesIO(body.encode("utf-8") + b"\n"))
+        self.assertEqual(message, "a" * (MAX_MCP_MESSAGE_BYTES - 2))
+
+    def test_jsonl_at_cap_with_crlf_is_accepted(self) -> None:
+        body = '"' + "a" * (MAX_MCP_MESSAGE_BYTES - 2) + '"'
+        message = _read_message(io.BytesIO(body.encode("utf-8") + b"\r\n"))
+        self.assertEqual(message, "a" * (MAX_MCP_MESSAGE_BYTES - 2))
+
+    def test_oversized_jsonl_with_newline_rejected(self) -> None:
+        # A body one byte over the cap is refused even with a trailing newline.
+        oversized = b"x" * (MAX_MCP_MESSAGE_BYTES + 1) + b"\n"
+        with self.assertRaisesRegex(ValueError, "exceeds"):
+            _read_message(io.BytesIO(oversized))
+
     def test_oversized_content_length_rejected(self) -> None:
         raw = f"Content-Length: {MAX_MCP_MESSAGE_BYTES + 1}\r\n\r\n".encode(
             "utf-8"
