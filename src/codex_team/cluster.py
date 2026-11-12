@@ -133,6 +133,19 @@ DISPATCH_TRANSIENT_OS_ERRNOS = frozenset(
     )
     if value is not None
 )
+# Recoverable SQLite lock/busy message variants. Besides the whole-database
+# "database is locked/busy", SQLite also reports table-level and schema-level
+# contention ("database table is locked", "database schema is locked",
+# "database table is busy"); these are transient lock conditions that deserve a
+# retry, not permanent failures. Schema errors ("no such table/column") and
+# corruption ("database disk image is malformed") are NOT in this set.
+DISPATCH_TRANSIENT_DB_LOCK_MARKERS = (
+    "database is locked",
+    "database is busy",
+    "database table is locked",
+    "database table is busy",
+    "database schema is locked",
+)
 TRANSIENT_APP_SERVER_ERRORS = (
     AppServerDisconnectedError,
     AppServerStartupError,
@@ -4318,10 +4331,12 @@ Do not return raw logs or a full transcript.
         """Classify dispatch failures that deserve a retry instead of a block.
 
         Only an explicit allowlist is transient: connection/timeout exceptions,
-        SQLite lock/busy, and OSError carrying a recoverable errno. Every other
-        OSError (ENOSPC disk full, EROFS read-only filesystem, EEXIST, ESRCH no
-        such process, permission/path errors, ...) is permanent and blocks
-        immediately rather than being retried every tick.
+        SQLite lock/busy (whole-database, table-level and schema-level variants
+        in DISPATCH_TRANSIENT_DB_LOCK_MARKERS), and OSError carrying a
+        recoverable errno. Every other OSError (ENOSPC disk full, EROFS
+        read-only filesystem, EEXIST, ESRCH no such process, permission/path
+        errors, ...) and non-lock SQLite errors (schema/corruption) are
+        permanent and block immediately rather than being retried every tick.
         """
         if isinstance(
             exc,
@@ -4343,7 +4358,7 @@ Do not return raw logs or a full transcript.
             message = str(exc).casefold()
             return any(
                 marker in message
-                for marker in ("database is locked", "database is busy")
+                for marker in DISPATCH_TRANSIENT_DB_LOCK_MARKERS
             )
         if isinstance(exc, OSError):
             return exc.errno in DISPATCH_TRANSIENT_OS_ERRNOS
@@ -4351,8 +4366,7 @@ Do not return raw logs or a full transcript.
         return any(
             marker in message
             for marker in (
-                "database is locked",
-                "database is busy",
+                *DISPATCH_TRANSIENT_DB_LOCK_MARKERS,
                 "temporarily unavailable",
                 "timed out",
                 "timeout",

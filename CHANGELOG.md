@@ -25,6 +25,11 @@
   ECONNREFUSED/ENETUNREACH/ENETDOWN/EHOSTUNREACH/EPIPE 可重试；FileExistsError、
   ENOSPC 磁盘满、EROFS 只读文件系统、ProcessLookupError 及无 errno 的 OSError
   一律判为永久错误立即 blocked，不再被通用 OSError 兜底误判为瞬时。
+- SQLite 锁错误识别补全表级/schema 级变体（`DISPATCH_TRANSIENT_DB_LOCK_MARKERS`）：
+  `database table is locked`、`database schema is locked`、`database table is busy`
+  与既有的 `database is locked/busy` 一样判为瞬时可重试（此前这些变体被误判为
+  永久错误立即 blocked）；schema 错误（no such table/column）与损坏（malformed）
+  仍判永久。OperationalError 分支与通用消息回退分支共用同一标记集。
 - MCP 帧上限排除 framing 换行：正文恰好 16MiB 且带 `\n` 或 `\r\n` 的 JSONL 被
   接受（此前换行计入上限导致恰好达上限被误拒），正文超上限一字节仍拒绝；
   短行完整读取至换行，Content-Length 头部不受影响。
@@ -56,6 +61,9 @@
   OS 错误/无 errno 用例；`test_security_hardening.py` 增补带 `\n`/`\r\n` 的
   恰好达上限接受与超限拒绝用例；`test_agent_pool.py` 增补 policy-only 变化
   「不复用但不自动归档」回归用例。
+- 第三轮边界测试：`test_dispatch_transient.py` 增补 SQLite 表级/schema 级锁
+  变体（含包装异常的消息回退）判瞬时、非锁 SQLite 错误（schema/损坏）判永久
+  用例。
 
 - Dashboard 将 `main`、Native 和人工 claim 纳入 `active_executions`，即使没有
   `cluster_jobs` 也不再显示“无 Agent 运行”；Native claim 在同一事务内绑定

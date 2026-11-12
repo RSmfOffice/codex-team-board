@@ -58,6 +58,46 @@ class DispatchClassificationTests(unittest.TestCase):
                 f"{exc!r} should be transient",
             )
 
+    def test_sqlite_lock_variants_are_transient(self) -> None:
+        # Table-level and schema-level lock/busy contention are recoverable
+        # SQLite lock conditions and must be retried, not blocked immediately.
+        for message in (
+            "database table is locked",
+            "database schema is locked",
+            "database table is busy",
+            "database is locked",
+            "database is busy",
+        ):
+            self.assertTrue(
+                ClusterManager._dispatch_error_is_transient(
+                    sqlite3.OperationalError(message)
+                ),
+                f"{message!r} should be transient",
+            )
+            # The same wording surfacing as a generic exception (e.g. wrapped
+            # by a higher layer) is also classified via the message fallback.
+            self.assertTrue(
+                ClusterManager._dispatch_error_is_transient(
+                    RuntimeError(message)
+                ),
+                f"wrapped {message!r} should be transient",
+            )
+
+    def test_non_lock_sqlite_errors_are_permanent(self) -> None:
+        # Schema mistakes and corruption are not lock contention and must block.
+        for message in (
+            "no such table: bar",
+            "no such column: foo",
+            "database disk image is malformed",
+            "table tasks has no column named missing",
+        ):
+            self.assertFalse(
+                ClusterManager._dispatch_error_is_transient(
+                    sqlite3.OperationalError(message)
+                ),
+                f"{message!r} should be permanent",
+            )
+
     def test_permanent_os_errors_are_not_transient(self) -> None:
         # Disk full, read-only filesystem, file exists and no-such-process are
         # permanent even though they are OSError subclasses; they must block
