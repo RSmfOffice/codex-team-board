@@ -14,8 +14,10 @@
   Thread 因累计 token 远超窗口被误判超过 85% 复用阈值而停止复用，压低缓存命中率。
   历史已写入的错误 `context_tokens` 标记为 legacy inaccurate，不估算改写。
 - `cache_hit_rate()` 异常输入防御：`cached_input_tokens > input_tokens` 不再静默
-  显示 100%；在归一化边界把 cached 截断到 input，对最终仍不一致的数据返回
-  None/unknown。正常命中率与缺失/零值语义不变。
+  显示 100%；在归一化边界把 cached 截断到 input。截断后若存在显式
+  `uncached_input_tokens` 且与 `input - cached` 不一致（`cached + uncached != input`），
+  返回 None/unknown；一致快照（含截断后 cached==input、uncached==0）仍报告真实
+  命中率（可为 1.0）。正常命中率与缺失/零值语义不变。
 - MCP 异常先脱敏再写入日志（warning/error），claim token 与 bearer 秘密不再
   进入日志；移除会泄露原始 traceback 的 exc_info。
 - MCP 帧读取对裸 JSONL 行与头部行也施加 16MiB 硬上限（此前仅 Content-Length
@@ -64,8 +66,9 @@
   的复用/新建、累计远超窗口但当前上下文小仍可复用、unknown 上下文不复用。
   修正 `test_cluster.py` 中期待累计 context 的断言，并把依赖复用的空 last fixture
   补上真实 `last.input`。
-- 新增 `tests/test_cache_hit_rate_defense.py`：cached>input 截断、最终不一致返回
-  unknown、正常/零值/缺失语义不变的边界测试。
+- 新增 `tests/test_cache_hit_rate_defense.py`：cached>input 截断、截断后显式
+  uncached 与 input-cached 不一致返回 unknown、一致快照报告真实命中率、
+  正常/零值/缺失语义不变的边界测试。
 - 新增回归测试 `tests/test_hardening_round1.py`、`tests/test_hardening_round2.py`、
   `tests/test_hardening_round3.py`。
 - 新增评审驱动测试：`test_security_hardening.py`（日志脱敏/帧上限）、

@@ -265,17 +265,26 @@ def cache_hit_rate(usage: Mapping[str, Any] | None) -> float | None:
     uncached_tokens = normalized["uncached_input_tokens"]
     if cached_tokens is None:
         return None
-    # Truncate cached to input at the normalization boundary so an inconsistent
-    # snapshot (cached > input) never silently reports a 100% hit rate.
     if input_tokens is not None:
+        # Truncate cached to input at the normalization boundary so an
+        # over-reported cached figure never silently inflates the hit rate.
         cached_tokens = min(cached_tokens, input_tokens)
+        # After truncation the explicit uncached figure must still reconcile
+        # with input - cached. If it does not, the snapshot is inconsistent and
+        # the rate is unknown rather than a misleading value. Only an explicitly
+        # reported uncached is checked; a value derived from input - cached is
+        # consistent by construction.
+        if (
+            usage_field_is_present(usage, "uncached_input_tokens")
+            and uncached_tokens is not None
+            and uncached_tokens != input_tokens - cached_tokens
+        ):
+            return None
     denominator = input_tokens
     if denominator is None and uncached_tokens is not None:
         denominator = cached_tokens + uncached_tokens
     if not denominator:
         return None
-    # If the final figures are still inconsistent, report unknown rather than a
-    # misleading rate.
     if cached_tokens > denominator:
         return None
     return max(0.0, min(1.0, cached_tokens / denominator))
