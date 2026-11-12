@@ -4123,38 +4123,48 @@ class TeamService:
         ).fetchall()
         return [dict(row) for row in rows]
 
-    @staticmethod
+    # Stay well below SQLite's default 32766 host-parameter limit so a large
+    # board never raises "too many SQL variables". Chunking preserves the
+    # per-task ordering because each chunk is ordered and a task's dependencies
+    # all live in the single chunk that contains its id.
+    _BLOCKING_QUERY_CHUNK_SIZE = 1000
+
+    @classmethod
     def _blocking_tasks_map(
+        cls,
         connection: sqlite3.Connection,
         task_ids: list[str],
     ) -> dict[str, list[dict[str, Any]]]:
-        """Batch-load unfinished dependencies for many tasks in one query."""
+        """Batch-load unfinished dependencies for many tasks in chunked queries."""
         blocked_by: dict[str, list[dict[str, Any]]] = {
             task_id: [] for task_id in task_ids
         }
         if not task_ids:
             return blocked_by
-        placeholders = ",".join("?" for _ in task_ids)
-        rows = connection.execute(
-            f"""
-            SELECT d.task_id, t.task_id AS depends_on, t.title, t.status,
-                   t.archived_at
-            FROM task_dependencies d
-            JOIN tasks t ON t.task_id = d.depends_on
-            WHERE d.task_id IN ({placeholders}) AND t.status != 'done'
-            ORDER BY d.task_id, t.task_id
-            """,
-            task_ids,
-        ).fetchall()
-        for row in rows:
-            blocked_by[str(row["task_id"])].append(
-                {
-                    "task_id": row["depends_on"],
-                    "title": row["title"],
-                    "status": row["status"],
-                    "archived_at": row["archived_at"],
-                }
-            )
+        chunk_size = cls._BLOCKING_QUERY_CHUNK_SIZE
+        for start in range(0, len(task_ids), chunk_size):
+            chunk = task_ids[start : start + chunk_size]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = connection.execute(
+                f"""
+                SELECT d.task_id, t.task_id AS depends_on, t.title, t.status,
+                       t.archived_at
+                FROM task_dependencies d
+                JOIN tasks t ON t.task_id = d.depends_on
+                WHERE d.task_id IN ({placeholders}) AND t.status != 'done'
+                ORDER BY d.task_id, t.task_id
+                """,
+                chunk,
+            ).fetchall()
+            for row in rows:
+                blocked_by[str(row["task_id"])].append(
+                    {
+                        "task_id": row["depends_on"],
+                        "title": row["title"],
+                        "status": row["status"],
+                        "archived_at": row["archived_at"],
+                    }
+                )
         return blocked_by
 
     def _new_task_id(self) -> str:
