@@ -6,6 +6,39 @@
 
 ### Fixed
 
+- MCP 异常先脱敏再写入日志（warning/error），claim token 与 bearer 秘密不再
+  进入日志；移除会泄露原始 traceback 的 exc_info。
+- MCP 帧读取对裸 JSONL 行与头部行也施加 16MiB 硬上限（此前仅 Content-Length
+  分支有上限），超长单行被拒绝。
+- 派发瞬时错误分类收窄：权限/路径/schema 错误（PermissionError、
+  FileNotFoundError、no such column/table）立即 blocked，不再每 tick 无限重试；
+  仅数据库锁/busy、超时、连接断开保持瞬时。瞬时延迟改为指数退避并在
+  `DISPATCH_TRANSIENT_MAX_DEFERRALS` 次后 blocked，成功即清除延迟状态。
+- 恢复 Agent 池用量归一的旧契约：保留 `cached_tokens` 别名，不引入嵌套
+  total/last 与 input 反推，缓存命中率/成本统计与旧版逐位一致。
+- `_blocking_tasks_map` 按 1000 个 task_id 分块查询，规避 SQLite 32766 参数
+  上限（此前大看板会报 too many SQL variables）；保持每任务 blocked_by 顺序。
+- canceled 任务在 summary/snapshot/events 的所有 scope 默认隐藏（此前项目范围
+  的 summary/snapshot 会显示），归档可见性仍由 include_archived 控制。
+
+### Changed
+
+- 测试统一为 pytest：`pyproject.toml` 声明 `[project.optional-dependencies]
+  test = ["pytest>=8"]` 与 `[tool.pytest.ini_options]`；windows-ci/release
+  改用 `pip install -e ".[test]"` + `compileall` + `pytest`；AGENTS 验证命令同步。
+- AGENTS 增加开发维护契约（架构边界、修改门禁、验证命令、测试约定）。
+
+### Tests
+
+- 新增回归测试 `tests/test_hardening_round1.py`、`tests/test_hardening_round2.py`、
+  `tests/test_hardening_round3.py`。
+- 新增评审驱动测试：`test_security_hardening.py`（日志脱敏/帧上限）、
+  `test_dispatch_transient.py`（错误分类/有界重试）、`test_agent_usage_compat.py`
+  （旧别名差分）、`test_blocking_chunking.py`（分块/一致性）、
+  `test_read_model_consistency.py`（跨 scope 一致性）、
+  `test_exec_log_differential.py`（单遍 vs 两遍差分）、
+  `test_app_server_cleanup.py`（启动失败清理）。
+
 - Dashboard 将 `main`、Native 和人工 claim 纳入 `active_executions`，即使没有
   `cluster_jobs` 也不再显示“无 Agent 运行”；Native claim 在同一事务内绑定
   Agent、Goal 和 freshness。

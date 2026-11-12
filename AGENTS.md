@@ -1,3 +1,56 @@
+# Codex Team Board — Agent 工作契约
+
+本文件分两部分：**开发维护契约**（改代码时遵守）与**团队协作策略**（托管块，
+由 `team init` 生成，勿手工编辑标记之间的内容）。
+
+## 第一部分：开发维护契约
+
+### 架构边界（MUST）
+
+系统维护四个真相边界，跨边界操作必须显式对账：SQLite 业务真相
+（`service.py`/`db.py`）、Git 真相（`worktrees.py`/`repo_lock.py`）、运行时真相
+（`cluster.py`/`processes.py`/`app_server.py`）、模型可见前缀真相
+（`cache_contract.py`/`prompt_contract.py`）。控制面（cli/mcp/dashboard POST）
+只适配协议；领域面（TeamService）管任务/事件/Review；调度面（ClusterManager）
+管 Goal/Job/容量；观测面（dashboard GET/web）只投影不反写。
+
+### 修改门禁（MUST）
+
+- 状态写入必须 `BEGIN IMMEDIATE` + version/状态 CAS；禁止裸 read-check-write。
+- 终止进程必须先验证强身份；无法验证时 fail closed。
+- 模型可见稳定文本变化必须使旧 cache profile/workflow epoch 失配；AGENTS 变化
+  按独立缓存迁移处理（见 `docs/cache-migration.md`），不得静默冷启动全部 Agent。
+- 缺失 usage 保持 None/unknown，禁止伪造 0。
+- 特权操作必须校验 authority token 或受管角色绑定；错误与日志外发前脱敏。
+- `dashboard_summary` 与 `dashboard_snapshot` 的 cluster_summary 口径必须一致，
+  canceled 任务在所有视图默认隐藏；summary 保持轻量。
+- 批量 SQL 必须分块，单条 IN 参数不得超过 SQLite 上限（默认 32766）。
+
+### 验证命令（每次修改后 MUST 全绿）
+
+测试使用 pytest（声明为可选测试依赖）。先安装：`python -m pip install -e ".[test]"`。
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m compileall -q src tests scripts
+python -m pytest tests -q
+node --check src/codex_team/web/app.js
+node scripts/dashboard-ui-smoke.mjs
+```
+
+CI（windows-ci.yml / release.yml）使用同一套命令。涉及真实浏览器/归档恢复时
+追加 `node scripts/dashboard-edge-smoke.mjs`（需看板运行于 127.0.0.1:8765）。
+
+### 测试约定
+
+- 新功能/修复必须附回归测试；行为重构必须附与旧实现的差分测试，测试全绿不等于
+  行为等价证明。
+- 并发路径用屏障/竞态注入证明单赢家；测试用临时 CODEX_TEAM_HOME 与独立 git 仓库。
+
+---
+
+## 第二部分：团队协作策略（托管块）
+
 <!-- CODEX_TEAM_BOARD:START -->
 ## Codex 团队协作策略
 

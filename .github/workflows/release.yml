@@ -41,9 +41,11 @@ jobs:
           if (!(Test-Path -LiteralPath ".\release-notes\$tag.md")) {
             throw "release notes not found for $tag"
           }
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
           $env:PYTHONPATH = ".\src"
-          python -m py_compile .\src\codex_team\*.py
-          python -m unittest discover -s tests -v
+          python -m compileall -q src tests scripts
+          python -m pytest tests -q
 
       - name: Build portable dashboard package
         shell: powershell
