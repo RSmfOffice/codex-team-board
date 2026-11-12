@@ -256,11 +256,22 @@ def usage_is_cost_complete(usage: Mapping[str, Any] | None) -> bool:
     )
 
 
-def usage_from_exec_log(path: str | Path) -> dict[str, Any]:
-    """Read the final turn usage from a Codex exec JSONL log."""
+def scan_exec_log(path: str | Path) -> dict[str, Any]:
+    """Single-pass scan of a Codex exec JSONL log.
+
+    Collects thread id, completion/error state and first/final turn usage in
+    one read so callers that need both usage and lifecycle facts do not have to
+    parse the file twice.
+    """
 
     final_usage: dict[str, int | None] = normalize_usage(None)
     first_usage: dict[str, int | None] | None = None
+    present_fields: set[str] = set()
+    first_present_fields: set[str] = set()
+    thread_id: str | None = None
+    completed = False
+    error = ""
+    readable = True
     log_path = Path(path)
     try:
         with log_path.open("r", encoding="utf-8", errors="replace") as stream:
@@ -273,21 +284,59 @@ def usage_from_exec_log(path: str | Path) -> dict[str, Any]:
                     continue
                 if not isinstance(event, Mapping):
                     continue
-                if event.get("type") == "turn.completed":
-                    snapshot = normalize_usage(_mapping(event.get("usage")))
+                event_type = event.get("type")
+                if event_type == "thread.started":
+                    thread_id = event.get("thread_id")
+                elif event_type == "turn.completed":
+                    completed = True
+                    event_usage = _mapping(event.get("usage"))
+                    snapshot = normalize_usage(event_usage)
                     final_usage = merge_usage(snapshot, final_usage)
+                    explicit = {
+                        field
+                        for field in RAW_USAGE_FIELDS
+                        if usage_field_is_present(event_usage, field)
+                    }
+                    present_fields.update(explicit)
                     if first_usage is None:
                         first_usage = snapshot
+                        first_present_fields = set(explicit)
+                elif event_type in {"turn.failed", "error"}:
+                    raw_error = event.get("error") or event.get("message")
+                    if isinstance(raw_error, dict):
+                        raw_error = raw_error.get("message") or json.dumps(
+                            raw_error, ensure_ascii=False
+                        )
+                    error = str(raw_error or event_type)
     except OSError:
+        readable = False
+    return {
+        "final_usage": final_usage,
+        "first_usage": first_usage,
+        "present_fields": present_fields,
+        "first_present_fields": first_present_fields,
+        "thread_id": thread_id,
+        "completed": completed,
+        "error": error,
+        "readable": readable,
+    }
+
+
+def usage_from_exec_log(path: str | Path) -> dict[str, Any]:
+    """Read the final turn usage from a Codex exec JSONL log."""
+
+    scan = scan_exec_log(path)
+    if not scan["readable"]:
         return {
             **normalize_usage(None),
             "first_usage": normalize_usage(None),
             "usage_source": None,
             "usage_missing_fields": list(RAW_USAGE_FIELDS),
         }
+    final_usage = scan["final_usage"]
     return {
         **final_usage,
-        "first_usage": first_usage or normalize_usage(None),
+        "first_usage": scan["first_usage"] or normalize_usage(None),
         "usage_source": (
             "turn.completed.usage"
             if usage_has_cost_evidence(final_usage)

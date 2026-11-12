@@ -5,6 +5,7 @@ import hashlib
 import os
 import secrets
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -60,9 +61,10 @@ from .scheduling import (
 from .service import TeamError, TeamService
 from .usage import (
     JOB_USAGE_FIELDS,
+    RAW_USAGE_FIELDS,
     normalize_usage,
+    scan_exec_log,
     usage_field_is_present,
-    usage_from_exec_log,
     usage_has_any_evidence,
     usage_has_cost_evidence,
     usage_is_cost_complete,
@@ -909,6 +911,7 @@ class ClusterManager:
             raise ClusterError("invalid goal status")
         completed_at = utc_now() if status in TERMINAL_GOAL_STATUSES else None
         with self.team.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """
                 SELECT g.*, p.root_path
@@ -953,14 +956,18 @@ class ClusterManager:
                     raise ClusterError(
                         f"project already has active goal: {competing['goal_id']}"
                     )
-            connection.execute(
+            updated = connection.execute(
                 """
                 UPDATE cluster_goals
                 SET status = ?, updated_at = ?, completed_at = ?, last_error = ?
-                WHERE goal_id = ?
+                WHERE goal_id = ? AND status = ?
                 """,
-                (status, utc_now(), completed_at, reason, goal_id),
+                (status, utc_now(), completed_at, reason, goal_id, current_status),
             )
+            if updated.rowcount != 1:
+                raise ClusterError(
+                    "goal changed while updating its status; reload and retry"
+                )
             if status == "active":
                 connection.execute(
                     """
@@ -3666,6 +3673,29 @@ class ClusterManager:
                     )
                 return None, True, True
             except Exception as exc:
+                if self._dispatch_error_is_transient(exc):
+                    # Transient runtime/transport failures must not escalate
+                    # into a manual block. Release the reservation so the task
+                    # returns to ready and the next tick can retry it; the
+                    # attempt ledger still bounds permanent failures.
+                    self._release_auto_worker_reservation(
+                        task["task_id"],
+                        goal_id,
+                        reason=f"transient dispatch failure: {exc}",
+                    )
+                    with self.team.connection() as connection:
+                        self._event(
+                            connection,
+                            goal_id,
+                            "dispatch_deferred",
+                            "teamd",
+                            {
+                                "task_id": task["task_id"],
+                                "error": self._redact_error(str(exc)),
+                                "reason": "transient_dispatch_failure",
+                            },
+                        )
+                    return None, True, False
                 self.team.block_task(
                     task["task_id"],
                     actor="teamd",
@@ -4138,6 +4168,107 @@ Do not return raw logs or a full transcript.
                 },
             )
             return True
+
+    def _release_auto_worker_reservation(
+        self,
+        task_id: str,
+        goal_id: str,
+        *,
+        reason: str,
+    ) -> bool:
+        """Release this scheduler's own reservation without touching foreign claims.
+
+        The dispatching job_id is not known when startup fails before the job
+        row exists, so match the auto-worker actor prefix instead. External or
+        native claims never use that prefix and are preserved.
+        """
+        now = utc_now()
+        with self.team.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            task = connection.execute(
+                """
+                SELECT status, claimed_by, claim_token, version
+                FROM tasks WHERE task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if (
+                task is None
+                or task["status"] != "running"
+                or not str(task["claimed_by"] or "").startswith("auto-")
+            ):
+                return False
+            active_job = connection.execute(
+                """
+                SELECT 1 FROM cluster_jobs
+                WHERE task_id = ? AND kind = 'worker'
+                  AND status IN ('starting', 'running')
+                LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+            if active_job is not None:
+                return False
+            updated = connection.execute(
+                """
+                UPDATE tasks
+                SET status = 'ready', claimed_by = NULL, claim_token = NULL,
+                    lease_until = NULL, blocker = '', updated_at = ?,
+                    version = version + 1
+                WHERE task_id = ? AND status = 'running' AND version = ?
+                  AND claimed_by = ? AND claim_token IS ?
+                """,
+                (
+                    now,
+                    task_id,
+                    int(task["version"]),
+                    task["claimed_by"],
+                    task["claim_token"],
+                ),
+            )
+            if updated.rowcount == 0:
+                return False
+            self._event(
+                connection,
+                goal_id,
+                "worker_reservation_released",
+                "teamd",
+                {
+                    "task_id": task_id,
+                    "actor": str(task["claimed_by"]),
+                    "reason": reason,
+                },
+            )
+            return True
+
+    @staticmethod
+    def _dispatch_error_is_transient(exc: BaseException) -> bool:
+        """Classify dispatch failures that deserve a retry instead of a block."""
+        if isinstance(
+            exc,
+            (
+                AppServerDisconnectedError,
+                AppServerStartupError,
+                AppServerTimeoutError,
+                ConnectionError,
+                TimeoutError,
+                OSError,
+                sqlite3.OperationalError,
+            ),
+        ):
+            return True
+        message = str(exc).casefold()
+        return any(
+            marker in message
+            for marker in (
+                "database is locked",
+                "database is busy",
+                "temporarily unavailable",
+                "timed out",
+                "timeout",
+                "connection reset",
+            )
+        )
 
     def _recover_orphan_worker_reservations(self) -> dict[str, Any]:
         now = datetime.now(UTC)
@@ -7670,103 +7801,40 @@ def _redact_sensitive_file(path: Path) -> bool:
 
 
 def _parse_codex_log(path: Path) -> dict[str, Any]:
-    usage_record = usage_from_exec_log(path)
-    usage = {
-        field: usage_record.get(field)
-        for field in (
-            "input_tokens",
-            "cached_input_tokens",
-            "uncached_input_tokens",
-            "cache_write_input_tokens",
-            "output_tokens",
-            "reasoning_output_tokens",
-            "context_tokens",
-            "model_context_window",
-        )
-    }
-    first_usage = usage_record.get("first_usage")
+    # One pass gathers usage and lifecycle facts. Presence uses the raw explicit
+    # fields captured during the scan (a derived value is not "present" unless
+    # its inputs were explicitly reported), matching the previous two-pass scan.
+    scan = scan_exec_log(path)
+    final_usage = scan["final_usage"]
+    first_usage = scan["first_usage"] or normalize_usage(None)
+    usage = {field: final_usage.get(field) for field in RAW_USAGE_FIELDS}
     result: dict[str, Any] = {
-        "thread_id": None,
-        "completed": False,
-        "error": "",
+        "thread_id": scan["thread_id"],
+        "completed": scan["completed"],
+        "error": scan["error"] if scan["readable"] else "log unreadable",
         **usage,
-        "first_input_tokens": (
-            first_usage.get("input_tokens")
-            if isinstance(first_usage, Mapping)
-            else usage["input_tokens"]
+        "first_input_tokens": first_usage.get("input_tokens"),
+        "first_cached_input_tokens": first_usage.get("cached_input_tokens"),
+        "first_uncached_input_tokens": first_usage.get("uncached_input_tokens"),
+        "usage_source": (
+            "turn.completed.usage"
+            if usage_has_cost_evidence(final_usage)
+            else None
         ),
-        "first_cached_input_tokens": (
-            first_usage.get("cached_input_tokens")
-            if isinstance(first_usage, Mapping)
-            else usage["cached_input_tokens"]
-        ),
-        "first_uncached_input_tokens": (
-            first_usage.get("uncached_input_tokens")
-            if isinstance(first_usage, Mapping)
-            else usage["uncached_input_tokens"]
-        ),
-        "usage_source": usage_record.get("usage_source"),
     }
-    present_fields: set[str] = set()
-    first_present_fields: set[str] | None = None
-    try:
-        with path.open("r", encoding="utf-8", errors="replace") as stream:
-            for line in stream:
-                if not line.startswith("{"):
-                    continue
-                try:
-                    item = json.loads(line)
-                except ValueError:
-                    continue
-                event_type = item.get("type")
-                if event_type == "thread.started":
-                    result["thread_id"] = item.get("thread_id")
-                elif event_type == "turn.completed":
-                    result["completed"] = True
-                    event_usage = item.get("usage")
-                    if isinstance(event_usage, Mapping):
-                        event_fields = {
-                            field
-                            for field in (
-                                "input_tokens",
-                                "cached_input_tokens",
-                                "uncached_input_tokens",
-                                "cache_write_input_tokens",
-                                "output_tokens",
-                                "reasoning_output_tokens",
-                                "context_tokens",
-                                "model_context_window",
-                            )
-                            if usage_field_is_present(event_usage, field)
-                        }
-                        present_fields.update(event_fields)
-                        if first_present_fields is None:
-                            first_present_fields = set(event_fields)
-                elif event_type in {"turn.failed", "error"}:
-                    error = item.get("error") or item.get("message")
-                    if isinstance(error, dict):
-                        error = error.get("message") or json.dumps(error, ensure_ascii=False)
-                    result["error"] = str(error or event_type)
-    except OSError:
-        result["error"] = "log unreadable"
-    if (
-        "uncached_input_tokens" in present_fields
-        or {
-            "input_tokens",
-            "cached_input_tokens",
-        }.issubset(present_fields)
-    ):
-        present_fields.add("uncached_input_tokens")
+
+    def with_derived_uncached(present: set[str]) -> set[str]:
+        result_set = set(present)
+        if (
+            "uncached_input_tokens" in result_set
+            or {"input_tokens", "cached_input_tokens"}.issubset(result_set)
+        ):
+            result_set.add("uncached_input_tokens")
+        return result_set
+
+    present_fields = with_derived_uncached(scan["present_fields"])
+    first_present_fields = with_derived_uncached(scan["first_present_fields"])
     output_present_fields = set(present_fields)
-    first_present_fields = first_present_fields or set()
-    if (
-        "uncached_input_tokens" in first_present_fields
-        or {
-            "input_tokens",
-            "cached_input_tokens",
-        }.issubset(first_present_fields)
-    ):
-        first_present_fields.add("uncached_input_tokens")
     for final_field, snapshot_field in (
         ("first_input_tokens", "input_tokens"),
         ("first_cached_input_tokens", "cached_input_tokens"),
@@ -7848,7 +7916,15 @@ def _usage_missing_fields_json(usage: Mapping[str, Any] | None) -> str:
 def _usage_state_has_evidence(state: Mapping[str, Any] | None) -> bool:
     if not isinstance(state, Mapping):
         return False
-    return _usage_has_evidence(state.get("usage"))
+    usage = state.get("usage")
+    if not isinstance(usage, Mapping):
+        return False
+    if "total" in usage or "last" in usage:
+        return any(
+            _usage_has_evidence(usage.get(section))
+            for section in ("total", "last")
+        )
+    return _usage_has_evidence(usage)
 
 
 def _app_usage_state_has_evidence(

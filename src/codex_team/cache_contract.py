@@ -140,8 +140,7 @@ def core_tool_schema_hash() -> str:
 
 
 def configured_surface() -> str:
-    surface = os.environ.get("CODEX_TEAM_MCP_SURFACE", "core").strip().lower()
-    return surface if surface in SURFACES else surface
+    return os.environ.get("CODEX_TEAM_MCP_SURFACE", "core").strip().lower()
 
 
 def tool_surface_identity(surface: str | None = None) -> tuple[str, str]:

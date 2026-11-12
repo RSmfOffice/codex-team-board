@@ -68,6 +68,9 @@ let lastSummaryRevision = "";
 let summaryEtag = "";
 let boardEtag = "";
 let detailRequestVersion = 0;
+let lastDetailSignature = "";
+let lastDetailTaskId = "";
+let detailEventsEtag = "";
 let lastNativeAgentSyncAt = 0;
 let nativeAgentSyncInFlight = false;
 
@@ -386,6 +389,7 @@ async function syncNativeAgentThreads({
   force = false,
   silent = false,
   refresh = false,
+  signal = undefined,
 } = {}) {
   const now = Date.now();
   if (
@@ -406,6 +410,7 @@ async function syncNativeAgentThreads({
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ limit: 500 }),
+        signal,
       },
       "sync native agents",
     );
@@ -425,11 +430,14 @@ async function syncNativeAgentThreads({
     }
     return changed > 0;
   } catch (error) {
-    setActionStatus(
-      "agent-reset-status",
-      `Native Thread 同步失败：${error.message}`,
-      "error",
-    );
+    lastNativeAgentSyncAt = 0;
+    if (error.name !== "AbortError") {
+      setActionStatus(
+        "agent-reset-status",
+        `Native Thread 同步失败：${error.message}`,
+        "error",
+      );
+    }
     return false;
   } finally {
     nativeAgentSyncInFlight = false;
@@ -500,7 +508,7 @@ function renderCard(task) {
     ? `<span class="chip owner">${escapeHtml(task.execution.label || "执行中")} · ${escapeHtml(task.execution.display_name || task.execution.actor || "—")}</span>`
     : "";
   const claimWait = task.status === "ready" && task.claim_wait_seconds
-    ? `<span class="chip ${escapeHtml(task.claim_wait_state)}">等待认领 ${escapeHtml(ageText(task.claim_wait_seconds))}</span>`
+    ? `<span class="chip ${escapeHtml(task.claim_wait_state || "normal")}">等待认领 ${escapeHtml(ageText(task.claim_wait_seconds))}</span>`
     : "";
   const workflowClass = task.workflow_epoch ? "" : " historical";
   return `
@@ -788,7 +796,8 @@ function buildClusterMetrics(data = {}) {
 function renderBoard(data, { force = false } = {}) {
   const signature = buildBoardSignature(data);
   if (!force && signature === lastBoardSignature) return false;
-  tasksById = new Map(data.tasks.map((task) => [task.task_id, task]));
+  const boardTasks = Array.isArray(data.tasks) ? data.tasks : [];
+  tasksById = new Map(boardTasks.map((task) => [task.task_id, task]));
   if (selectedTaskId && !tasksById.has(selectedTaskId)) {
     closeDetail();
   }
@@ -799,7 +808,7 @@ function renderBoard(data, { force = false } = {}) {
     eventsByTask.set(event.task_id, list);
   }
   for (const lane of lanes) {
-    const tasks = data.tasks.filter((task) => task.status === lane);
+    const tasks = boardTasks.filter((task) => task.status === lane);
     document.getElementById(`count-${lane}`).textContent = tasks.length;
     const container = document.getElementById(`cards-${lane}`);
     container.innerHTML = tasks.length
@@ -807,14 +816,15 @@ function renderBoard(data, { force = false } = {}) {
       : '<div class="empty">暂无任务</div>';
   }
 
+  const counts = data.counts || {};
   const summary = [
-    ["READY", data.counts.ready || 0],
-    ["RUNNING", data.counts.running || 0],
-    ["REVIEW", data.counts.review || 0],
-    ["BLOCKED", data.counts.blocked || 0],
-    ["DONE", data.counts.done || 0],
-    ["PROJECTS", data.projects.length],
-    ["MESSAGES", data.messages.length],
+    ["READY", counts.ready || 0],
+    ["RUNNING", counts.running || 0],
+    ["REVIEW", counts.review || 0],
+    ["BLOCKED", counts.blocked || 0],
+    ["DONE", counts.done || 0],
+    ["PROJECTS", (data.projects || []).length],
+    ["MESSAGES", (data.messages || []).length],
   ];
   document.getElementById("summary").innerHTML = summary
     .map(([label, value]) => `<div class="metric"><strong>${value}</strong><span>${label}</span></div>`)
@@ -1102,6 +1112,7 @@ function renderAgentThreads(agents, events = []) {
       <article class="agent-thread-card ${escapeHtml(status)}"
                data-agent-id="${escapeHtml(agent.agent_id)}"
                data-agent-status="${escapeHtml(status)}"
+               data-agent-runtime="${escapeHtml(agent.runtime || "managed")}"
                data-agent-archived="${agent.archived_at ? "true" : "false"}">
         <div class="agent-thread-head">
           <strong>${escapeHtml(agent.display_name || agent.agent_id)}</strong>
@@ -1157,6 +1168,7 @@ function renderAgentThreads(agents, events = []) {
                   data-control-action="reset-agent"
                   data-agent-id="${escapeHtml(agent.agent_id)}"
                   data-agent-status="${escapeHtml(status)}"
+                  data-agent-runtime="${escapeHtml(agent.runtime || "managed")}"
                   data-agent-archived="${agent.archived_at ? "true" : "false"}"
                   ${resetDisabled ? "disabled" : ""}>
             ${resetDisabled ? resetBlockedReason : "请求重置"}
@@ -1235,10 +1247,11 @@ function renderTaskDetail(task, events) {
 async function hydrateTaskDetailEvents(taskId, requestVersion) {
   const params = new URLSearchParams({ limit: "12" });
   try {
-    const data = await requestJson(
+    const response = await requestRevisableJson(
       `/api/tasks/${encodeURIComponent(taskId)}/events?${params.toString()}`,
       { cache: "no-store" },
       "task events",
+      detailEventsEtag,
     );
     if (
       requestVersion !== detailRequestVersion
@@ -1247,10 +1260,17 @@ async function hydrateTaskDetailEvents(taskId, requestVersion) {
     ) {
       return;
     }
-    renderTaskDetail(
-      tasksById.get(taskId),
-      Array.isArray(data.events) ? data.events : [],
-    );
+    if (response.notModified) {
+      return;
+    }
+    detailEventsEtag = response.etag;
+    const events = Array.isArray(response.data?.events)
+      ? response.data.events
+      : [];
+    const task = tasksById.get(taskId);
+    renderTaskDetail(task, events);
+    lastDetailSignature = JSON.stringify([task, events]);
+    lastDetailTaskId = taskId;
   } catch (error) {
     if (requestVersion === detailRequestVersion && selectedTaskId === taskId) {
       const timeline = document.querySelector(".timeline");
@@ -1264,16 +1284,32 @@ async function hydrateTaskDetailEvents(taskId, requestVersion) {
 function showDetail(taskId) {
   const task = tasksById.get(taskId);
   if (!task) return;
+  const switchingTask = selectedTaskId !== taskId;
   selectedTaskId = taskId;
+  if (switchingTask) {
+    detailEventsEtag = "";
+    lastDetailSignature = "";
+  }
   detailRequestVersion += 1;
   const requestVersion = detailRequestVersion;
-  renderTaskDetail(task, eventsByTask.get(taskId) || []);
+  const events = eventsByTask.get(taskId) || [];
+  // Rebuild the panel only when its content actually changed; periodic board
+  // refreshes must not reset the reader's scroll position every 2 seconds.
+  const signature = JSON.stringify([task, events]);
+  if (switchingTask || signature !== lastDetailSignature) {
+    lastDetailSignature = signature;
+    lastDetailTaskId = taskId;
+    renderTaskDetail(task, events);
+  }
   void hydrateTaskDetailEvents(taskId, requestVersion);
 }
 
 function closeDetail() {
   detailRequestVersion += 1;
   selectedTaskId = "";
+  lastDetailSignature = "";
+  lastDetailTaskId = "";
+  detailEventsEtag = "";
   document.getElementById("detail").classList.add("hidden");
   updateArchiveButton();
 }
@@ -1365,7 +1401,7 @@ async function pollBoard({ forceRender = false } = {}) {
     if (!projectsLoaded) {
       await loadProjects(activeRequest.signal);
     }
-    await syncNativeAgentThreads({ silent: true });
+    await syncNativeAgentThreads({ silent: true, signal: activeRequest.signal });
     const params = new URLSearchParams();
     if (selectedProject) params.set("project_id", selectedProject);
     if (includeArchived) params.set("include_archived", "1");
@@ -1627,8 +1663,10 @@ async function handleClusterControl(button) {
 async function handleAgentReset(button) {
   const agentId = button.dataset.agentId;
   const status = String(button.dataset.agentStatus || "").toLowerCase();
+  const runtime = String(button.dataset.agentRuntime || "managed").toLowerCase();
   if (
     !agentId
+    || runtime === "native"
     || ["busy", "starting", "superseded"].includes(status)
     || button.dataset.agentArchived === "true"
   ) return;

@@ -28,6 +28,19 @@ from .db import (
     utc_now,
 )
 from .goal_status import effective_goal_status
+from .read_model import (
+    CLAIM_WAIT_CRITICAL_SECONDS,
+    CLAIM_WAIT_WARNING_SECONDS,
+    age_seconds,
+    claim_wait_state,
+    goal_health,
+    goal_next_action,
+    goal_queue_reason,
+    heartbeat_state,
+    is_historical_task,
+    parse_iso,
+    worker_heartbeat_age,
+)
 from .scheduling import (
     DEFAULT_GLOBAL_JOB_CAPACITY,
     DEFAULT_GOAL_WORKER_CAPACITY,
@@ -41,8 +54,6 @@ from .usage import JOB_USAGE_FIELDS, cache_hit_rate
 
 TERMINAL_STATUSES = frozenset({"done", "canceled"})
 ACTIVE_STATUSES = frozenset({"ready", "running", "review", "blocked"})
-CLAIM_WAIT_WARNING_SECONDS = 60
-CLAIM_WAIT_CRITICAL_SECONDS = 300
 
 
 class TeamError(RuntimeError):
@@ -409,6 +420,17 @@ class TeamService:
             raise TeamError(
                 f"only the lead or human reviewer can perform {operation}"
             )
+        token = (
+            authority_token.strip()
+            if isinstance(authority_token, str)
+            else ""
+        )
+        if token:
+            if secrets.compare_digest(token, self.operator_authority()):
+                return normalized_actor
+            raise TeamError(
+                f"{operation} requires a valid local authority token"
+            )
         role, bound_actor = self._managed_caller_binding()
         if not role:
             return normalized_actor
@@ -750,14 +772,18 @@ class TeamService:
     @staticmethod
     def _root(path: str | Path) -> Path:
         candidate = Path(path).expanduser().resolve()
-        result = subprocess.run(
-            ["git", "-C", str(candidate), "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-        )
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(candidate), "rev-parse", "--show-toplevel"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise TeamError(f"could not inspect Git repository: {exc}") from exc
         if result.returncode != 0:
             raise TeamError(f"not a Git repository: {candidate}")
         return Path(result.stdout.strip()).resolve()
@@ -1551,12 +1577,17 @@ class TeamService:
                 """,
                 parameters,
             ).fetchall()
+            task_ids = [str(row["task_id"]) for row in rows]
+            blocked_by = self._blocking_tasks_map(connection, task_ids)
             result = []
             for row in rows:
                 item = dict(row)
                 item.pop("claim_token", None)
-                item["blocked_by"] = self._blocking_tasks(connection, item["task_id"])
-                item["ready"] = self._is_ready(connection, item["task_id"])
+                blockers = blocked_by.get(str(item["task_id"]), [])
+                item["blocked_by"] = blockers
+                item["ready"] = (
+                    item["status"] in {"ready", "backlog"} and not blockers
+                )
                 item["lease_expired"] = self._lease_expired(item.get("lease_until"))
                 result.append(item)
             return result
@@ -1618,6 +1649,12 @@ class TeamService:
         *,
         include_archived: bool = False,
     ) -> dict[str, Any]:
+        """Lightweight summary sharing dashboard_snapshot's exact semantics.
+
+        The cluster_summary numbers must match dashboard_snapshot for the same
+        scope; only the heavy row payloads (tasks/goals/agents/events) are
+        omitted here so the polling probe stays cheap.
+        """
         system_capacity = env_int(
             "CODEX_TEAM_CLUSTER_MAX_JOBS",
             DEFAULT_GLOBAL_JOB_CAPACITY,
@@ -1660,6 +1697,7 @@ class TeamService:
                 goal_where.append("g.project_id = ?")
                 goal_params.append(project_id)
             else:
+                task_where.append("t.status != 'canceled'")
                 task_where.append("p.archived_at IS NULL")
                 goal_where.append("p.archived_at IS NULL")
             if not include_archived:
@@ -1683,20 +1721,25 @@ class TeamService:
                 str(row["status"]): int(row["count"])
                 for row in task_status_rows
             }
-            goal_status_rows = connection.execute(
+            goal_rows = connection.execute(
                 f"""
-                SELECT g.status, COUNT(*) AS count
+                SELECT g.goal_id, g.project_id, g.status, g.last_error,
+                       g.archived_at
                 FROM cluster_goals g
                 JOIN projects p ON p.project_id = g.project_id
                 WHERE {' AND '.join(goal_where)}
-                GROUP BY g.status
                 """,
                 tuple(goal_params),
             ).fetchall()
-            goal_counts = {
-                str(row["status"]): int(row["count"])
-                for row in goal_status_rows
-            }
+            goals = [dict(row) for row in goal_rows]
+            for goal in goals:
+                goal["status"] = effective_goal_status(
+                    goal["status"], goal.get("last_error")
+                )
+            goal_counts: dict[str, int] = {}
+            for goal in goals:
+                status = str(goal["status"])
+                goal_counts[status] = goal_counts.get(status, 0) + 1
             job_row = connection.execute(
                 f"""
                 SELECT COUNT(*) AS active_jobs,
@@ -1714,7 +1757,7 @@ class TeamService:
             ).fetchone()
             active_job_rows = connection.execute(
                 f"""
-                SELECT j.job_id, j.kind, j.task_id, j.started_at
+                SELECT j.job_id, j.goal_id, j.kind, j.task_id, j.started_at
                 FROM cluster_jobs j
                 JOIN cluster_goals g ON g.goal_id = j.goal_id
                 JOIN projects p ON p.project_id = g.project_id
@@ -1723,14 +1766,13 @@ class TeamService:
                 """,
                 tuple(goal_params),
             ).fetchall()
-            worker_task_ids = [
-                str(row["task_id"])
-                for row in active_job_rows
-                if row["kind"] == "worker" and row["task_id"]
+            active_jobs = [dict(row) for row in active_job_rows]
+            active_task_ids = [
+                str(row["task_id"]) for row in active_jobs if row["task_id"]
             ]
             latest_activity: dict[str, str] = {}
-            if worker_task_ids:
-                placeholders = ",".join("?" for _ in worker_task_ids)
+            if active_task_ids:
+                placeholders = ",".join("?" for _ in active_task_ids)
                 activity_rows = connection.execute(
                     f"""
                     SELECT task_id, MAX(created_at) AS latest_at
@@ -1739,69 +1781,211 @@ class TeamService:
                       AND event_type IN ('claimed', 'heartbeat', 'progress')
                     GROUP BY task_id
                     """,
-                    worker_task_ids,
+                    active_task_ids,
                 ).fetchall()
                 latest_activity = {
                     str(row["task_id"]): str(row["latest_at"])
                     for row in activity_rows
                 }
             now_utc = datetime.now(UTC)
-
-            def parse_time(value: str | None) -> datetime | None:
-                if not value:
-                    return None
-                try:
-                    parsed = datetime.fromisoformat(
-                        str(value).replace("Z", "+00:00")
-                    )
-                    if parsed.tzinfo is None:
-                        parsed = parsed.replace(tzinfo=UTC)
-                except (TypeError, ValueError):
-                    return None
-                return parsed
-
-            worker_ages: list[int] = []
-            for row in active_job_rows:
-                if row["kind"] != "worker":
-                    continue
-                heartbeat_at = row["started_at"]
-                if row["task_id"]:
-                    activity_at = latest_activity.get(str(row["task_id"]))
-                    started = parse_time(heartbeat_at)
-                    activity = parse_time(activity_at)
-                    if activity and (
-                        started is None or activity >= started
-                    ):
-                        heartbeat_at = activity_at
-                heartbeat_time = parse_time(heartbeat_at)
-                if heartbeat_time is not None:
-                    worker_ages.append(
-                        max(
-                            0,
-                            int((now_utc - heartbeat_time).total_seconds()),
-                        )
-                    )
-            schedulable_goal_count = sum(
-                goal_counts.get(status, 0)
-                for status in ("planning", "active")
+            worker_ages = [
+                worker_heartbeat_age(job, latest_activity, now_utc)
+                for job in active_jobs
+                if job["kind"] == "worker"
+            ]
+            schedulable_goal_count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) AS goal_count
+                    FROM cluster_goals g
+                    JOIN projects p ON p.project_id = g.project_id
+                    WHERE g.status IN ('planning', 'active')
+                      AND g.archived_at IS NULL
+                      AND p.archived_at IS NULL
+                    """
+                ).fetchone()["goal_count"]
             )
-            active_worker_rows = connection.execute(
+            task_rows = connection.execute(
                 f"""
-                SELECT j.goal_id, COUNT(*) AS worker_count
-                FROM cluster_jobs j
-                JOIN cluster_goals g ON g.goal_id = j.goal_id
-                JOIN projects p ON p.project_id = g.project_id
-                WHERE j.kind = 'worker'
-                  AND j.status IN ('starting', 'running')
-                  AND {' AND '.join(goal_where)}
-                GROUP BY j.goal_id
+                SELECT t.task_id, t.goal_id, t.status, t.created_at,
+                       t.updated_at, t.claimed_by, t.archived_at,
+                       t.project_id
+                FROM tasks t
+                JOIN projects p ON p.project_id = t.project_id
+                LEFT JOIN cluster_goals g ON g.goal_id = t.goal_id
+                WHERE {' AND '.join(task_where)}
                 """,
-                tuple(goal_params),
+                tuple(task_params),
             ).fetchall()
-            fairness_wait_count = sum(
-                int(row["worker_count"]) >= goal_capacity
-                for row in active_worker_rows
+            tasks = [dict(row) for row in task_rows]
+            archived_project_ids = {
+                str(project["project_id"])
+                for project in projects
+                if project.get("archived_at")
+            }
+            archived_goal_ids = {
+                str(goal["goal_id"])
+                for goal in goals
+                if goal.get("archived_at")
+            }
+            task_ids = [str(task["task_id"]) for task in tasks]
+            blocked_ids: set[str] = set()
+            if task_ids:
+                placeholders = ",".join("?" for _ in task_ids)
+                dependency_rows = connection.execute(
+                    f"""
+                    SELECT d.task_id
+                    FROM task_dependencies d
+                    JOIN tasks t ON t.task_id = d.depends_on
+                    WHERE d.task_id IN ({placeholders}) AND t.status != 'done'
+                    """,
+                    task_ids,
+                ).fetchall()
+                blocked_ids = {str(row["task_id"]) for row in dependency_rows}
+            active_jobs_by_task = {
+                str(job["task_id"]) for job in active_jobs if job.get("task_id")
+            }
+            claimed_actors = sorted(
+                {
+                    str(task["claimed_by"])
+                    for task in tasks
+                    if str(task["status"]) == "running" and task.get("claimed_by")
+                }
             )
+            native_actors: set[str] = set()
+            if claimed_actors:
+                placeholders = ",".join("?" for _ in claimed_actors)
+                native_rows = connection.execute(
+                    f"""
+                    SELECT DISTINCT actor
+                    FROM cluster_agents
+                    WHERE runtime = 'native' AND archived_at IS NULL
+                      AND actor IN ({placeholders})
+                    """,
+                    claimed_actors,
+                ).fetchall()
+                native_actors = {str(row["actor"]) for row in native_rows}
+            active_jobs_by_goal: dict[str, int] = {}
+            active_workers_by_goal: dict[str, int] = {}
+            for job in active_jobs:
+                goal_id = str(job.get("goal_id") or "")
+                if not goal_id:
+                    continue
+                active_jobs_by_goal[goal_id] = (
+                    active_jobs_by_goal.get(goal_id, 0) + 1
+                )
+                if job.get("kind") == "worker":
+                    active_workers_by_goal[goal_id] = (
+                        active_workers_by_goal.get(goal_id, 0) + 1
+                    )
+            attention_count = 0
+            external_executions = 0
+            native_executions = 0
+            goal_task_flags: dict[str, dict[str, bool]] = {}
+            for task in tasks:
+                if is_historical_task(
+                    task, archived_project_ids, archived_goal_ids
+                ):
+                    continue
+                status = str(task["status"])
+                execution_source = ""
+                if str(task["task_id"]) in active_jobs_by_task:
+                    execution_source = "managed_job"
+                elif status == "running" and task.get("claimed_by"):
+                    claimed_by = str(task["claimed_by"])
+                    if claimed_by.startswith("auto-"):
+                        execution_source = "dispatch_reservation"
+                    elif claimed_by in native_actors:
+                        execution_source = "native_claim"
+                    else:
+                        execution_source = "external_claim"
+                if execution_source and execution_source != "managed_job":
+                    external_executions += 1
+                    if execution_source == "native_claim":
+                        native_executions += 1
+                wait_seconds = 0
+                if status == "ready" and str(task["task_id"]) not in blocked_ids:
+                    wait_seconds = age_seconds(task.get("created_at"), now_utc)
+                wait_state = claim_wait_state(wait_seconds)
+                task_attention = (
+                    status in {"blocked", "review"} or wait_state == "critical"
+                )
+                goal_id = str(task.get("goal_id") or "")
+                if not goal_id:
+                    if task_attention:
+                        attention_count += 1
+                    continue
+                if task_attention:
+                    attention_count += 1
+                flags = goal_task_flags.setdefault(
+                    goal_id,
+                    {
+                        "has_blocked": False,
+                        "has_review": False,
+                        "has_critical_wait": False,
+                        "has_warning_wait": False,
+                        "has_ready": False,
+                        "has_dispatchable_ready": False,
+                        "has_running": False,
+                    },
+                )
+                flags["has_blocked"] = flags["has_blocked"] or status == "blocked"
+                flags["has_review"] = flags["has_review"] or status == "review"
+                flags["has_critical_wait"] = (
+                    flags["has_critical_wait"] or wait_state == "critical"
+                )
+                flags["has_warning_wait"] = (
+                    flags["has_warning_wait"] or wait_state == "warning"
+                )
+                flags["has_ready"] = flags["has_ready"] or status == "ready"
+                flags["has_dispatchable_ready"] = flags[
+                    "has_dispatchable_ready"
+                ] or (
+                    status == "ready"
+                    and str(task["task_id"]) not in blocked_ids
+                )
+                flags["has_running"] = flags["has_running"] or status == "running"
+            queued_goals = 0
+            fairness_wait_count = 0
+            total_active_jobs = len(active_jobs)
+            for goal in goals:
+                goal_id = str(goal["goal_id"])
+                goal_status = str(goal["status"])
+                is_historical_goal = bool(goal.get("archived_at")) or (
+                    str(goal["project_id"]) in archived_project_ids
+                )
+                if is_historical_goal:
+                    continue
+                flags = goal_task_flags.get(goal_id, {})
+                goal_active_jobs = active_jobs_by_goal.get(goal_id, 0)
+                goal_active_workers = active_workers_by_goal.get(goal_id, 0)
+                queue_reason = goal_queue_reason(
+                    goal_status,
+                    has_dispatchable_ready=bool(
+                        flags.get("has_dispatchable_ready")
+                    ),
+                    has_ready=bool(flags.get("has_ready")),
+                    has_review=bool(flags.get("has_review")),
+                    has_blocked=bool(flags.get("has_blocked")),
+                    has_running=bool(flags.get("has_running")),
+                    goal_active_jobs=goal_active_jobs,
+                    goal_active_workers=goal_active_workers,
+                    total_active_jobs=total_active_jobs,
+                    system_capacity=system_capacity,
+                    goal_capacity=goal_capacity,
+                )
+                if goal_status in {"planning", "active"} and queue_reason not in {
+                    "running",
+                    "none",
+                }:
+                    queued_goals += 1
+                if (
+                    goal_status in {"planning", "active"}
+                    and queue_reason == "global_capacity"
+                ):
+                    fairness_wait_count += 1
+                if goal_status in {"paused", "failed"}:
+                    attention_count += 1
             heartbeat_overdue = sum(
                 age >= heartbeat_warning_seconds for age in worker_ages
             )
@@ -1812,7 +1996,7 @@ class TeamService:
             )
             generated_at = utc_now()
         cluster_summary = {
-            "goals_total": sum(goal_counts.values()),
+            "goals_total": len(goals),
             "goals_active": goal_counts.get("active", 0),
             "goals_paused": goal_counts.get("paused", 0),
             "goals_failed": goal_counts.get("failed", 0),
@@ -1821,6 +2005,10 @@ class TeamService:
             "review_tasks": counts.get("review", 0),
             "blocked_tasks": counts.get("blocked", 0),
             "active_jobs": int(job_row["active_jobs"] or 0),
+            "active_executions": int(job_row["active_jobs"] or 0)
+            + external_executions,
+            "external_executions": external_executions,
+            "native_executions": native_executions,
             "active_workers": int(job_row["active_workers"] or 0),
             "active_leads": int(job_row["active_leads"] or 0),
             "global_jobs": int(job_row["active_workers"] or 0),
@@ -1828,22 +2016,21 @@ class TeamService:
             "worker_capacity_per_goal": goal_capacity,
             "system_jobs": int(job_row["active_jobs"] or 0),
             "system_capacity": system_capacity,
-            "queued_goals": max(
-                0,
-                schedulable_goal_count
-                - int(job_row["active_leads"] or 0),
-            ),
+            "queued_goals": queued_goals,
             "heartbeat_overdue": heartbeat_overdue,
-            "oldest_heartbeat_age_seconds": (
-                max(worker_ages) if worker_ages else None
-            ),
+            "oldest_heartbeat_age_seconds": max(worker_ages, default=0),
             "fairness_wait_count": fairness_wait_count,
-            "attention_count": (
-                goal_counts.get("paused", 0)
-                + goal_counts.get("failed", 0)
-                + counts.get("blocked", 0)
-                + counts.get("review", 0)
-                + heartbeat_overdue
+            "attention_count": attention_count,
+            "oldest_claim_wait_seconds": max(
+                (
+                    age_seconds(task.get("created_at"), now_utc)
+                    for task in tasks
+                    if str(task["status"]) == "ready"
+                    and not is_historical_task(
+                        task, archived_project_ids, archived_goal_ids
+                    )
+                ),
+                default=0,
             ),
         }
         return {
@@ -1869,11 +2056,11 @@ class TeamService:
         if project_id:
             where.append("t.project_id = ?")
             parameters.append(project_id)
-        else:
-            where.append("t.status != 'canceled'")
+        # Apply the same default visibility rules regardless of scope: canceled
+        # tasks and archived projects stay hidden unless explicitly included.
+        where.append("t.status != 'canceled'")
         if not include_archived:
-            if not project_id:
-                where.append("p.archived_at IS NULL")
+            where.append("p.archived_at IS NULL")
             where.append("t.archived_at IS NULL")
             where.append("(g.goal_id IS NULL OR g.archived_at IS NULL)")
         if before_event_id is not None:
@@ -2507,15 +2694,6 @@ class TeamService:
                 for goal in cluster_goals
                 if goal.get("archived_at")
             }
-
-            def is_historical_task(task: dict[str, Any]) -> bool:
-                if task.get("archived_at"):
-                    return True
-                if str(task.get("project_id")) in archived_project_ids:
-                    return True
-                goal_id = task.get("goal_id")
-                return bool(goal_id and str(goal_id) in archived_goal_ids)
-
             if task_ids:
                 placeholders = ",".join("?" for _ in task_ids)
                 dependency_rows = connection.execute(
@@ -2651,51 +2829,13 @@ class TeamService:
                         str(row["created_at"]),
                     )
             now_utc = datetime.now(UTC)
-
-            def parse_time(value: str | None) -> datetime | None:
-                if not value:
-                    return None
-                try:
-                    parsed = datetime.fromisoformat(
-                        str(value).replace("Z", "+00:00")
-                    )
-                    if parsed.tzinfo is None:
-                        parsed = parsed.replace(tzinfo=UTC)
-                except (TypeError, ValueError):
-                    return None
-                return parsed
-
-            def age_seconds(value: str | None) -> int:
-                parsed = parse_time(value)
-                if parsed is None:
-                    return 0
-                return max(0, int((now_utc - parsed).total_seconds()))
-
-            def heartbeat_state(age: int) -> str:
-                if age >= heartbeat_critical_seconds:
-                    return "critical"
-                if age >= heartbeat_warning_seconds:
-                    return "warning"
-                return "normal"
-
-            worker_heartbeat_ages: dict[str, int] = {}
-            for job in active_jobs:
-                if job.get("kind") != "worker":
-                    continue
-                heartbeat_at = job.get("started_at")
-                if job.get("task_id"):
-                    activity_at = latest_task_activity.get(
-                        str(job["task_id"]),
-                    )
-                    started_at = parse_time(heartbeat_at)
-                    activity_time = parse_time(activity_at)
-                    if activity_time and (
-                        started_at is None or activity_time >= started_at
-                    ):
-                        heartbeat_at = activity_at
-                worker_heartbeat_ages[str(job["job_id"])] = age_seconds(
-                    heartbeat_at
+            worker_heartbeat_ages = {
+                str(job["job_id"]): worker_heartbeat_age(
+                    job, latest_task_activity, now_utc
                 )
+                for job in active_jobs
+                if job.get("kind") == "worker"
+            }
             for task in tasks:
                 task["active_job"] = active_jobs_by_task.get(task["task_id"])
                 claim_activity_at = latest_task_activity.get(task["task_id"])
@@ -2750,24 +2890,14 @@ class TeamService:
                 task["active_execution"] = execution is not None
                 wait_seconds = 0
                 if task["status"] == "ready" and not task["blocked_by"]:
-                    try:
-                        created = datetime.fromisoformat(
-                            str(task["created_at"]).replace("Z", "+00:00")
-                        )
-                        wait_seconds = max(0, int((now_utc - created).total_seconds()))
-                    except (TypeError, ValueError):
-                        wait_seconds = 0
+                    wait_seconds = age_seconds(task.get("created_at"), now_utc)
                 task["claim_wait_seconds"] = wait_seconds
-                task["claim_wait_state"] = (
-                    "critical"
-                    if wait_seconds >= CLAIM_WAIT_CRITICAL_SECONDS
-                    else "warning"
-                    if wait_seconds >= CLAIM_WAIT_WARNING_SECONDS
-                    else "normal"
-                )
+                task["claim_wait_state"] = claim_wait_state(wait_seconds)
             tasks_by_goal: dict[str, list[dict[str, Any]]] = {}
             for task in tasks:
-                if is_historical_task(task):
+                if is_historical_task(
+                    task, archived_project_ids, archived_goal_ids
+                ):
                     continue
                 goal_id = task.get("goal_id")
                 if goal_id:
@@ -2775,7 +2905,9 @@ class TeamService:
             goal_states: dict[str, dict[str, Any]] = {}
             attention_count = 0
             for task in tasks:
-                if is_historical_task(task):
+                if is_historical_task(
+                    task, archived_project_ids, archived_goal_ids
+                ):
                     continue
                 goal_id = task.get("goal_id")
                 if not goal_id:
@@ -2854,54 +2986,27 @@ class TeamService:
                     goal["queue_reason"] = "none"
                     goal["estimated_wait_seconds"] = 0
                     continue
-                if is_stalled_goal:
-                    goal["health"] = "stalled"
-                elif goal_status == "canceled":
-                    goal["health"] = "canceled"
-                elif (
-                    goal_status == "failed"
-                    or has_blocked
-                    or has_critical_wait
-                ):
-                    goal["health"] = "critical"
-                elif (
-                    goal_status == "paused"
-                    or has_review
-                    or has_warning_wait
-                ):
-                    goal["health"] = "warning"
-                elif has_active_job or has_running:
-                    goal["health"] = "active"
-                elif goal_status == "planning":
-                    goal["health"] = "planning"
-                else:
-                    goal["health"] = "healthy"
-                if is_stalled_goal:
-                    goal["next_action"] = "inspect_stalled_goal"
-                elif goal_status == "failed":
-                    goal["next_action"] = "inspect_failed_goal"
-                elif goal_status == "paused":
-                    goal["next_action"] = "resume_or_cancel_goal"
-                elif has_blocked:
-                    goal["next_action"] = "resolve_blocked_tasks"
-                elif has_critical_wait:
-                    goal["next_action"] = "assign_ready_tasks"
-                elif has_review:
-                    goal["next_action"] = "review_completed_tasks"
-                elif has_active_job:
-                    goal["next_action"] = "monitor_active_jobs"
-                elif has_running:
-                    goal["next_action"] = "monitor_running_tasks"
-                elif has_ready:
-                    goal["next_action"] = "schedule_ready_tasks"
-                elif goal_status == "planning":
-                    goal["next_action"] = "wait_for_lead"
-                elif goal_status == "completed":
-                    goal["next_action"] = "none"
-                elif goal_status == "canceled":
-                    goal["next_action"] = "none"
-                else:
-                    goal["next_action"] = "monitor_goal"
+                goal["health"] = goal_health(
+                    goal_status,
+                    is_historical=False,
+                    is_stalled=is_stalled_goal,
+                    has_active_job=has_active_job,
+                    has_blocked=has_blocked,
+                    has_review=has_review,
+                    has_critical_wait=has_critical_wait,
+                    has_warning_wait=has_warning_wait,
+                    has_running=has_running,
+                )
+                goal["next_action"] = goal_next_action(
+                    goal_status,
+                    is_stalled=is_stalled_goal,
+                    has_blocked=has_blocked,
+                    has_critical_wait=has_critical_wait,
+                    has_review=has_review,
+                    has_active_job=has_active_job,
+                    has_running=has_running,
+                    has_ready=has_ready,
+                )
                 goal_jobs = active_jobs_by_goal.get(goal["goal_id"], [])
                 goal["active_job_count"] = len(goal_jobs)
                 goal_tasks = tasks_by_goal.get(goal["goal_id"], [])
@@ -2926,7 +3031,11 @@ class TeamService:
                 )
                 goal["heartbeat_age_seconds"] = goal_heartbeat_age
                 goal["heartbeat_state"] = (
-                    heartbeat_state(goal_heartbeat_age)
+                    heartbeat_state(
+                        goal_heartbeat_age,
+                        heartbeat_warning_seconds,
+                        heartbeat_critical_seconds,
+                    )
                     if goal_jobs
                     else "idle"
                 )
@@ -2946,34 +3055,21 @@ class TeamService:
                     goal["goal_id"],
                     [],
                 )
-                if goal_status not in {"planning", "active"}:
-                    queue_reason = "none"
-                elif (
-                    len(active_jobs) >= system_capacity
-                    and dispatchable_ready
-                ):
-                    queue_reason = "global_capacity"
-                elif (
-                    len(active_worker_jobs) >= goal_capacity
-                    and dispatchable_ready
-                ):
-                    queue_reason = "goal_capacity"
-                elif review_tasks:
-                    queue_reason = "review_pending"
-                elif blocked_tasks:
-                    queue_reason = "blocked"
-                elif dispatchable_ready:
-                    queue_reason = "ready"
-                elif ready_tasks:
-                    queue_reason = "dependency_wait"
-                elif goal_jobs or any(
-                    task["status"] == "running" for task in goal_tasks
-                ):
-                    queue_reason = "running"
-                elif goal_status == "planning" or not goal_jobs:
-                    queue_reason = "waiting_for_lead"
-                else:
-                    queue_reason = "none"
+                queue_reason = goal_queue_reason(
+                    goal_status,
+                    has_dispatchable_ready=bool(dispatchable_ready),
+                    has_ready=bool(ready_tasks),
+                    has_review=bool(review_tasks),
+                    has_blocked=bool(blocked_tasks),
+                    has_running=any(
+                        task["status"] == "running" for task in goal_tasks
+                    ),
+                    goal_active_jobs=len(goal_jobs),
+                    goal_active_workers=len(active_worker_jobs),
+                    total_active_jobs=len(active_jobs),
+                    system_capacity=system_capacity,
+                    goal_capacity=goal_capacity,
+                )
                 goal["queue_reason"] = queue_reason
                 if queue_reason in {"global_capacity", "goal_capacity"}:
                     wait_tasks = dispatchable_ready
@@ -2998,11 +3094,11 @@ class TeamService:
                     wait_field = "updated_at"
                 goal["estimated_wait_seconds"] = max(
                     (
-                        age_seconds(task.get(wait_field))
+                        age_seconds(task.get(wait_field), now_utc)
                         for task in wait_tasks
                     ),
                     default=(
-                        age_seconds(goal.get("updated_at"))
+                        age_seconds(goal.get("updated_at"), now_utc)
                         if queue_reason == "waiting_for_lead"
                         else 0
                     ),
@@ -3078,20 +3174,26 @@ class TeamService:
                     and (task.get("execution") or {}).get("source")
                     != "managed_job"
                     for task in tasks
-                    if not is_historical_task(task)
+                    if not is_historical_task(
+                        task, archived_project_ids, archived_goal_ids
+                    )
                 ),
                 "external_executions": sum(
                     task.get("active_execution")
                     and (task.get("execution") or {}).get("source")
                     in {"external_claim", "native_claim", "dispatch_reservation"}
                     for task in tasks
-                    if not is_historical_task(task)
+                    if not is_historical_task(
+                        task, archived_project_ids, archived_goal_ids
+                    )
                 ),
                 "native_executions": sum(
                     (task.get("execution") or {}).get("source")
                     == "native_claim"
                     for task in tasks
-                    if not is_historical_task(task)
+                    if not is_historical_task(
+                        task, archived_project_ids, archived_goal_ids
+                    )
                 ),
                 "active_workers": len(worker_heartbeat_ages),
                 "active_leads": sum(
@@ -3127,7 +3229,9 @@ class TeamService:
                         task["claim_wait_seconds"]
                         for task in tasks
                         if task["status"] == "ready"
-                        and not is_historical_task(task)
+                        and not is_historical_task(
+                            task, archived_project_ids, archived_goal_ids
+                        )
                     ),
                     default=0,
                 ),
@@ -3644,26 +3748,12 @@ class TeamService:
                     )
                 )
         if preflight["kind"] == "write":
-            status = subprocess.run(
-                ["git", "-C", worktree, "status", "--porcelain"],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-            )
+            status = self._worktree_git(worktree, "status", "--porcelain")
             if status.returncode != 0:
                 raise TeamError(status.stderr.strip() or "could not inspect worktree")
             if status.stdout.strip():
                 raise TeamError("worktree is dirty; commit changes before submission")
-            head = subprocess.run(
-                ["git", "-C", worktree, "rev-parse", "HEAD"],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-            )
+            head = self._worktree_git(worktree, "rev-parse", "HEAD")
             if head.returncode != 0:
                 raise TeamError(head.stderr.strip() or "could not read worktree HEAD")
             actual = head.stdout.strip().lower()
@@ -3759,14 +3849,7 @@ class TeamService:
                         task,
                     )
                 )
-            status = subprocess.run(
-                ["git", "-C", str(worktree), "status", "--porcelain"],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-            )
+            status = self._worktree_git(worktree, "status", "--porcelain")
             if status.returncode != 0:
                 raise TeamError(status.stderr.strip() or "could not inspect worktree")
             if status.stdout.strip():
@@ -3778,38 +3861,20 @@ class TeamService:
             submitted_commit = str(task["commit_sha"] or "").strip()
             if not submitted_commit:
                 raise TeamError("write task approval requires submitted commit_sha")
-            worker_result = subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(task["root_path"]),
-                    "rev-parse",
-                    "--verify",
-                    f"{submitted_commit}^{{commit}}",
-                ],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
+            worker_result = self._worktree_git(
+                Path(str(task["root_path"])),
+                "rev-parse",
+                "--verify",
+                f"{submitted_commit}^{{commit}}",
             )
             if worker_result.returncode != 0:
                 raise TeamError("submitted commit_sha does not resolve")
             worker_commit = worker_result.stdout.strip()
-            merge_result = subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(task["root_path"]),
-                    "rev-parse",
-                    "--verify",
-                    f"{resolved_merge}^{{commit}}",
-                ],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
+            merge_result = self._worktree_git(
+                Path(str(task["root_path"])),
+                "rev-parse",
+                "--verify",
+                f"{resolved_merge}^{{commit}}",
             )
             if merge_result.returncode != 0:
                 raise TeamError("merge_commit does not resolve in the main repository")
@@ -3817,55 +3882,32 @@ class TeamService:
             target_branch = str(task["target_branch"] or "")
             if not target_branch:
                 raise TeamError("write task has no target branch")
-            target_result = subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(task["root_path"]),
-                    "rev-parse",
-                    "--verify",
-                    f"refs/heads/{target_branch}^{{commit}}",
-                ],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
+            target_result = self._worktree_git(
+                Path(str(task["root_path"])),
+                "rev-parse",
+                "--verify",
+                f"refs/heads/{target_branch}^{{commit}}",
             )
             if target_result.returncode != 0:
                 raise TeamError(f"target branch not found: {target_branch}")
             target_commit = target_result.stdout.strip()
-            merge_on_target = subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(task["root_path"]),
-                    "merge-base",
-                    "--is-ancestor",
-                    resolved_merge,
-                    target_commit,
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
+            merge_on_target = self._worktree_git(
+                Path(str(task["root_path"])),
+                "merge-base",
+                "--is-ancestor",
+                resolved_merge,
+                target_commit,
             )
             if merge_on_target.returncode != 0:
                 raise TeamError(
                     f"merge_commit is not reachable from target branch {target_branch}"
                 )
-            worker_in_merge = subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(task["root_path"]),
-                    "merge-base",
-                    "--is-ancestor",
-                    worker_commit,
-                    resolved_merge,
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
+            worker_in_merge = self._worktree_git(
+                Path(str(task["root_path"])),
+                "merge-base",
+                "--is-ancestor",
+                worker_commit,
+                resolved_merge,
             )
             if worker_in_merge.returncode != 0:
                 raise TeamError(
@@ -4080,6 +4122,40 @@ class TeamService:
             (task_id,),
         ).fetchall()
         return [dict(row) for row in rows]
+
+    @staticmethod
+    def _blocking_tasks_map(
+        connection: sqlite3.Connection,
+        task_ids: list[str],
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Batch-load unfinished dependencies for many tasks in one query."""
+        blocked_by: dict[str, list[dict[str, Any]]] = {
+            task_id: [] for task_id in task_ids
+        }
+        if not task_ids:
+            return blocked_by
+        placeholders = ",".join("?" for _ in task_ids)
+        rows = connection.execute(
+            f"""
+            SELECT d.task_id, t.task_id AS depends_on, t.title, t.status,
+                   t.archived_at
+            FROM task_dependencies d
+            JOIN tasks t ON t.task_id = d.depends_on
+            WHERE d.task_id IN ({placeholders}) AND t.status != 'done'
+            ORDER BY d.task_id, t.task_id
+            """,
+            task_ids,
+        ).fetchall()
+        for row in rows:
+            blocked_by[str(row["task_id"])].append(
+                {
+                    "task_id": row["depends_on"],
+                    "title": row["title"],
+                    "status": row["status"],
+                    "archived_at": row["archived_at"],
+                }
+            )
+        return blocked_by
 
     def _new_task_id(self) -> str:
         for _ in range(20):

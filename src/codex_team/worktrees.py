@@ -18,14 +18,18 @@ class WorktreeManager:
 
     @staticmethod
     def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            ["git", "-C", str(cwd), *args],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-        )
+        try:
+            return subprocess.run(
+                ["git", "-C", str(cwd), *args],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=60,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise TeamError(f"git operation failed or timed out: {exc}") from exc
 
     def create(
         self,

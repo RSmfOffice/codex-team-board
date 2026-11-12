@@ -23,14 +23,18 @@ def _process_lock(key: str) -> threading.Lock:
 
 
 def _git_common_dir(root: Path) -> Path:
-    result = subprocess.run(
-        ["git", "-C", str(root), "rev-parse", "--git-common-dir"],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"could not locate Git metadata for {root}: {exc}") from exc
     if result.returncode != 0:
         raise RuntimeError(
             result.stderr.strip() or f"could not locate Git metadata for {root}"

@@ -591,6 +591,27 @@ class AppServerRuntime:
                 self._stop_locked()
             self._start_locked()
 
+    def _cleanup_failed_start(
+        self,
+        process: subprocess.Popen,
+        process_job: ProcessJob | None,
+    ) -> None:
+        """Tear down a process whose startup handshake could not complete."""
+        if process_job is not None:
+            process_job.close()
+        try:
+            process.kill()
+            process.wait(timeout=self.stop_timeout)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is None or stream.closed:
+                continue
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                pass
+
     def _start_locked(self) -> None:
         if self._is_running_locked():
             return
@@ -626,46 +647,20 @@ class AppServerRuntime:
         try:
             process_job = ProcessJob.attach(process)
         except Exception as exc:
-            try:
-                process.kill()
-                process.wait(timeout=self.stop_timeout)
-            except (OSError, subprocess.TimeoutExpired):
-                pass
-            for stream in (process.stdin, process.stdout, process.stderr):
-                if stream is None or stream.closed:
-                    continue
-                try:
-                    stream.close()
-                except (OSError, ValueError):
-                    pass
+            self._cleanup_failed_start(process, None)
             message = f"failed to assign App Server Job Object: {exc}"
             with self._state_lock:
                 self._last_error = message
             raise AppServerStartupError(message) from exc
         process_identity = get_process_identity(process.pid)
         if not process_identity:
-            if process_job is not None:
-                process_job.close()
-            try:
-                process.kill()
-                process.wait(timeout=self.stop_timeout)
-            except (OSError, subprocess.TimeoutExpired):
-                pass
-            for stream in (process.stdin, process.stdout, process.stderr):
-                if stream is None or stream.closed:
-                    continue
-                try:
-                    stream.close()
-                except (OSError, ValueError):
-                    pass
+            self._cleanup_failed_start(process, process_job)
             message = "failed to verify App Server process identity"
             with self._state_lock:
                 self._last_error = message
             raise AppServerStartupError(message)
         if process.stdin is None or process.stdout is None or process.stderr is None:
-            if process_job is not None:
-                process_job.close()
-            process.kill()
+            self._cleanup_failed_start(process, process_job)
             raise AppServerStartupError("App Server stdio pipes were not created")
 
         with self._state_lock:

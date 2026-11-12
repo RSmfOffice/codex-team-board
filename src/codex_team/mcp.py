@@ -38,6 +38,7 @@ from .prompt_contract import (
     instructions_for_surface,
 )
 from .processes import current_process_identity, process_identity
+from .redaction import redact_sensitive_text
 from .service import (
     TeamError,
     TeamService,
@@ -48,6 +49,7 @@ from .worktrees import WorktreeManager
 
 LOGGER = logging.getLogger("codex_team.mcp")
 PROTOCOL_VERSION = "2025-06-18"
+MAX_MCP_MESSAGE_BYTES = 16 * 1024 * 1024
 RECEIPT_WAIT_SECONDS = 60
 LEGACY_PENDING_TAKEOVER_SECONDS = 60
 _ACTIVE_RECEIPT_OWNERS: set[tuple[str, str]] = set()
@@ -1473,7 +1475,19 @@ class TeamMcpServer:
         if name in task_transitions and event is not None:
             result = self.team.get_task(str(event["task_id"]))
             if name in {"team_claim_task", "team_heartbeat"}:
-                result["claim_token"] = result.get("claim_token")
+                # get_task strips claim_token for normal reads; a recovery
+                # replay must return the live token so the caller can keep
+                # heartbeating and submitting the claimed task.
+                with self.team.connection(write=False) as connection:
+                    row = connection.execute(
+                        "SELECT claim_token FROM tasks WHERE task_id = ?",
+                        (str(event["task_id"]),),
+                    ).fetchone()
+                result["claim_token"] = (
+                    str(row["claim_token"])
+                    if row is not None and row["claim_token"]
+                    else None
+                )
             return result
         if name == "team_cluster_start":
             objective = str(arguments.get("objective") or "")
@@ -1931,12 +1945,22 @@ def _read_message(stream: Any) -> dict[str, Any] | None:
         if not stripped:
             continue
         if stripped.lower().startswith(b"content-length:"):
-            length = int(stripped.split(b":", 1)[1].strip())
+            try:
+                length = int(stripped.split(b":", 1)[1].strip())
+            except ValueError as exc:
+                raise ValueError("invalid Content-Length header") from exc
+            if length < 0 or length > MAX_MCP_MESSAGE_BYTES:
+                raise ValueError(
+                    f"Content-Length must be between 0 and {MAX_MCP_MESSAGE_BYTES}"
+                )
             while True:
                 header = stream.readline()
                 if not header or not header.strip():
                     break
-            return json.loads(stream.read(length).decode("utf-8"))
+            payload = stream.read(length)
+            if len(payload) != length:
+                raise ValueError("truncated MCP message payload")
+            return json.loads(payload.decode("utf-8"))
         return json.loads(stripped.decode("utf-8"))
 
 
@@ -1997,29 +2021,35 @@ def _process(server: TeamMcpServer, message: dict[str, Any]) -> dict[str, Any] |
         return {"jsonrpc": "2.0", "id": message_id, "result": result}
     except (TeamError, SchemaValidationError) as exc:
         LOGGER.warning("MCP request rejected: %s", exc)
+        safe_message = redact_sensitive_text(str(exc))
         if method == "tools/call":
             return {
                 "jsonrpc": "2.0",
                 "id": message_id,
-                "result": _tool_result(f"Tool error: {exc}", is_error=True),
+                "result": _tool_result(
+                    f"Tool error: {safe_message}", is_error=True
+                ),
             }
         return {
             "jsonrpc": "2.0",
             "id": message_id,
-            "error": {"code": -32602, "message": str(exc)},
+            "error": {"code": -32602, "message": safe_message},
         }
     except Exception as exc:
         LOGGER.exception("MCP request failed: %s", method)
+        safe_message = redact_sensitive_text(str(exc))
         if method == "tools/call":
             return {
                 "jsonrpc": "2.0",
                 "id": message_id,
-                "result": _tool_result(f"Tool error: {exc}", is_error=True),
+                "result": _tool_result(
+                    f"Tool error: {safe_message}", is_error=True
+                ),
             }
         return {
             "jsonrpc": "2.0",
             "id": message_id,
-            "error": {"code": -32603, "message": str(exc)},
+            "error": {"code": -32603, "message": safe_message},
         }
 
 
