@@ -1691,13 +1691,16 @@ class TeamService:
             task_params: list[Any] = []
             goal_where = ["1 = 1"]
             goal_params: list[Any] = []
+            # Canceled tasks are hidden from every dashboard view (summary,
+            # snapshot and events) regardless of scope; archived visibility is
+            # controlled separately by include_archived.
+            task_where.append("t.status != 'canceled'")
             if project_id:
                 task_where.append("t.project_id = ?")
                 task_params.append(project_id)
                 goal_where.append("g.project_id = ?")
                 goal_params.append(project_id)
             else:
-                task_where.append("t.status != 'canceled'")
                 task_where.append("p.archived_at IS NULL")
                 goal_where.append("p.archived_at IS NULL")
             if not include_archived:
@@ -2603,6 +2606,7 @@ class TeamService:
                     JOIN projects p ON p.project_id = t.project_id
                     LEFT JOIN cluster_goals tg ON tg.goal_id = t.goal_id
                     WHERE t.project_id = ?
+                    AND t.status != 'canceled'
                     {task_archive_filter}
                     {task_goal_filter}
                     ORDER BY
