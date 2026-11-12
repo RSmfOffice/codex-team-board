@@ -2606,7 +2606,8 @@ class ClusterSchedulerTests(unittest.TestCase):
             self.assertEqual(first_job["cached_input_tokens"], 20)
             self.assertEqual(first_job["uncached_input_tokens"], 100)
             self.assertEqual(first_job["first_input_tokens"], 120)
-            self.assertEqual(first_job["context_tokens"], 150)
+            # Current context is last.input (50), not cumulative totalTokens (150).
+            self.assertEqual(first_job["context_tokens"], 50)
             self.assertEqual(first_job["model_context_window"], 200)
 
             second = manager._dispatch_worker(
@@ -2983,7 +2984,8 @@ class ClusterSchedulerTests(unittest.TestCase):
             self.assertEqual(persisted["first_input_tokens"], 120)
             self.assertEqual(persisted["first_cached_input_tokens"], 20)
             self.assertEqual(persisted["first_uncached_input_tokens"], 100)
-            self.assertEqual(persisted["context_tokens"], 184)
+            # Current context is last.input (60), not cumulative total context (184).
+            self.assertEqual(persisted["context_tokens"], 60)
             self.assertEqual(persisted["model_context_window"], 200)
             self.assertEqual(persisted["telemetry_complete"], 1)
 
@@ -3216,7 +3218,8 @@ class ClusterSchedulerTests(unittest.TestCase):
                 }.issubset(json.loads(partial["usage_missing_fields"]))
             )
             self.assertEqual(partial_dashboard["input_tokens"], 120)
-            self.assertEqual(partial_dashboard["context_tokens"], 140)
+            # Current context is last.inputTokens (20), not total.totalTokens (140).
+            self.assertEqual(partial_dashboard["context_tokens"], 20)
             self.assertIsNone(partial_dashboard["cached_input_tokens"])
             self.assertIsNone(partial_dashboard["uncached_input_tokens"])
             self.assertIsNone(partial_dashboard["output_tokens"])
@@ -3264,7 +3267,8 @@ class ClusterSchedulerTests(unittest.TestCase):
             self.assertEqual(last_empty["output_tokens"], 4)
             self.assertEqual(last_empty["telemetry_complete"], 1)
             self.assertEqual(last_empty_dashboard["input_tokens"], 9)
-            self.assertEqual(last_empty_dashboard["context_tokens"], 13)
+            # last is empty: current context is unknown, never total.totalTokens (13).
+            self.assertIsNone(last_empty_dashboard["context_tokens"])
 
             cached_uncached, cached_uncached_dashboard = complete_with_usage(
                 "Cached uncached only",
@@ -3798,7 +3802,14 @@ class ClusterSchedulerTests(unittest.TestCase):
                         "outputTokens": 3,
                         "totalTokens": 13,
                     },
-                    "last": {},
+                    # Real App Server reports the current turn input; context
+                    # reuse requires a known last.input (not an empty bucket).
+                    "last": {
+                        "inputTokens": 8,
+                        "cachedInputTokens": 1,
+                        "outputTokens": 2,
+                        "totalTokens": 10,
+                    },
                     "modelContextWindow": 100,
                 },
             )
@@ -5014,7 +5025,14 @@ class ClusterSchedulerTests(unittest.TestCase):
                         "outputTokens": 3,
                         "totalTokens": 13,
                     },
-                    "last": {},
+                    # Real App Server reports the current turn input; context
+                    # reuse requires a known last.input (not an empty bucket).
+                    "last": {
+                        "inputTokens": 8,
+                        "cachedInputTokens": 1,
+                        "outputTokens": 2,
+                        "totalTokens": 10,
+                    },
                     "modelContextWindow": 100,
                 },
             )
@@ -5515,7 +5533,8 @@ class ClusterSchedulerTests(unittest.TestCase):
             self.assertEqual(persisted["first_input_tokens"], 120)
             self.assertEqual(persisted["first_cached_input_tokens"], 20)
             self.assertEqual(persisted["first_uncached_input_tokens"], 100)
-            self.assertEqual(persisted["context_tokens"], 184)
+            # Current context is last.input (60), not cumulative total context (184).
+            self.assertEqual(persisted["context_tokens"], 60)
             self.assertEqual(persisted["model_context_window"], 200)
             self.assertEqual(
                 persisted["usage_source"],
@@ -5738,7 +5757,13 @@ class ClusterSchedulerTests(unittest.TestCase):
                         "outputTokens": 20,
                         "totalTokens": 120,
                     },
-                    "last": {},
+                    # Real App Server reports the current turn input.
+                    "last": {
+                        "inputTokens": 8,
+                        "cachedInputTokens": 2,
+                        "outputTokens": 1,
+                        "totalTokens": 9,
+                    },
                     "modelContextWindow": 1000,
                 },
             )
@@ -5768,7 +5793,8 @@ class ClusterSchedulerTests(unittest.TestCase):
             self.assertEqual(lost["cached_input_tokens"], 80)
             self.assertEqual(lost["uncached_input_tokens"], 20)
             self.assertEqual(lost["output_tokens"], 20)
-            self.assertEqual(lost["context_tokens"], 120)
+            # Current context is last.input (8), not cumulative totalTokens (120).
+            self.assertEqual(lost["context_tokens"], 8)
             self.assertEqual(lost["model_context_window"], 1000)
             self.assertEqual(team.get_task(task["task_id"])["status"], "ready")
             self.assertIn(

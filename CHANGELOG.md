@@ -6,6 +6,13 @@
 
 ### Fixed
 
+- managed App Server 当前上下文统计修正：`context_tokens` 改用当前 turn 的
+  `last.input`，不再把累计 `total.totalTokens` 当作当前上下文。job、AgentPool
+  release 与 Dashboard managed Agent 统一同一语义；缺失 `last`/`last.input` 时
+  为 unknown（None），绝不以累计总量兜底。成本字段（input/cached/uncached/
+  output、baseline delta、累计 job 成本）与 Native Agent 路径保持不变。此前长
+  Thread 因累计 token 远超窗口被误判超过 85% 复用阈值而停止复用，压低缓存命中率。
+  历史已写入的错误 `context_tokens` 标记为 legacy inaccurate，不估算改写。
 - MCP 异常先脱敏再写入日志（warning/error），claim token 与 bearer 秘密不再
   进入日志；移除会泄露原始 traceback 的 exc_info。
 - MCP 帧读取对裸 JSONL 行与头部行也施加 16MiB 硬上限（此前仅 Content-Length
@@ -49,6 +56,11 @@
 
 ### Tests
 
+- 新增 `tests/test_managed_context.py`：当前上下文取 `last.input`、缺失 last 为
+  unknown、首 job 累计成本但 release 上下文为当前 last 输入、低于/高于 85% 阈值
+  的复用/新建、累计远超窗口但当前上下文小仍可复用、unknown 上下文不复用。
+  修正 `test_cluster.py` 中期待累计 context 的断言，并把依赖复用的空 last fixture
+  补上真实 `last.input`。
 - 新增回归测试 `tests/test_hardening_round1.py`、`tests/test_hardening_round2.py`、
   `tests/test_hardening_round3.py`。
 - 新增评审驱动测试：`test_security_hardening.py`（日志脱敏/帧上限）、

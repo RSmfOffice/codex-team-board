@@ -63,6 +63,7 @@ from .service import TeamError, TeamService
 from .usage import (
     JOB_USAGE_FIELDS,
     RAW_USAGE_FIELDS,
+    current_context_input_tokens,
     normalize_usage,
     scan_exec_log,
     usage_field_is_present,
@@ -7013,9 +7014,10 @@ Do not return raw logs or a full transcript.
                     0,
                     output_count - baseline_output_count,
                 )
-            context_count = selected.get("context_tokens")
-            if context_count is None:
-                context_count = fallback.get("context_tokens")
+            # Current context is the current turn's input (``last.input``),
+            # never the cumulative ``total.totalTokens``. Missing last input
+            # stays unknown instead of falling back to a lifetime sum.
+            context_count = current_context_input_tokens(per_turn)
             cache_write = selected.get("cache_write_input_tokens")
             if cache_write is None:
                 cache_write = fallback.get("cache_write_input_tokens")
@@ -7031,8 +7033,9 @@ Do not return raw logs or a full transcript.
                 )
                 if usage_field_is_present(selected_raw, field)
             }
+            if context_count is not None:
+                present_fields.add("context_tokens")
             for field in (
-                "context_tokens",
                 "cache_write_input_tokens",
                 "reasoning_output_tokens",
             ):

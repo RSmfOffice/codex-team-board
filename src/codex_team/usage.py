@@ -231,6 +231,33 @@ def merge_usage(
     }
 
 
+def current_context_input_tokens(usage: Mapping[str, Any] | None) -> int | None:
+    """Return the current-turn input size used as the live context estimate.
+
+    The App Server ``total`` bucket is a thread-lifetime cumulative snapshot;
+    its ``totalTokens`` must never be treated as the current context. Only the
+    ``last`` bucket's input represents the current turn. When ``last`` (or its
+    input) is absent this returns ``None`` (unknown) rather than falling back to
+    a cumulative total, so reuse thresholds are not poisoned by lifetime sums.
+
+    A flat per-turn snapshot (no ``total``/``last`` nesting) is read directly.
+    """
+
+    source = _mapping(usage)
+    if "total" in source or "last" in source:
+        last = source.get("last")
+        if not isinstance(last, Mapping):
+            return None
+        selected: Mapping[str, Any] = last
+    else:
+        selected = source
+    for alias in _ALIASES["input_tokens"]:
+        value = _integer(selected.get(alias))
+        if value is not None:
+            return value
+    return None
+
+
 def cache_hit_rate(usage: Mapping[str, Any] | None) -> float | None:
     normalized = normalize_usage(usage)
     input_tokens = normalized["input_tokens"]
